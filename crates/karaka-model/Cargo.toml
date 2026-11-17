@@ -7,6 +7,12 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Empty for now: the message types are plain Rust. Provider crates such as
-# Anthropic's depend on this one and bring their own HTTP and JSON libraries.
+# Kept tiny. Provider crates such as Anthropic's depend on this one and bring
+# their own HTTP and JSON libraries.
 [dependencies]
+# Only the `Stream` trait, which every async library agrees on. No executor.
+futures-core.workspace = true
+
+# Only for running the async tests.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

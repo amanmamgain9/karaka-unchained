@@ -16,3 +16,4 @@ publish = false
 # Versions shared across crates; each crate picks the features it needs.
 [workspace.dependencies]
 tokio = "1"
+futures-core = "0.3"
