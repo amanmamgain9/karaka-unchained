@@ -1,0 +1,19 @@
+[package]
+name = "karaka"
+description = "The Karaka runtime binary: it chooses the plugins and starts them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The only crate that depends on implementations such as the providers. Every
+# other crate sees just the ports.
+[dependencies]
+karaka-kernel.workspace = true
+karaka-model.workspace = true
+karaka-anthropic.workspace = true
+karaka-openai.workspace = true
+# `rt-multi-thread` is the executor a server will need, so the binary starts
+# on it now. `macros` is for `#[tokio::main]`.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -29,5 +29,9 @@ futures-util = { version = "0.3", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 
 # The workspace's own crates, so each one names its siblings the same way.
+karaka-kernel = { path = "crates/karaka-kernel" }
 karaka-model = { path = "crates/karaka-model" }
 karaka-sse = { path = "crates/karaka-sse" }
+# Implementations. Only the `karaka` binary names these.
+karaka-anthropic = { path = "crates/karaka-anthropic" }
+karaka-openai = { path = "crates/karaka-openai" }

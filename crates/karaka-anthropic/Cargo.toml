@@ -8,6 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# For the plugin that puts the model in a runtime. The kernel has no
+# dependencies of its own, so this adds almost nothing to the build.
+karaka-kernel.workspace = true
 karaka-model.workspace = true
 # Splits the HTTP body into server-sent events.
 karaka-sse.workspace = true

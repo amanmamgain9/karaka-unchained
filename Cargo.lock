@@ -571,10 +571,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka"
+version = "0.1.0"
+dependencies = [
+ "karaka-anthropic",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-openai",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-anthropic"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "karaka-kernel",
  "karaka-model",
  "karaka-sse",
  "reqwest",
@@ -603,6 +615,7 @@ name = "karaka-openai"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "karaka-kernel",
  "karaka-model",
  "karaka-sse",
  "reqwest",

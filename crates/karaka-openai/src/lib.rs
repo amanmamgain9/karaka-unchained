@@ -3,7 +3,8 @@
 //! Many servers speak the same `POST /chat/completions` format: OpenAI
 //! itself, DeepSeek, gateways such as OpenRouter, and local servers such as
 //! llama.cpp, vLLM and Ollama. [`OpenAiModel`] serves all of them; only the
-//! base URL and the API key change.
+//! base URL and the API key change. [`OpenAiPlugin`] builds one from an
+//! [`OpenAiConfig`] and provides it to a Karaka runtime as `dyn Model`.
 //!
 //! Each stage has its own module, so each can be tested on its own: the
 //! request body, and decoding the streamed chunks. Reading those chunks out
@@ -11,6 +12,8 @@
 
 mod decoder;
 mod model;
+mod plugin;
 mod request;
 
 pub use model::OpenAiModel;
+pub use plugin::{OpenAiConfig, OpenAiPlugin};
