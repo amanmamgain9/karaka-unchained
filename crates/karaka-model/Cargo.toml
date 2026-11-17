@@ -1,0 +1,12 @@
+[package]
+name = "karaka-model"
+description = "The model seam: what a conversation is, and the port a model provider implements"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Empty for now: the message types are plain Rust. Provider crates such as
+# Anthropic's depend on this one and bring their own HTTP and JSON libraries.
+[dependencies]
