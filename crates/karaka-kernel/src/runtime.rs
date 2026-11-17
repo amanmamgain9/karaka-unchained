@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::PortId;
-use crate::plugin::{BoxError, Plugin, PluginContext, Ports};
+use crate::plugin::{BoxError, DynPlugin, PluginContext, Ports};
 
 /// A started set of plugins and the ports they provide.
 ///
@@ -19,9 +19,10 @@ impl Runtime {
     /// Checks the whole plugin list, then starts each plugin after the
     /// providers of every port it requires.
     ///
-    /// Plugins that don't depend on each other start in the order listed. If
-    /// the list has any problem, no plugin starts.
-    pub fn start(plugins: Vec<Box<dyn Plugin>>) -> Result<Self, StartError> {
+    /// Plugins that don't depend on each other start in the order listed, one
+    /// at a time: each `setup` finishes before the next begins. If the list has
+    /// any problem, no plugin starts.
+    pub async fn start(plugins: Vec<Box<dyn DynPlugin>>) -> Result<Self, StartError> {
         let declared: Vec<Declared> = plugins.into_iter().map(Declared::new).collect();
         let order = start_order(&declared)?;
 
@@ -32,7 +33,8 @@ impl Runtime {
                 PluginContext::new(&plugin.name, &plugin.provides, &plugin.requires, &mut ports);
             plugin
                 .plugin
-                .setup(&mut ctx)
+                .setup_boxed(&mut ctx)
+                .await
                 .map_err(|source| StartError::Failed {
                     plugin: plugin.name.clone(),
                     source,
@@ -119,14 +121,14 @@ impl Error for StartError {
 /// A plugin with its declarations read once, so ordering and the checks in
 /// `PluginContext` all see the same lists.
 struct Declared {
-    plugin: Box<dyn Plugin>,
+    plugin: Box<dyn DynPlugin>,
     name: String,
     provides: Vec<PortId>,
     requires: Vec<PortId>,
 }
 
 impl Declared {
-    fn new(plugin: Box<dyn Plugin>) -> Self {
+    fn new(plugin: Box<dyn DynPlugin>) -> Self {
         Self {
             name: plugin.name().to_owned(),
             provides: plugin.provides(),
@@ -216,7 +218,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{Runtime, StartError};
-    use crate::{BoxError, Plugin, PluginContext, PortId};
+    use crate::{BoxError, DynPlugin, Plugin, PluginContext, PortId};
 
     trait Alpha: Send + Sync {}
     trait Beta: Send + Sync {}
@@ -245,7 +247,7 @@ mod tests {
         fn requires(&self) -> Vec<PortId> {
             self.requires.clone()
         }
-        fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+        async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
             (self.setup)(ctx)
         }
     }
@@ -255,7 +257,7 @@ mod tests {
         provides: Vec<PortId>,
         requires: Vec<PortId>,
         setup: Setup,
-    ) -> Box<dyn Plugin> {
+    ) -> Box<dyn DynPlugin> {
         Box::new(TestPlugin {
             name,
             provides,
@@ -285,24 +287,45 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn keeps_the_listed_order_between_independent_plugins() {
+    /// Provides its port only after handing control back to the executor, as
+    /// a plugin waiting on a database or the network would.
+    struct SlowPlugin;
+
+    impl Plugin for SlowPlugin {
+        fn name(&self) -> &str {
+            "slow"
+        }
+        fn provides(&self) -> Vec<PortId> {
+            vec![alpha()]
+        }
+        async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+            tokio::task::yield_now().await;
+            ctx.provide::<dyn Alpha>(Arc::new(Value));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_the_listed_order_between_independent_plugins() {
         let runtime = Runtime::start(vec![
             plugin("b", vec![], vec![], do_nothing),
             plugin("a", vec![], vec![], do_nothing),
             plugin("c", vec![], vec![], do_nothing),
         ])
+        .await
         .expect("the runtime starts");
         assert_eq!(runtime.plugins(), ["b", "a", "c"]);
     }
 
-    #[test]
-    fn reports_every_problem_before_starting_any_plugin() {
+    #[tokio::test]
+    async fn reports_every_problem_before_starting_any_plugin() {
         let Err(StartError::Invalid(problems)) = Runtime::start(vec![
             plugin("same", vec![alpha()], vec![], must_not_start),
             plugin("same", vec![alpha()], vec![], must_not_start),
             plugin("needy", vec![], vec![beta()], must_not_start),
-        ]) else {
+        ])
+        .await
+        else {
             panic!("expected an invalid plugin list");
         };
         assert_eq!(problems.len(), 3, "{problems:#?}");
@@ -311,12 +334,14 @@ mod tests {
         assert!(problems[2].contains("\"needy\" requires port"));
     }
 
-    #[test]
-    fn names_the_plugins_caught_in_a_cycle() {
+    #[tokio::test]
+    async fn names_the_plugins_caught_in_a_cycle() {
         let Err(StartError::Invalid(problems)) = Runtime::start(vec![
             plugin("first", vec![alpha()], vec![beta()], must_not_start),
             plugin("second", vec![beta()], vec![alpha()], must_not_start),
-        ]) else {
+        ])
+        .await
+        else {
             panic!("expected an invalid plugin list");
         };
         assert!(problems[0].contains("cycle"), "{problems:#?}");
@@ -326,11 +351,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reports_which_plugin_failed_to_start() {
+    #[tokio::test]
+    async fn reports_which_plugin_failed_to_start() {
         let Err(error) = Runtime::start(vec![plugin("broken", vec![], vec![], |_| {
             Err("no database".into())
-        })]) else {
+        })])
+        .await
+        else {
             panic!("expected a failed start");
         };
         assert_eq!(
@@ -339,20 +366,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_a_plugin_that_forgets_a_declared_port() {
+    #[tokio::test]
+    async fn rejects_a_plugin_that_forgets_a_declared_port() {
         let Err(StartError::NotProvided { plugin: name, port }) =
-            Runtime::start(vec![plugin("forgetful", vec![alpha()], vec![], do_nothing)])
+            Runtime::start(vec![plugin("forgetful", vec![alpha()], vec![], do_nothing)]).await
         else {
             panic!("expected a missing port");
         };
         assert_eq!((name.as_str(), port), ("forgetful", alpha()));
     }
 
-    #[test]
-    fn a_started_runtime_hands_out_provided_ports() {
+    #[tokio::test]
+    async fn a_started_runtime_hands_out_provided_ports() {
         let runtime = Runtime::start(vec![plugin("alpha", vec![alpha()], vec![], provide_alpha)])
+            .await
             .expect("the runtime starts");
         let _value: Arc<dyn Alpha> = runtime.get::<dyn Alpha>();
+    }
+
+    #[tokio::test]
+    async fn a_plugin_can_wait_during_setup() {
+        let runtime = Runtime::start(vec![
+            Box::new(SlowPlugin),
+            plugin("after", vec![], vec![alpha()], do_nothing),
+        ])
+        .await
+        .expect("the runtime starts");
+        assert_eq!(runtime.plugins(), ["slow", "after"]);
+    }
+
+    /// Compiles only if starting can move between threads, as it must on a
+    /// multi-threaded executor, and if a started runtime can be shared by them.
+    #[test]
+    fn starting_and_the_runtime_work_across_threads() {
+        fn assert_send<T: Send>(_: T) {}
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send(Runtime::start(vec![]));
+        assert_send_sync::<Runtime>();
     }
 }

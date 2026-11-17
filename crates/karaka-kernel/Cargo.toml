@@ -10,3 +10,7 @@ publish.workspace = true
 # Deliberately empty: every other crate depends on the kernel, so the kernel
 # depends on nothing.
 [dependencies]
+
+# Only for running the async tests; users of the kernel don't get Tokio from it.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

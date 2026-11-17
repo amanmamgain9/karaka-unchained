@@ -7,6 +7,6 @@ mod plugin;
 mod port;
 mod runtime;
 
-pub use plugin::{BoxError, Plugin, PluginContext};
+pub use plugin::{BoxError, DynPlugin, Plugin, PluginContext};
 pub use port::PortId;
 pub use runtime::{Runtime, StartError};

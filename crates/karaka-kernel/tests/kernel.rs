@@ -43,7 +43,7 @@ impl Plugin for ClockPlugin {
         vec![PortId::of::<dyn Clock>()]
     }
 
-    fn setup(&self, ctx: &mut PluginContext) -> Result<(), BoxError> {
+    async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
         ctx.provide::<dyn Clock>(Arc::new(FixedClock));
         Ok(())
     }
@@ -65,7 +65,7 @@ impl Plugin for GreeterPlugin {
         vec![PortId::of::<dyn Clock>()]
     }
 
-    fn setup(&self, ctx: &mut PluginContext) -> Result<(), BoxError> {
+    async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
         // No `?` here: the runtime checked before starting anything that a
         // plugin provides the clock, so this cannot fail.
         let clock = ctx.get::<dyn Clock>();
@@ -74,10 +74,11 @@ impl Plugin for GreeterPlugin {
     }
 }
 
-#[test]
-fn starts_providers_before_the_plugins_that_need_them() {
+#[tokio::test]
+async fn starts_providers_before_the_plugins_that_need_them() {
     // Listed in the wrong order on purpose.
     let runtime = Runtime::start(vec![Box::new(GreeterPlugin), Box::new(ClockPlugin)])
+        .await
         .expect("the runtime starts");
 
     assert_eq!(runtime.plugins(), ["clock", "greeter"]);

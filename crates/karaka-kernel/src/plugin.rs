@@ -2,6 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::error::Error;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::PortId;
@@ -30,8 +31,62 @@ pub trait Plugin: Send + Sync {
     }
 
     /// Starts the plugin: reads the ports it requires and provides the ports
-    /// it declared.
-    fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError>;
+    /// it declared. Implement it as `async fn setup(...)`.
+    ///
+    /// The returned future must be `Send`, so a multi-threaded executor can
+    /// run it on any thread. In practice: don't hold an `Rc` or a `RefCell`
+    /// borrow across an `.await`.
+    fn setup(
+        &self,
+        ctx: &mut PluginContext<'_>,
+    ) -> impl Future<Output = Result<(), BoxError>> + Send;
+}
+
+/// A [`Plugin`] of any type, so plugins of different types can share one list
+/// as `Box<dyn DynPlugin>`.
+///
+/// Don't implement this yourself: every `Plugin` already is one.
+///
+/// It exists because a trait with an async method can't be used as `dyn
+/// Trait`. Each plugin's `setup` returns a future of a different type, and a
+/// `dyn` call needs one type. This trait boxes the future, so it always has the
+/// same type: a pointer to some future.
+pub trait DynPlugin: Send + Sync {
+    /// See [`Plugin::name`].
+    fn name(&self) -> &str;
+
+    /// See [`Plugin::provides`].
+    fn provides(&self) -> Vec<PortId>;
+
+    /// See [`Plugin::requires`].
+    fn requires(&self) -> Vec<PortId>;
+
+    /// [`Plugin::setup`], with its future boxed.
+    fn setup_boxed<'a>(
+        &'a self,
+        ctx: &'a mut PluginContext<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'a>>;
+}
+
+impl<P: Plugin> DynPlugin for P {
+    fn name(&self) -> &str {
+        Plugin::name(self)
+    }
+
+    fn provides(&self) -> Vec<PortId> {
+        Plugin::provides(self)
+    }
+
+    fn requires(&self) -> Vec<PortId> {
+        Plugin::requires(self)
+    }
+
+    fn setup_boxed<'a>(
+        &'a self,
+        ctx: &'a mut PluginContext<'_>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'a>> {
+        Box::pin(Plugin::setup(self, ctx))
+    }
 }
 
 /// The values plugins have provided, at most one per port.
