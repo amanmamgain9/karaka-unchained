@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use karaka::{BoxError, Plugin, PluginContext, PortId, Runtime};
+use karaka_kernel::{BoxError, Plugin, PluginContext, PortId, Runtime};
 
 // Two ports. A port is a trait; plugins share implementations of it as
 // `Arc<dyn Trait>`. `Send + Sync` lets one value serve many connections on

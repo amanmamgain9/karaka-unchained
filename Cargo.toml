@@ -1,9 +1,14 @@
-[package]
-name = "karaka"
+# One crate per seam, and one per implementation that pulls in heavy
+# dependencies such as a database driver. Small implementations live in their
+# seam's crate. Only the final binary depends on implementations.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Shared by every crate; each one opts in with `version.workspace = true` etc.
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.100"
-description = "Agent runtime for SaaS applications: a small static kernel with pluggable backends"
+repository = "https://github.com/amanmamgain9/karaka-unchained"
 publish = false
-
-[dependencies]

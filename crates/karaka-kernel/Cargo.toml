@@ -1,0 +1,12 @@
+[package]
+name = "karaka-kernel"
+description = "Karaka's static kernel: ports, plugins, and the runtime that starts them in order"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Deliberately empty: every other crate depends on the kernel, so the kernel
+# depends on nothing.
+[dependencies]
