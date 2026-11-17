@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 karaka-model.workspace = true
+# Splits the HTTP body into server-sent events.
+karaka-sse.workspace = true
 serde.workspace = true
 # `raw_value` lets JSON the model wrote pass through without being parsed and
 # written out again.

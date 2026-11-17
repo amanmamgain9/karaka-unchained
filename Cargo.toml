@@ -30,3 +30,4 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 
 # The workspace's own crates, so each one names its siblings the same way.
 karaka-model = { path = "crates/karaka-model" }
+karaka-sse = { path = "crates/karaka-sse" }

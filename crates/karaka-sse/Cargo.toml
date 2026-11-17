@@ -1,0 +1,12 @@
+[package]
+name = "karaka-sse"
+description = "Server-sent events read out of an HTTP body, shared by Karaka's model providers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Deliberately empty: it only splits bytes into events, so it works with
+# whichever HTTP client a provider uses.
+[dependencies]

@@ -1,16 +1,32 @@
 //! Server-sent events, read out of an HTTP body.
 //!
+//! Model providers stream their answers as server-sent events. This crate
+//! does only the framing, the same for every provider: what each event's
+//! JSON means is the provider crate's job. It has no dependencies, so it
+//! works with any HTTP client: push the body's bytes in as they arrive and
+//! take complete events out.
+//!
 //! The body arrives in chunks that can end anywhere: halfway through a line,
 //! or even halfway through one UTF-8 character. So bytes are buffered until a
 //! whole line is there, and only whole lines are turned into text.
 //!
 //! An event is a few `field: value` lines followed by a blank line. Only the
-//! `data` field matters here: Anthropic repeats the event's type inside its
-//! JSON, so the `event` field adds nothing.
+//! `data` field is kept. Anthropic repeats the event's type inside its JSON,
+//! and OpenAI-style servers send no `event` field at all, so the other fields
+//! add nothing.
 
 /// Turns chunks of bytes into the `data` of each complete event.
-#[derive(Default)]
-pub(crate) struct Sse {
+///
+/// ```
+/// let mut sse = karaka_sse::Sse::default();
+/// sse.push(b"data: {\"a\":1}\n");
+/// // The blank line that ends the event hasn't arrived yet.
+/// assert_eq!(sse.next_event(), None);
+/// sse.push(b"\n");
+/// assert_eq!(sse.next_event().as_deref(), Some("{\"a\":1}"));
+/// ```
+#[derive(Debug, Default)]
+pub struct Sse {
     /// Bytes received but not yet read as lines.
     buffer: Vec<u8>,
     /// How far into `buffer` lines have been read. Read lines are dropped in
@@ -22,7 +38,7 @@ pub(crate) struct Sse {
 
 impl Sse {
     /// Adds the next chunk of the body.
-    pub(crate) fn push(&mut self, bytes: &[u8]) {
+    pub fn push(&mut self, bytes: &[u8]) {
         self.buffer.drain(..self.start);
         self.start = 0;
         self.buffer.extend_from_slice(bytes);
@@ -30,7 +46,7 @@ impl Sse {
 
     /// The `data` of the next complete event, or `None` until more bytes
     /// arrive.
-    pub(crate) fn next_event(&mut self) -> Option<String> {
+    pub fn next_event(&mut self) -> Option<String> {
         while let Some(line) = self.next_line() {
             if line.is_empty() {
                 // A blank line ends the event. One with no data, such as a
@@ -68,8 +84,8 @@ impl Sse {
         let line = &rest[..end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         // A whole line is whole UTF-8 too, as long as the server sent UTF-8.
-        // If it didn't, the bad bytes become `�` and the JSON decoder
-        // reports the event.
+        // If it didn't, the bad bytes become `�` and the provider's
+        // JSON decoder reports the event.
         Some(String::from_utf8_lossy(line).into_owned())
     }
 }

@@ -1,0 +1,26 @@
+[package]
+name = "karaka-openai"
+description = "A Karaka model provider for OpenAI-compatible Chat Completions APIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karaka-model.workspace = true
+# Splits the HTTP body into server-sent events.
+karaka-sse.workspace = true
+serde.workspace = true
+# `raw_value` lets JSON the tool author wrote pass through without being
+# parsed and written out again.
+serde_json = { workspace = true, features = ["raw_value"] }
+# The HTTP client. Which features it gets is decided once, in the root
+# `Cargo.toml`.
+reqwest.workspace = true
+# `unfold` builds the event stream out of one async step at a time.
+futures-util.workspace = true
+
+[dev-dependencies]
+# Runs the async tests and the fake server they talk to.
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }

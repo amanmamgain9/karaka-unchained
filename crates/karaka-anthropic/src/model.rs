@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use futures_util::stream::unfold;
 use karaka_model::{ErrorKind, Event, EventStream, Model, ModelError, Request};
+use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 
 use crate::decoder::{Decoder, WireError, error_kind};
 use crate::request::body;
-use crate::sse::Sse;
 
 const BASE_URL: &str = "https://api.anthropic.com";
 

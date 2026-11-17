@@ -5,12 +5,11 @@
 //! `karaka_model` events.
 //!
 //! Each stage has its own module, so each can be tested on its own: the
-//! request body, reading server-sent events out of the HTTP body, and
-//! decoding those events.
+//! request body, and decoding the streamed events. Reading those events out
+//! of the HTTP body is shared with other providers, in `karaka-sse`.
 
 mod decoder;
 mod model;
 mod request;
-mod sse;
 
 pub use model::AnthropicModel;
