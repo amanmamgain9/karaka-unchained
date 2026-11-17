@@ -1,0 +1,150 @@
+//! Server-sent events, read out of an HTTP body.
+//!
+//! The body arrives in chunks that can end anywhere: halfway through a line,
+//! or even halfway through one UTF-8 character. So bytes are buffered until a
+//! whole line is there, and only whole lines are turned into text.
+//!
+//! An event is a few `field: value` lines followed by a blank line. Only the
+//! `data` field matters here: Anthropic repeats the event's type inside its
+//! JSON, so the `event` field adds nothing.
+
+/// Turns chunks of bytes into the `data` of each complete event.
+#[derive(Default)]
+pub(crate) struct Sse {
+    /// Bytes received but not yet read as lines.
+    buffer: Vec<u8>,
+    /// How far into `buffer` lines have been read. Read lines are dropped in
+    /// one go when more bytes are pushed, rather than one at a time.
+    start: usize,
+    /// The `data` lines of the event being read, joined with `\n`.
+    data: Option<String>,
+}
+
+impl Sse {
+    /// Adds the next chunk of the body.
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        self.buffer.drain(..self.start);
+        self.start = 0;
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// The `data` of the next complete event, or `None` until more bytes
+    /// arrive.
+    pub(crate) fn next_event(&mut self) -> Option<String> {
+        while let Some(line) = self.next_line() {
+            if line.is_empty() {
+                // A blank line ends the event. One with no data, such as a
+                // run of comments, dispatches nothing.
+                if let Some(data) = self.data.take() {
+                    return Some(data);
+                }
+                continue;
+            }
+            // Everything else is ignored: `event`, `id` and `retry` fields,
+            // and comments, which start with `:` and so have an empty name.
+            let (field, value) = line.split_once(':').unwrap_or((&line, ""));
+            if field == "data" {
+                // One space after the colon is part of the format, not the
+                // value.
+                let value = value.strip_prefix(' ').unwrap_or(value);
+                match &mut self.data {
+                    Some(data) => {
+                        data.push('\n');
+                        data.push_str(value);
+                    }
+                    None => self.data = Some(value.to_owned()),
+                }
+            }
+        }
+        None
+    }
+
+    /// The next whole line, without its line ending, or `None` if the line
+    /// hasn't fully arrived.
+    fn next_line(&mut self) -> Option<String> {
+        let rest = &self.buffer[self.start..];
+        let end = rest.iter().position(|&byte| byte == b'\n')?;
+        self.start += end + 1;
+        let line = &rest[..end];
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // A whole line is whole UTF-8 too, as long as the server sent UTF-8.
+        // If it didn't, the bad bytes become `�` and the JSON decoder
+        // reports the event.
+        Some(String::from_utf8_lossy(line).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sse;
+
+    /// Pushes every chunk and keeps each event that comes out.
+    fn events(chunks: &[&[u8]]) -> Vec<String> {
+        let mut sse = Sse::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            sse.push(chunk);
+            while let Some(data) = sse.next_event() {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn an_event_split_across_chunks() {
+        let body = "event: content_block_delta\ndata: {\"text\":\"héllo\"}\n\n".as_bytes();
+        // `é` is two bytes; cut between them, as well as mid-field and
+        // between the two newlines.
+        let accent = body.iter().position(|&byte| byte == 0xC3).expect("é");
+        let cuts = [3, 20, accent + 1, body.len() - 1];
+
+        let mut chunks = Vec::new();
+        let mut from = 0;
+        for cut in cuts {
+            chunks.push(&body[from..cut]);
+            from = cut;
+        }
+        chunks.push(&body[from..]);
+
+        assert_eq!(events(&chunks), ["{\"text\":\"héllo\"}"]);
+    }
+
+    #[test]
+    fn crlf_line_endings() {
+        assert_eq!(
+            events(&[b"event: ping\r\ndata: {\"type\":\"ping\"}\r\n\r\n"]),
+            ["{\"type\":\"ping\"}"]
+        );
+    }
+
+    #[test]
+    fn data_over_several_lines() {
+        assert_eq!(
+            events(&[b"data: first\ndata:second\ndata:  third\n\n"]),
+            ["first\nsecond\n third"]
+        );
+    }
+
+    #[test]
+    fn comments_and_other_fields_are_ignored() {
+        assert_eq!(
+            events(&[b": keep-alive\nid: 7\nretry: 1000\nevent: x\ndata: a\n\n"]),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_with_no_data_dispatches_nothing() {
+        assert_eq!(events(&[b": comment\n\n\nevent: x\n\ndata: b\n\n"]), ["b"]);
+    }
+
+    #[test]
+    fn an_unfinished_event_waits_for_its_blank_line() {
+        let mut sse = Sse::default();
+        sse.push(b"data: a\n");
+        assert_eq!(sse.next_event(), None);
+        sse.push(b"\n");
+        assert_eq!(sse.next_event().as_deref(), Some("a"));
+    }
+}

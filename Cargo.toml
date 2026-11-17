@@ -17,3 +17,16 @@ publish = false
 [workspace.dependencies]
 tokio = "1"
 futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Without default features it is only the stream helpers, with no macros.
+futures-util = { version = "0.3", default-features = false }
+# No default features: those add the system proxy lookup and charset
+# sniffing, which an API client doesn't need. `rustls` is TLS written in
+# Rust, so there's no OpenSSL to install or link. `http2` is what Anthropic's
+# servers prefer. The body is read with `Response::chunk`, so the `stream`
+# feature isn't needed.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+
+# The workspace's own crates, so each one names its siblings the same way.
+karaka-model = { path = "crates/karaka-model" }
