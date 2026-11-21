@@ -27,6 +27,9 @@ use crate::request::{MaxTokensField, Settings, body};
 /// - DeepSeek: `https://api.deepseek.com`
 /// - Ollama: `http://localhost:11434/v1`
 ///
+/// DeepSeek works here, but dsh v4 talks to it in the Messages format, so
+/// `karaka-anthropic`'s DeepSeek profile is the one that matches dsh.
+///
 /// ```no_run
 /// let model = karaka_openai::OpenAiModel::new("https://api.deepseek.com")
 ///     .with_api_key("sk-...");

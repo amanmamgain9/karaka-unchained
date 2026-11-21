@@ -26,20 +26,31 @@ Asks a model one question and prints the answer as it is written.
 With no question, or with -, the question is read from stdin.
 
 Settings come from the environment:
-  KARAKA_PROVIDER     anthropic (the default) or openai
+  KARAKA_PROVIDER     anthropic (the default), deepseek or openai. deepseek
+                      speaks Anthropic's Messages format, as dsh does;
+                      openai is for Chat Completions servers such as
+                      OpenAI and Ollama
   KARAKA_ROUTE        the name the provider's model is registered under,
                       such as deepseek or ollama (optional; the provider's
                       name otherwise)
-  KARAKA_MODEL        the model's id; for anthropic, claude-opus-5-5 by default
+  KARAKA_MODEL        the model's id; by default claude-opus-5-5 for
+                      anthropic and deepseek-flash for deepseek
   KARAKA_SYSTEM       a system prompt (optional)
-  KARAKA_MAX_TOKENS   the most the model may write (optional)
+  KARAKA_MAX_TOKENS   the most the model may write (optional; deepseek
+                      sends 256000 otherwise)
   KARAKA_EFFORT       low, medium, high, xhigh or max (optional; the
-                      provider's default otherwise)
+                      provider's default otherwise). deepseek takes only
+                      low, high or max, and high is its default
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY
                       summarized (the default) or omitted
   ANTHROPIC_CACHE     short (the default, 5 minutes), long (1 hour) or off
+  DEEPSEEK_API_KEY    needed for deepseek
+  DEEPSEEK_BASE_URL   another server for deepseek (optional; by default
+                      https://api.deepseek.com/anthropic)
+  DEEPSEEK_THINKING   enabled (the default) or disabled; disabled takes
+                      no KARAKA_EFFORT
   OPENAI_BASE_URL     needed for openai, such as https://api.openai.com/v1
   OPENAI_API_KEY      for openai (optional)
 ";

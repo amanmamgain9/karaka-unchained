@@ -8,7 +8,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
+use karaka_anthropic::{
+    AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
+};
 use karaka_kernel::{DynPlugin, Runtime, StartError};
 use karaka_model::{Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, complete};
 use serde_json::Value;
@@ -94,6 +96,8 @@ fn plugin(route: &str, api_key: &str, address: SocketAddr) -> AnthropicPlugin {
         default_effort: Some(Effort::Low),
         thinking_display: Some(ThinkingDisplay::Summarized),
         cache: CacheMode::Off,
+        profile: Profile::Anthropic,
+        thinking: None,
     })
 }
 
@@ -175,5 +179,137 @@ async fn an_empty_route_stops_the_runtime_from_starting() {
     assert!(
         source.to_string().starts_with("the model route is empty"),
         "{source}"
+    );
+}
+
+// The DeepSeek profile.
+
+/// Play This Life's DeepSeek setup (`karaka.cordis.yml`, `llm-deepseek`):
+/// thinking on, effort max, `max_tokens` 393,216.
+fn deepseek_config(address: SocketAddr) -> AnthropicConfig {
+    AnthropicConfig {
+        route: "deepseek".into(),
+        api_key: "deepseek-key".into(),
+        base_url: Some(format!("http://{address}/anthropic")),
+        default_max_tokens: Some(393_216),
+        default_effort: Some(Effort::Max),
+        thinking_display: None,
+        cache: CacheMode::default(),
+        profile: Profile::DeepSeek,
+        thinking: Some(DeepSeekThinking::Enabled),
+    }
+}
+
+#[tokio::test]
+async fn the_deepseek_profile_registers_a_model_that_answers() {
+    let (address, server) = serve_once(streamed(HELLO)).await;
+
+    let runtime = Runtime::start(with_registry(AnthropicPlugin::new(deepseek_config(
+        address,
+    ))))
+    .await
+    .expect("the runtime starts");
+    assert_eq!(runtime.plugins(), ["models", "deepseek"]);
+    let model = runtime
+        .get::<ModelRegistry>()
+        .get("deepseek")
+        .expect("the route is registered");
+
+    let request = Request::new("deepseek-flash", vec![Message::user("hi")]);
+    let response = complete(model.as_ref(), request)
+        .await
+        .expect("the call works");
+    assert_eq!(response.message.text(), "Hello");
+
+    let sent = server.await.expect("the server ran");
+    let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    let head = head.to_lowercase();
+    assert!(head.starts_with("post /anthropic/v1/messages "), "{head}");
+    assert!(head.contains("\r\nx-api-key: deepseek-key\r\n"), "{head}");
+    assert!(
+        head.contains("\r\nanthropic-version: 2023-06-01\r\n"),
+        "{head}"
+    );
+    let body: Value = serde_json::from_str(body).expect("the body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "model": "deepseek-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 393216,
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": "max"}
+        })
+    );
+}
+
+/// The error the DeepSeek plugin fails to start with, given `config`.
+async fn deepseek_start_error(config: AnthropicConfig) -> String {
+    let Err(StartError::Failed { source, .. }) =
+        Runtime::start(with_registry(AnthropicPlugin::new(config))).await
+    else {
+        panic!("expected the plugin to fail");
+    };
+    source.to_string()
+}
+
+#[tokio::test]
+async fn a_deepseek_config_that_cant_work_stops_the_runtime() {
+    // Nothing listens on port 1, and nothing should try to.
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+    let cases = [
+        (
+            AnthropicConfig {
+                api_key: " ".into(),
+                ..deepseek_config(address)
+            },
+            "the DeepSeek API key is empty",
+        ),
+        (
+            AnthropicConfig {
+                default_effort: Some(Effort::Medium),
+                ..deepseek_config(address)
+            },
+            "the default effort is \"medium\", but DeepSeek takes only low, high or max",
+        ),
+        (
+            AnthropicConfig {
+                thinking: Some(DeepSeekThinking::Disabled),
+                ..deepseek_config(address)
+            },
+            "the default effort is \"max\", but thinking is disabled, and DeepSeek takes no effort then",
+        ),
+        (
+            AnthropicConfig {
+                thinking_display: Some(ThinkingDisplay::Summarized),
+                ..deepseek_config(address)
+            },
+            "`thinking_display` is for the anthropic profile; the deepseek profile turns thinking on or off with `thinking`",
+        ),
+        (
+            AnthropicConfig {
+                base_url: Some("https://user:secret@api.deepseek.com/anthropic".into()),
+                ..deepseek_config(address)
+            },
+            "the base URL \"https://user:secret@api.deepseek.com/anthropic\" must be plain HTTP or HTTPS, with no user name, password, query or fragment",
+        ),
+    ];
+    for (config, expected) in cases {
+        assert_eq!(deepseek_start_error(config).await, expected);
+    }
+}
+
+#[tokio::test]
+async fn deepseeks_thinking_switch_is_refused_for_anthropic() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+    let config = AnthropicConfig {
+        route: "anthropic".into(),
+        profile: Profile::Anthropic,
+        ..deepseek_config(address)
+    };
+    assert_eq!(
+        deepseek_start_error(config).await,
+        "`thinking` is for the deepseek profile; the anthropic profile uses `thinking_display`"
     );
 }

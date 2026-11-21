@@ -286,3 +286,33 @@ first:
 - **Tools.** pi-ai sends a trimmed tool schema and
   `eager_input_streaming`. It also adds synthetic results for orphaned
   tool calls.
+
+### Fixed after the second audit
+
+- Fixed in `4b619b2`:
+  - **Failures that looked like success.** Refusals, content filters,
+    empty replies, context overflow and unknown stop reasons are now
+    errors.
+  - **Cut-off tool calls.** Tool calls from a `max_tokens` finish never
+    reach a consumer.
+  - **New error kinds** follow dsh's codes and its retry policy.
+- **DeepSeek's API format.** `karaka-anthropic` has a DeepSeek profile
+  that reproduces dsh v4's `llm-deepseek`:
+  - the `https://api.deepseek.com/anthropic` endpoint, with
+    `anthropic-version` 2023-06-01;
+  - `thinking: enabled|disabled`, and effort limited to low, high or max;
+  - no cache markers, and `max_tokens` always sent;
+  - tool history checked before sending;
+  - strict decoding.
+
+  A real call to `deepseek-flash` worked on 2026-11-21 without dsh's
+  `x-deepseek-harness-*` headers.
+
+  Still unverified: whether DeepSeek signs thinking blocks, and whether
+  it accepts unsigned thinking back. That needs a multi-turn call, so
+  it waits for the loop.
+
+  DeepSeek signatures are stored as a small envelope that names the
+  model, so they go back only to the model that made them. That isn't
+  v4's on-disk `replayState` shape yet, and the gap stays open with the
+  signature-origin work.

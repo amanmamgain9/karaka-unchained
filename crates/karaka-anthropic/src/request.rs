@@ -19,6 +19,8 @@ use karaka_model::{Block, Effort, ErrorKind, Message, ModelError, Request, Role}
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
+use crate::deepseek;
+
 /// The beta that allows `thinking.block_binding`. Without this header
 /// Anthropic rejects the field with "Extra inputs are not permitted".
 pub(crate) const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
@@ -395,14 +397,17 @@ fn block(block: &Block) -> Option<WireBlock<'_>> {
         // Anthropic accepts thinking back only with the signature it issued.
         // A signed block is kept even when its text is empty: with display
         // "omitted" every block is, and the signature still carries the
-        // reasoning.
+        // reasoning. The DeepSeek profile's replay data is no Anthropic
+        // signature, so its reasoning counts as unsigned.
         Block::Reasoning {
             text,
             replay: Some(signature),
-        } if !signature.trim().is_empty() => WireBlock::Thinking {
-            thinking: text,
-            signature,
-        },
+        } if !signature.trim().is_empty() && !deepseek::is_replay(signature) => {
+            WireBlock::Thinking {
+                thinking: text,
+                signature,
+            }
+        }
         // Reasoning without a signature came from another provider, or from
         // a stream that broke off. Anthropic won't take it as thinking, but
         // as text it keeps what the model had worked out. pi-ai does the same.
@@ -429,12 +434,12 @@ fn block(block: &Block) -> Option<WireBlock<'_>> {
 
 /// `text` as raw JSON, if it is a JSON object. Checked, but not parsed into
 /// values: it goes out exactly as it came in.
-fn json_object(text: &str) -> Option<&RawValue> {
+pub(crate) fn json_object(text: &str) -> Option<&RawValue> {
     let raw: &RawValue = serde_json::from_str(text).ok()?;
     raw.get().starts_with('{').then_some(raw)
 }
 
-fn empty_object() -> &'static RawValue {
+pub(crate) fn empty_object() -> &'static RawValue {
     serde_json::from_str("{}").expect("`{}` is valid JSON")
 }
 
@@ -1052,6 +1057,29 @@ mod tests {
         assert_eq!(
             sent["messages"][0]["content"][0]["cache_control"],
             json!({"type": "ephemeral"})
+        );
+    }
+
+    /// Reasoning that DeepSeek signed goes to Anthropic as text, as any
+    /// other provider's does: Anthropic would refuse DeepSeek's signature.
+    #[test]
+    fn deepseek_reasoning_becomes_text() {
+        let request = Request::new(
+            "claude-opus-5-5",
+            vec![assistant(vec![
+                reasoning(
+                    "DeepSeek thought this",
+                    Some(&crate::deepseek::replay("deepseek-flash", "sig")),
+                ),
+                text("answer"),
+            ])],
+        );
+        assert_eq!(
+            to_json(&request)["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "DeepSeek thought this"},
+                {"type": "text", "text": "answer"}
+            ])
         );
     }
 }

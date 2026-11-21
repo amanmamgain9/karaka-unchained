@@ -268,8 +268,10 @@ fn user<'a>(message: &'a Message, out: &mut Vec<WireMessage<'a>>) {
 /// A tool result. The format has no `is_error`, so a failure is said in the
 /// content itself, where the model reads it.
 fn tool_message(result: &ToolResult) -> WireMessage<'_> {
-    // DeepSeek's adapter sends this for empty output: some servers refuse a
-    // tool message with no content.
+    // dsh's pi-ai adapter sends this for empty output
+    // (`llm-pi-ai/src/context.ts:42`): some servers refuse a tool message
+    // with no content. dsh's DeepSeek adapter sends an empty result as it
+    // is, but that one speaks the Messages format, not this one.
     let output = if result.content.is_empty() {
         "(no output)"
     } else {
@@ -289,15 +291,18 @@ fn tool_message(result: &ToolResult) -> WireMessage<'_> {
 /// An assistant message: its text, its reasoning and its tool calls.
 ///
 /// Reasoning goes back as `reasoning_content` whenever the message has any.
-/// DeepSeek's thinking mode requires it on a message with tool calls and
-/// ignores it elsewhere; DeepSeek's own adapter sends it every time, because
-/// gateways that forward to other vendors use it to find that turn's
-/// thinking again. A message with no reasoning gets no field.
+/// DeepSeek's Chat Completions thinking mode requires it on a message with
+/// tool calls and ignores it elsewhere. Sending it every time also lets
+/// gateways that forward to other vendors find that turn's thinking again.
+/// dsh v4 has no counterpart to this: it talks to DeepSeek in the Messages
+/// format, where reasoning goes back as thinking blocks (see
+/// `karaka-anthropic`'s DeepSeek profile). A message with no reasoning gets
+/// no field.
 ///
 /// `content` is `""` when there's no text, never `null`, even beside tool
-/// calls. DeepSeek's adapter found that some gateways refuse `null`, and
-/// DeepSeek refuses it on a message that has no tool calls either. Text that
-/// is only whitespace counts as none.
+/// calls: some gateways refuse `null`, and DeepSeek refuses it on a message
+/// that has no tool calls either. Text that is only whitespace counts as
+/// none.
 ///
 /// A message left with no text, no reasoning and no tool calls is `None`,
 /// and isn't sent.

@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 
-use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode};
+use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, Profile};
 use karaka_kernel::Runtime;
 use karaka_model::{Message, ModelRegistry, ModelsPlugin, Request, complete};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
@@ -117,6 +117,8 @@ async fn anthropic_and_deepseek_answer_side_by_side() {
         default_effort: None,
         thinking_display: None,
         cache: CacheMode::Off,
+        profile: Profile::Anthropic,
+        thinking: None,
     });
     let deepseek = OpenAiPlugin::new(OpenAiConfig {
         route: "deepseek".into(),
@@ -163,4 +165,98 @@ async fn anthropic_and_deepseek_answer_side_by_side() {
         sent.contains("\r\nauthorization: bearer deepseek-key\r\n"),
         "{sent}"
     );
+}
+
+/// DeepSeek's events for the answer "from deepseek": the same format as
+/// Anthropic's.
+const DEEPSEEK_MESSAGES_ANSWER: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","model":"deepseek-flash","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"from deepseek"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+/// The way dsh v4 runs the two: both through the Messages format, each
+/// with its own profile, route and key.
+#[tokio::test]
+async fn both_profiles_of_the_messages_crate_answer_side_by_side() {
+    let (anthropic_address, anthropic_server) = serve_once(streamed(ANTHROPIC_ANSWER));
+    let (deepseek_address, deepseek_server) = serve_once(streamed(DEEPSEEK_MESSAGES_ANSWER));
+
+    let config = |route: &str, key: &str, base_url: String, profile| AnthropicConfig {
+        route: route.into(),
+        api_key: key.into(),
+        base_url: Some(base_url),
+        default_max_tokens: None,
+        default_effort: None,
+        thinking_display: None,
+        cache: CacheMode::Off,
+        profile,
+        thinking: None,
+    };
+    let anthropic = config(
+        "anthropic",
+        "anthropic-key",
+        format!("http://{anthropic_address}"),
+        Profile::Anthropic,
+    );
+    let deepseek = config(
+        "deepseek",
+        "deepseek-key",
+        format!("http://{deepseek_address}/anthropic"),
+        Profile::DeepSeek,
+    );
+
+    let runtime = Runtime::start(vec![
+        Box::new(ModelsPlugin),
+        Box::new(AnthropicPlugin::new(anthropic)),
+        Box::new(AnthropicPlugin::new(deepseek)),
+    ])
+    .await
+    .expect("the runtime starts");
+    let registry = runtime.get::<ModelRegistry>();
+    assert_eq!(registry.routes(), ["anthropic", "deepseek"]);
+    assert_eq!(
+        ask(&registry, "anthropic", "claude-opus-5-5").await,
+        "from anthropic"
+    );
+    assert_eq!(
+        ask(&registry, "deepseek", "deepseek-flash").await,
+        "from deepseek"
+    );
+
+    let sent = anthropic_server
+        .join()
+        .expect("the server ran")
+        .to_lowercase();
+    assert!(sent.starts_with("post /v1/messages "), "{sent}");
+    assert!(
+        sent.contains("\r\nanthropic-version: 2026-10-21\r\n"),
+        "{sent}"
+    );
+    let sent = deepseek_server
+        .join()
+        .expect("the server ran")
+        .to_lowercase();
+    assert!(sent.starts_with("post /anthropic/v1/messages "), "{sent}");
+    assert!(sent.contains("\r\nx-api-key: deepseek-key\r\n"), "{sent}");
+    assert!(
+        sent.contains("\r\nanthropic-version: 2023-06-01\r\n"),
+        "{sent}"
+    );
+    assert!(sent.contains(r#""max_tokens":256000"#), "{sent}");
 }

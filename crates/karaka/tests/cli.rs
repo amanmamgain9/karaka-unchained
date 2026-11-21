@@ -22,6 +22,9 @@ const VARIABLES: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
     "ANTHROPIC_CACHE",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_THINKING",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
 ];
@@ -130,6 +133,41 @@ const ANTHROPIC_HELLO: &str = concat!(
     "\n\n",
     "event: message_delta\n",
     r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":34}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+/// DeepSeek's events for the same answer, with some thinking first. The
+/// Messages format is Anthropic's, so the events are too.
+const DEEPSEEK_HELLO: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","model":"deepseek-flash","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Say it."}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello, world"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":1}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
     "\n\n",
     "event: message_stop\n",
     r#"data: {"type":"message_stop"}"#,
@@ -317,4 +355,85 @@ fn help_prints_the_usage_and_exits_with_2() {
             "{args:?}"
         );
     }
+}
+
+#[test]
+fn asks_deepseek_in_the_messages_format() {
+    let (address, server) = serve_once(streamed(DEEPSEEK_HELLO));
+
+    let output = karaka(
+        &["ask", "say", "hello"],
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
+            ("KARAKA_SYSTEM", "Be brief.".into()),
+            ("KARAKA_MAX_TOKENS", "393216".into()),
+            ("KARAKA_EFFORT", "max".into()),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Hello, world\n");
+    // stderr isn't a terminal here, so the reasoning isn't shown.
+    assert_eq!(stderr, "stop: finished · in 12 · out 9 tokens\n");
+
+    let sent = server.join().expect("the server ran");
+    let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    let head = head.to_lowercase();
+    assert!(head.starts_with("post /anthropic/v1/messages "), "{head}");
+    assert!(head.contains("\r\nx-api-key: test-key\r\n"), "{head}");
+    assert!(
+        head.contains("\r\nanthropic-version: 2023-06-01\r\n"),
+        "{head}"
+    );
+    assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
+    assert_eq!(
+        body,
+        concat!(
+            r#"{"model":"deepseek-flash","stream":true,"#,
+            r#""messages":[{"role":"user","content":[{"type":"text","text":"say hello"}]}],"#,
+            r#""max_tokens":393216,"thinking":{"type":"enabled"},"#,
+            r#""output_config":{"effort":"max"},"system":"Be brief."}"#
+        )
+    );
+}
+
+#[test]
+fn deepseek_refuses_an_effort_it_lacks_before_any_call() {
+    // Nothing listens on port 1; a call that went out would fail differently.
+    let output = karaka(
+        &["ask", "hi"],
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", "http://127.0.0.1:1".into()),
+            ("KARAKA_EFFORT", "medium".into()),
+        ],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "karaka: the provider rejected the request: DeepSeek has no effort \"medium\"; it takes low, high or max (trying again won't help)\n"
+    );
+}
+
+#[test]
+fn a_missing_deepseek_key_fails_before_any_call() {
+    let output = karaka(
+        &["ask", "hi"],
+        &[("KARAKA_PROVIDER", "deepseek".into())],
+        "",
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("karaka: DEEPSEEK_API_KEY is not set"),
+        "{stderr}"
+    );
 }

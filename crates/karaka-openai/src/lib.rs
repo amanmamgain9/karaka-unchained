@@ -8,6 +8,12 @@
 //! under the config's route. One runtime can hold several, each with its
 //! own route.
 //!
+//! DeepSeek serves this format too, but dsh v4 doesn't use it: it talks to
+//! DeepSeek in Anthropic's Messages format, at
+//! `https://api.deepseek.com/anthropic`. To send what dsh sends, use the
+//! DeepSeek profile of `karaka-anthropic` instead. This crate stays for
+//! servers that only speak Chat Completions.
+//!
 //! Each stage has its own module, so each can be tested on its own: the
 //! request body, and decoding the streamed chunks. Reading those chunks out
 //! of the HTTP body is shared with other providers, in `karaka-sse`.

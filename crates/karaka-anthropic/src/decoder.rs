@@ -3,12 +3,23 @@
 //! The [`Decoder`] only sees the JSON of each event, one at a time. Reading
 //! those out of the HTTP body is a separate job, so everything here can be
 //! tested without a network.
+//!
+//! DeepSeek sends the same events. Its profile reads them as dsh's
+//! `llm-deepseek/src/translate.ts` does, which is stricter: a kind of block,
+//! delta or stop reason it doesn't know fails the call instead of being
+//! skipped, and so do events out of order and tool arguments that aren't a
+//! JSON object.
 
 use karaka_model::{
     Block, ErrorKind, Event, ModelError, Refusal, StopReason, ToolCall, Usage, is_context_overflow,
     is_out_of_quota,
 };
 use serde::Deserialize;
+use serde_json::value::RawValue;
+
+use crate::Profile;
+use crate::deepseek;
+use crate::request::json_object;
 
 /// Assembles one streamed response.
 ///
@@ -17,6 +28,14 @@ use serde::Deserialize;
 /// must wait for the stop reason.
 #[derive(Default)]
 pub(crate) struct Decoder {
+    profile: Profile,
+    /// The model the request asked for. The DeepSeek profile records it
+    /// beside each signature, so the signature goes back only to that model
+    /// (`translate.ts:161`, `replay.ts:63`).
+    model: String,
+    /// Whether `message_start` has arrived. Only the DeepSeek profile
+    /// checks the order of events.
+    started: bool,
     open: Option<Open>,
     /// Finished blocks waiting for the stop reason.
     ///
@@ -41,11 +60,16 @@ enum Open {
     Text(String),
     Thinking {
         text: String,
-        signature: String,
+        /// `None` until a signature arrives. Anthropic always sends one;
+        /// DeepSeek may not, and then there's nothing to send back.
+        signature: Option<String>,
     },
     ToolUse {
         id: String,
         name: String,
+        /// The arguments if no JSON pieces arrive: `{}` for Anthropic, and
+        /// the start's own `input` for DeepSeek (`translate.ts:56,140`).
+        initial: String,
         json: String,
     },
     /// A block Karaka doesn't use, such as a server tool's. Its deltas and
@@ -54,6 +78,19 @@ enum Open {
 }
 
 impl Decoder {
+    /// A decoder for the DeepSeek profile, for an answer from `model`.
+    pub(crate) fn deepseek(model: impl Into<String>) -> Self {
+        Self {
+            profile: Profile::DeepSeek,
+            model: model.into(),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn profile(&self) -> Profile {
+        self.profile
+    }
+
     /// Reads one event's JSON.
     ///
     /// Returns a list because `message_stop` releases every held block and
@@ -63,14 +100,30 @@ impl Decoder {
     /// An error event, a stop reason that isn't a finished answer, or JSON
     /// that doesn't fit ends the call with an `Err`.
     pub(crate) fn feed(&mut self, data: &str) -> Result<Vec<Event>, ModelError> {
+        let deepseek = self.profile == Profile::DeepSeek;
+        // DeepSeek's error events may lack a type or a message, which the
+        // strict reading below would call unreadable. dsh reads whatever
+        // is there (`transport.ts:22-27`), and so does this.
+        if deepseek
+            && let Ok(event) = serde_json::from_str::<deepseek::ErrorEvent>(data)
+            && event.kind == "error"
+        {
+            return Err(event.error.into_model_error(None));
+        }
         // dsh calls a stream it can't read malformed
         // (`llm-deepseek/src/sse.ts:18-19`), and so doesn't retry it.
         let event: WireEvent = serde_json::from_str(data).map_err(|error| {
             ModelError::new(
                 ErrorKind::Malformed,
-                format!("Anthropic sent an event that couldn't be read: {error}"),
+                format!(
+                    "{} sent an event that couldn't be read: {error}",
+                    self.profile.name()
+                ),
             )
         })?;
+        if deepseek {
+            self.check_order(&event)?;
+        }
 
         Ok(match event {
             WireEvent::MessageStart { message } => {
@@ -78,31 +131,18 @@ impl Decoder {
                 Vec::new()
             }
             WireEvent::ContentBlockStart { content_block } => {
-                self.open = Some(match content_block {
-                    StartBlock::Text { text } => Open::Text(text),
-                    StartBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => Open::Thinking {
-                        text: thinking,
-                        signature,
-                    },
-                    StartBlock::ToolUse { id, name } => Open::ToolUse {
-                        id,
-                        name,
-                        json: String::new(),
-                    },
-                    StartBlock::Other => Open::Skipped,
-                });
-                Vec::new()
+                let open = self.start(content_block, data)?;
+                let events = self.initial_delta(&open).into_iter().collect();
+                self.open = Some(open);
+                events
             }
             WireEvent::ContentBlockDelta { delta } => self.delta(delta)?.into_iter().collect(),
             WireEvent::ContentBlockStop => {
                 let open = self
                     .open
                     .take()
-                    .ok_or_else(|| protocol("a block stopped"))?;
-                match finish(open) {
+                    .ok_or_else(|| protocol(self.profile, "a block stopped"))?;
+                match self.finish(open) {
                     Some(block) => self.finished(block),
                     None => Vec::new(),
                 }
@@ -110,7 +150,10 @@ impl Decoder {
             WireEvent::MessageDelta { delta, usage } => {
                 self.add_usage(usage);
                 if let Some(reason) = delta.stop_reason {
-                    self.stop = Some(stop_reason(&reason, delta.stop_details)?);
+                    self.stop = Some(match self.profile {
+                        Profile::Anthropic => stop_reason(&reason, delta.stop_details)?,
+                        Profile::DeepSeek => deepseek_stop_reason(&reason)?,
+                    });
                 }
                 Vec::new()
             }
@@ -118,6 +161,94 @@ impl Decoder {
             WireEvent::Error { error } => return Err(error.into_model_error(None)),
             WireEvent::Ping | WireEvent::Other => Vec::new(),
         })
+    }
+
+    /// The DeepSeek profile's checks on the order of events
+    /// (`translate.ts:110-123,148`). Anthropic's own profile trusts the
+    /// order, as it always has.
+    fn check_order(&mut self, event: &WireEvent) -> Result<(), ModelError> {
+        let profile = self.profile;
+        let fail = |detail| Err(broken(profile, detail));
+        match event {
+            WireEvent::MessageStart { .. } if self.started => {
+                fail("a second message_start arrived")
+            }
+            WireEvent::MessageStart { .. } => {
+                self.started = true;
+                Ok(())
+            }
+            // dsh skips event types it doesn't know, wherever they come.
+            WireEvent::Ping | WireEvent::Other | WireEvent::Error { .. } => Ok(()),
+            _ if !self.started => fail("an event arrived before message_start"),
+            WireEvent::ContentBlockStart { .. } if self.stop.is_some() => {
+                fail("a block started after the stop reason")
+            }
+            WireEvent::MessageStop if self.open.is_some() => {
+                fail("the message stopped with a block still open")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The block a `content_block_start` opens. `data` is the event's JSON,
+    /// for the DeepSeek profile to read a tool's starting input from.
+    fn start(&self, block: StartBlock, data: &str) -> Result<Open, ModelError> {
+        Ok(match block {
+            StartBlock::Text { text } => Open::Text(text),
+            StartBlock::Thinking {
+                thinking,
+                signature,
+            } => Open::Thinking {
+                text: thinking,
+                signature,
+            },
+            StartBlock::ToolUse { id, name } => {
+                let initial = match self.profile {
+                    Profile::Anthropic => "{}".to_owned(),
+                    Profile::DeepSeek => {
+                        // `translate.ts:56-57`.
+                        if id.is_empty() || name.is_empty() {
+                            return Err(broken(self.profile, "a tool call has no id or no name"));
+                        }
+                        tool_input(data).ok_or_else(|| {
+                            broken(self.profile, "a tool call's input isn't a JSON object")
+                        })?
+                    }
+                };
+                Open::ToolUse {
+                    id,
+                    name,
+                    initial,
+                    json: String::new(),
+                }
+            }
+            StartBlock::Other => match self.profile {
+                Profile::Anthropic => Open::Skipped,
+                // dsh calls this unsupported content (`translate.ts:60`).
+                // Trying again would get the same kind of block.
+                Profile::DeepSeek => {
+                    return Err(ModelError::new(
+                        ErrorKind::Malformed,
+                        "DeepSeek sent a kind of block Karaka doesn't support",
+                    ));
+                }
+            },
+        })
+    }
+
+    /// Text that a DeepSeek block starts with, passed on as a delta, as dsh
+    /// does (`translate.ts:127-128`). Anthropic starts every block empty.
+    fn initial_delta(&self, open: &Open) -> Option<Event> {
+        if self.profile != Profile::DeepSeek {
+            return None;
+        }
+        match open {
+            Open::Text(text) if !text.is_empty() => Some(Event::TextDelta(text.clone())),
+            Open::Thinking { text, .. } if !text.is_empty() => {
+                Some(Event::ReasoningDelta(text.clone()))
+            }
+            _ => None,
+        }
     }
 
     /// Sends a finished block on, or holds it for the stop reason (see
@@ -135,11 +266,12 @@ impl Decoder {
     /// The held blocks, then [`Event::Done`]. On `max_tokens` the tool calls
     /// among them are dropped, as dsh drops them (`llm/src/assembler.ts:137-141`).
     fn done(&mut self) -> Result<Vec<Event>, ModelError> {
+        let provider = self.profile.name();
         let stop = self.stop.take().ok_or_else(|| {
             // llm-deepseek's `translate.ts:148`.
             ModelError::new(
                 ErrorKind::Malformed,
-                "Anthropic finished without saying why it stopped",
+                format!("{provider} finished without saying why it stopped"),
             )
         })?;
         // A finished answer with nothing in it would end the turn with
@@ -149,8 +281,22 @@ impl Decoder {
         if stop == StopReason::EndTurn && !self.any_block {
             return Err(ModelError::new(
                 ErrorKind::EmptyResponse,
-                "Anthropic finished an answer with no content",
+                format!("{provider} finished an answer with no content"),
             ));
+        }
+        // dsh refuses finished tool arguments that aren't a JSON object,
+        // rather than run a tool on them (`translate.ts:151-158`). Ones cut
+        // off by `max_tokens` are dropped below instead.
+        if self.profile == Profile::DeepSeek && stop != StopReason::MaxTokens {
+            let broken_call = self.held.iter().any(|block| {
+                matches!(block, Block::ToolCall(call) if json_object(&call.arguments).is_none())
+            });
+            if broken_call {
+                return Err(broken(
+                    self.profile,
+                    "a tool call's arguments aren't a JSON object",
+                ));
+            }
         }
         let mut events: Vec<Event> = std::mem::take(&mut self.held)
             .into_iter()
@@ -165,10 +311,11 @@ impl Decoder {
     }
 
     fn delta(&mut self, delta: Delta) -> Result<Option<Event>, ModelError> {
+        let profile = self.profile;
         let open = self
             .open
             .as_mut()
-            .ok_or_else(|| protocol("a delta arrived"))?;
+            .ok_or_else(|| protocol(profile, "a delta arrived"))?;
         Ok(match (open, delta) {
             (Open::Text(text), Delta::Text { text: more }) => {
                 text.push_str(&more);
@@ -179,7 +326,7 @@ impl Decoder {
                 Some(Event::ReasoningDelta(more))
             }
             (Open::Thinking { signature, .. }, Delta::Signature { signature: more }) => {
-                signature.push_str(&more);
+                signature.get_or_insert_default().push_str(&more);
                 None
             }
             // Tool arguments arrive as pieces of JSON that only parse once
@@ -188,14 +335,20 @@ impl Decoder {
                 json.push_str(&partial_json);
                 None
             }
-            (Open::Skipped, _) | (_, Delta::Other) => None,
-            _ => return Err(protocol("a delta of the wrong kind arrived")),
+            (Open::Skipped, _) => None,
+            // A new kind of delta. DeepSeek's profile refuses it
+            // (`translate.ts:87`), below.
+            (_, Delta::Other) if profile == Profile::Anthropic => None,
+            _ => {
+                return Err(broken(profile, "a delta of the wrong kind arrived"));
+            }
         })
     }
 
     fn add_usage(&mut self, wire: WireUsage) {
         // Anthropic's counts are running totals, so a later value replaces an
-        // earlier one rather than adding to it.
+        // earlier one rather than adding to it. DeepSeek's are too
+        // (`translate.ts:34-43`).
         let usage = &mut self.usage;
         let fields = [
             (&mut usage.input_tokens, wire.input_tokens),
@@ -212,26 +365,56 @@ impl Decoder {
             }
         }
     }
+
+    /// A finished block, or `None` for one Karaka skips.
+    fn finish(&self, open: Open) -> Option<Block> {
+        Some(match open {
+            Open::Text(text) => Block::Text(text),
+            // Kept even when the text is empty, as it is unless thinking is set
+            // to be shown: the signature still has to go back next turn.
+            Open::Thinking { text, signature } => Block::Reasoning {
+                text,
+                replay: match self.profile {
+                    Profile::Anthropic => Some(signature.unwrap_or_default()),
+                    // With no signature there's nothing to send back, so
+                    // no model to record either (`translate.ts:53`).
+                    Profile::DeepSeek => {
+                        signature.map(|signature| deepseek::replay(&self.model, &signature))
+                    }
+                },
+            },
+            Open::ToolUse {
+                id,
+                name,
+                initial,
+                json,
+            } => Block::ToolCall(ToolCall {
+                id,
+                name,
+                // A tool without arguments may send no JSON at all.
+                arguments: if json.is_empty() { initial } else { json },
+            }),
+            Open::Skipped => return None,
+        })
+    }
 }
 
-/// A finished block, or `None` for one Karaka skips.
-fn finish(open: Open) -> Option<Block> {
-    Some(match open {
-        Open::Text(text) => Block::Text(text),
-        // Kept even when the text is empty, as it is unless thinking is set
-        // to be shown: the signature still has to go back next turn.
-        Open::Thinking { text, signature } => Block::Reasoning {
-            text,
-            replay: Some(signature),
-        },
-        Open::ToolUse { id, name, json } => Block::ToolCall(ToolCall {
-            id,
-            name,
-            // A tool without arguments may send no JSON at all.
-            arguments: if json.is_empty() { "{}".into() } else { json },
-        }),
-        Open::Skipped => return None,
-    })
+/// The `input` of the tool call that `data`, a `content_block_start` event,
+/// starts, as the server wrote it. `None` unless it is a JSON object.
+fn tool_input(data: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Start<'a> {
+        #[serde(borrow)]
+        content_block: StartedTool<'a>,
+    }
+    #[derive(Deserialize)]
+    struct StartedTool<'a> {
+        #[serde(borrow)]
+        input: &'a RawValue,
+    }
+    let start: Start<'_> = serde_json::from_str(data).ok()?;
+    let input = start.content_block.input.get();
+    input.starts_with('{').then(|| input.to_owned())
 }
 
 /// What a stop reason means, mapped as pi-ai maps it
@@ -268,6 +451,21 @@ fn stop_reason(reason: &str, details: Option<StopDetails>) -> Result<StopReason,
         _ => Err(ModelError::new(
             ErrorKind::Malformed,
             format!("Anthropic stopped for a reason Karaka doesn't know: {reason}"),
+        )),
+    }
+}
+
+/// What a stop reason means for DeepSeek. dsh knows only these four, and
+/// calls any other malformed (`translate.ts:90-97`), refusals and
+/// `pause_turn` among them.
+fn deepseek_stop_reason(reason: &str) -> Result<StopReason, ModelError> {
+    match reason {
+        "end_turn" | "stop_sequence" => Ok(StopReason::EndTurn),
+        "tool_use" => Ok(StopReason::ToolCalls),
+        "max_tokens" => Ok(StopReason::MaxTokens),
+        _ => Err(ModelError::new(
+            ErrorKind::Malformed,
+            format!("DeepSeek stopped for a reason Karaka doesn't know: {reason}"),
         )),
     }
 }
@@ -331,13 +529,18 @@ pub(crate) fn classify(kind: Option<&str>, message: &str, status: Option<u16>) -
     }
 }
 
-/// A stream that broke Anthropic's own rules, which llm-deepseek calls
-/// malformed (`translate.ts:134`).
-fn protocol(what: &str) -> ModelError {
+/// A stream that broke the provider's own rules, which llm-deepseek calls
+/// malformed (`translate.ts:25-27`).
+fn broken(profile: Profile, detail: &str) -> ModelError {
     ModelError::new(
         ErrorKind::Malformed,
-        format!("Anthropic's stream broke its own rules: {what} with no block open"),
+        format!("{}'s stream broke its own rules: {detail}", profile.name()),
     )
+}
+
+/// A delta or a stop with no block open (`translate.ts:134`).
+fn protocol(profile: Profile, what: &str) -> ModelError {
+    broken(profile, &format!("{what} with no block open"))
 }
 
 // What Anthropic sends. Only the fields Karaka reads are declared; serde
@@ -388,7 +591,7 @@ enum StartBlock {
         #[serde(default)]
         thinking: String,
         #[serde(default)]
-        signature: String,
+        signature: Option<String>,
     },
     ToolUse {
         id: String,
@@ -922,5 +1125,337 @@ mod tests {
         .expect_err("the call fails");
 
         assert!(error.message.contains("no block open"), "{error}");
+    }
+
+    // The DeepSeek profile. The cases come from dsh's
+    // `llm-deepseek/tests/stream.spec.ts`, with its fixtures
+    // (`tests/helpers.ts:22-29`).
+
+    /// dsh's test model.
+    const DS_MODEL: &str = "deepseek-v4-flash";
+    const DS_START: &str = r#"{"type":"message_start","message":{"id":"msg_1","model":"deepseek-v4-flash","usage":{"input_tokens":12,"output_tokens":1}}}"#;
+    const DS_TEXT_START: &str =
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#;
+    const DS_TEXT: &str = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello 世界"}}"#;
+
+    fn ds_stop(reason: &str) -> String {
+        format!(
+            r#"{{"type":"message_delta","delta":{{"stop_reason":"{reason}"}},"usage":{{"output_tokens":5}}}}"#
+        )
+    }
+
+    fn deepseek_decode(events: &[&str]) -> Result<Vec<Event>, ModelError> {
+        let mut decoder = Decoder::deepseek(DS_MODEL);
+        let mut out = Vec::new();
+        for event in events {
+            out.extend(decoder.feed(event)?);
+        }
+        Ok(out)
+    }
+
+    fn deepseek_error(events: &[&str]) -> ModelError {
+        deepseek_decode(events).expect_err("the call fails")
+    }
+
+    /// The blocks among `events`, without the deltas and `Done`.
+    fn blocks(events: &[Event]) -> Vec<Block> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Block(block) => Some(block.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// dsh's "emits first-seen blocks, raw tool JSON and cumulative
+    /// disjoint usage before finish".
+    #[test]
+    fn deepseek_signatures_are_bound_to_the_requested_model() {
+        let events = deepseek_decode(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1,"cache_read_input_tokens":30,"cache_creation_input_tokens":7}}}"#,
+            r#"{"type":"content_block_start","index":4,"content_block":{"type":"thinking","thinking":"first","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"thinking_delta","thinking":" thought"}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"signature_delta","signature":"sig"}}"#,
+            r#"{"type":"content_block_delta","index":4,"delta":{"type":"signature_delta","signature":"nature"}}"#,
+            r#"{"type":"content_block_stop","index":4}"#,
+            r#"{"type":"content_block_start","index":9,"content_block":{"type":"tool_use","id":"call_1","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":9,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            r#"{"type":"content_block_delta","index":9,"delta":{"type":"input_json_delta","partial_json":" \"a\"}"}}"#,
+            r#"{"type":"content_block_stop","index":9}"#,
+            r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":3}}"#,
+            &ds_stop("tool_use"),
+            MESSAGE_STOP,
+        ])
+        .expect("the stream decodes");
+
+        assert_eq!(
+            events,
+            [
+                // The text the block started with comes first, as a delta.
+                Event::ReasoningDelta("first".into()),
+                Event::ReasoningDelta(" thought".into()),
+                Event::Block(Block::Reasoning {
+                    text: "first thought".into(),
+                    replay: Some(crate::deepseek::replay(DS_MODEL, "signature")),
+                }),
+                Event::Block(Block::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path": "a"}"#.into(),
+                })),
+                Event::Done {
+                    stop: StopReason::ToolCalls,
+                    usage: Usage {
+                        input_tokens: 12,
+                        output_tokens: 5,
+                        cache_read_tokens: 30,
+                        cache_write_tokens: 7,
+                    },
+                },
+            ]
+        );
+    }
+
+    /// dsh's "streams text already present in the starting block".
+    #[test]
+    fn deepseek_text_in_the_starting_block_is_streamed() {
+        let events = deepseek_decode(&[
+            DS_START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"initial"}}"#,
+            BLOCK_STOP,
+            &ds_stop("end_turn"),
+            MESSAGE_STOP,
+        ])
+        .expect("the stream decodes");
+        assert_eq!(events[0], Event::TextDelta("initial".into()));
+        assert_eq!(events[1], Event::Block(Block::Text("initial".into())));
+    }
+
+    /// dsh's "preserves initial tool input %j without JSON deltas".
+    #[test]
+    fn a_deepseek_tool_keeps_its_starting_input_without_json_pieces() {
+        for input in ["{}", r#"{"key":"initial"}"#] {
+            let start = format!(
+                r#"{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"a","name":"read","input":{input}}}}}"#
+            );
+            let events = deepseek_decode(&[
+                DS_START,
+                &start,
+                BLOCK_STOP,
+                &ds_stop("tool_use"),
+                MESSAGE_STOP,
+            ])
+            .expect("the stream decodes");
+            let blocks = blocks(&events);
+            let [Block::ToolCall(call)] = blocks.as_slice() else {
+                panic!("expected one tool call, got {events:?}");
+            };
+            assert_eq!(call.arguments, input);
+        }
+    }
+
+    /// dsh's "preserves signature-only thinking and prunes truncated tools
+    /// with their replay entries". A thinking block with no signature at
+    /// all keeps no replay.
+    #[test]
+    fn deepseek_signature_only_thinking_is_kept_and_a_cut_off_tool_dropped() {
+        let events = deepseek_decode(&[
+            DS_START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"opaque"}}"#,
+            BLOCK_STOP,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"unsigned"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"a","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            &ds_stop("max_tokens"),
+            MESSAGE_STOP,
+        ])
+        .expect("the stream decodes");
+        assert_eq!(
+            blocks(&events),
+            [
+                Block::Reasoning {
+                    text: String::new(),
+                    replay: Some(crate::deepseek::replay(DS_MODEL, "opaque")),
+                },
+                Block::Reasoning {
+                    text: "unsigned".into(),
+                    replay: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn deepseek_end_turn_and_stop_sequence_are_normal_stops() {
+        for reason in ["end_turn", "stop_sequence"] {
+            let events = deepseek_decode(&[
+                DS_START,
+                r#"{"type":"future_event"}"#,
+                DS_TEXT_START,
+                DS_TEXT,
+                BLOCK_STOP,
+                &ds_stop(reason),
+                MESSAGE_STOP,
+            ])
+            .expect("the stream decodes");
+            assert!(matches!(
+                events.last(),
+                Some(Event::Done {
+                    stop: StopReason::EndTurn,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// dsh's "rejects malformed event ordering or fields %#", for every
+    /// case Karaka can tell apart.
+    #[test]
+    fn deepseek_streams_that_break_the_rules_are_malformed() {
+        let negative_usage =
+            r#"{"type":"message_delta","delta":{},"usage":{"input_tokens":-1}}"#.to_owned();
+        let cases: Vec<Vec<String>> = vec![
+            vec![DS_START.into(), DS_START.into()],
+            vec![DS_TEXT_START.into()],
+            vec![DS_START.into(), BLOCK_STOP.into()],
+            vec![
+                DS_START.into(),
+                DS_TEXT_START.into(),
+                BLOCK_STOP.into(),
+                BLOCK_STOP.into(),
+            ],
+            vec![
+                DS_START.into(),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":2}}"#.into(),
+            ],
+            vec![
+                DS_START.into(),
+                DS_TEXT_START.into(),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"bad"}}"#.into(),
+            ],
+            vec![DS_START.into(), ds_stop("mystery")],
+            vec![DS_START.into(), MESSAGE_STOP.into()],
+            vec![
+                DS_START.into(),
+                DS_TEXT_START.into(),
+                ds_stop("end_turn"),
+                MESSAGE_STOP.into(),
+            ],
+            vec![DS_START.into(), negative_usage],
+            vec![DS_START.into(), ds_stop("end_turn"), DS_TEXT_START.into()],
+            vec![
+                DS_START.into(),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"read","input":{}}}"#.into(),
+            ],
+            vec![
+                DS_START.into(),
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"x","name":"read","input":[]}}"#.into(),
+            ],
+            // A delta of a kind nobody knows. Anthropic's profile skips it.
+            vec![
+                DS_START.into(),
+                DS_TEXT_START.into(),
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta"}}"#.into(),
+            ],
+        ];
+        for events in cases {
+            let events: Vec<&str> = events.iter().map(String::as_str).collect();
+            let error = deepseek_error(&events);
+            assert_eq!(error.kind, ErrorKind::Malformed, "{events:?}: {error}");
+        }
+    }
+
+    /// dsh's "refuses completed non-object tool JSON %s without repairing
+    /// it".
+    #[test]
+    fn deepseek_tool_arguments_that_arent_an_object_are_malformed() {
+        for json in ["{", "[]"] {
+            let delta = format!(
+                r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":"{json}"}}}}"#
+            );
+            let error = deepseek_error(&[
+                DS_START,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"read","input":{}}}"#,
+                &delta,
+                BLOCK_STOP,
+                &ds_stop("tool_use"),
+                MESSAGE_STOP,
+            ]);
+            assert_eq!(error.kind, ErrorKind::Malformed, "{json}");
+            assert!(error.message.contains("aren't a JSON object"), "{error}");
+        }
+    }
+
+    /// dsh's "refuses unsupported response content, empty responses and
+    /// premature EOF". The early end of the stream is the HTTP side's job.
+    #[test]
+    fn deepseek_refuses_blocks_it_doesnt_support_and_empty_answers() {
+        let error = deepseek_error(&[
+            DS_START,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"x"}}"#,
+        ]);
+        assert_eq!(error.kind, ErrorKind::Malformed);
+        assert!(!error.kind.is_retryable());
+
+        let error = deepseek_error(&[DS_START, &ds_stop("end_turn"), MESSAGE_STOP]);
+        assert_eq!(error.kind, ErrorKind::EmptyResponse);
+        assert_eq!(error.message, "DeepSeek finished an answer with no content");
+    }
+
+    /// dsh knows only four stop reasons. A refusal or a paused turn, which
+    /// Anthropic's profile reads, is malformed from DeepSeek.
+    #[test]
+    fn deepseek_knows_only_four_stop_reasons() {
+        for reason in [
+            "refusal",
+            "pause_turn",
+            "sensitive",
+            "model_context_window_exceeded",
+        ] {
+            let error = deepseek_error(&[DS_START, &ds_stop(reason)]);
+            assert_eq!(error.kind, ErrorKind::Malformed, "{reason}");
+            assert_eq!(
+                error.message,
+                format!("DeepSeek stopped for a reason Karaka doesn't know: {reason}")
+            );
+        }
+    }
+
+    /// dsh's "normalizes in-band overloads", and an error with nothing in
+    /// it, which dsh counts as a server error.
+    #[test]
+    fn deepseek_error_events_are_read_whatever_they_hold() {
+        let error = deepseek_error(&[
+            DS_START,
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+        ]);
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.message, "busy");
+
+        let error = deepseek_error(&[r#"{"type":"error","error":{}}"#]);
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.message, "DeepSeek's request failed (stream error)");
+
+        let error = deepseek_error(&[r#"{"type":"error"}"#]);
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+    }
+
+    /// The same malformed stream from Anthropic still goes by Anthropic's
+    /// looser rules.
+    #[test]
+    fn the_anthropic_profile_keeps_its_own_rules() {
+        let events = decode(&[
+            TEXT_START,
+            HEL,
+            BLOCK_STOP,
+            &stop("end_turn", "null"),
+            MESSAGE_STOP,
+        ])
+        .expect("Anthropic doesn't check for message_start");
+        assert_eq!(events[0], Event::TextDelta("Hel".into()));
     }
 }

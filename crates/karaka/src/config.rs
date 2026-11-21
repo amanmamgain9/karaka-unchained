@@ -4,13 +4,20 @@
 //! These variables are a stopgap. They will move to the YAML config file,
 //! whose sections fill the plugins' typed configs directly.
 
-use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
+use karaka_anthropic::{
+    AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
+};
 use karaka_kernel::DynPlugin;
 use karaka_model::{Effort, ModelsPlugin};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
 
 /// Used when `KARAKA_MODEL` isn't set and the provider is Anthropic.
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5-5";
+
+/// Used when `KARAKA_MODEL` isn't set and the provider is DeepSeek. dsh's
+/// default (`bundle/base/cordis.patch.yml:94`), the first model in
+/// llm-deepseek's catalog (`models.ts:8`).
+const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-flash";
 
 /// Everything `karaka ask` needs besides the question.
 #[derive(Debug)]
@@ -28,6 +35,9 @@ pub struct Config {
 #[derive(Debug)]
 pub enum Provider {
     Anthropic(AnthropicConfig),
+    /// DeepSeek, through the Anthropic crate's DeepSeek profile, as dsh v4
+    /// talks to it.
+    DeepSeek(AnthropicConfig),
     OpenAi(OpenAiConfig),
 }
 
@@ -35,7 +45,7 @@ impl Provider {
     /// The route the provider's model is registered under.
     pub fn route(&self) -> &str {
         match self {
-            Self::Anthropic(config) => &config.route,
+            Self::Anthropic(config) | Self::DeepSeek(config) => &config.route,
             Self::OpenAi(config) => &config.route,
         }
     }
@@ -44,7 +54,9 @@ impl Provider {
     /// which registers its model there.
     pub fn plugins(self) -> Vec<Box<dyn DynPlugin>> {
         let provider: Box<dyn DynPlugin> = match self {
-            Self::Anthropic(config) => Box::new(AnthropicPlugin::new(config)),
+            Self::Anthropic(config) | Self::DeepSeek(config) => {
+                Box::new(AnthropicPlugin::new(config))
+            }
             Self::OpenAi(config) => Box::new(OpenAiPlugin::new(config)),
         };
         vec![Box::new(ModelsPlugin), provider]
@@ -108,9 +120,45 @@ impl Config {
                     default_effort: None,
                     thinking_display: Some(thinking_display),
                     cache,
+                    profile: Profile::Anthropic,
+                    thinking: None,
                 };
                 let model = model.unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_owned());
                 (Provider::Anthropic(config), model)
+            }
+            "deepseek" => {
+                let api_key = var("DEEPSEEK_API_KEY").ok_or(
+                    "DEEPSEEK_API_KEY is not set. The deepseek provider needs it to call the API.",
+                )?;
+                // Unset leaves thinking on, as in dsh.
+                let thinking = match var("DEEPSEEK_THINKING") {
+                    Some(value) => Some(choice(
+                        "DEEPSEEK_THINKING",
+                        &value,
+                        &[
+                            ("enabled", DeepSeekThinking::Enabled),
+                            ("disabled", DeepSeekThinking::Disabled),
+                        ],
+                    )?),
+                    None => None,
+                };
+                let config = AnthropicConfig {
+                    route,
+                    api_key,
+                    // dsh reads the same variable (`config.ts:118`).
+                    base_url: var("DEEPSEEK_BASE_URL"),
+                    // The request carries `KARAKA_MAX_TOKENS` and
+                    // `KARAKA_EFFORT` itself. Without them, DeepSeek's
+                    // profile sends dsh's defaults: 256,000 and high.
+                    default_max_tokens: None,
+                    default_effort: None,
+                    thinking_display: None,
+                    cache: CacheMode::default(),
+                    profile: Profile::DeepSeek,
+                    thinking,
+                };
+                let model = model.unwrap_or_else(|| DEFAULT_DEEPSEEK_MODEL.to_owned());
+                (Provider::DeepSeek(config), model)
             }
             "openai" => {
                 let base_url = var("OPENAI_BASE_URL").ok_or(
@@ -136,7 +184,7 @@ impl Config {
             }
             other => {
                 return Err(format!(
-                    "KARAKA_PROVIDER is \"{other}\", but it must be \"anthropic\" or \"openai\""
+                    "KARAKA_PROVIDER is \"{other}\", but it must be \"anthropic\", \"deepseek\" or \"openai\""
                 ));
             }
         };
@@ -201,7 +249,7 @@ fn choice<T: Copy>(variable: &str, text: &str, options: &[(&str, T)]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use karaka_anthropic::{CacheMode, ThinkingDisplay};
+    use karaka_anthropic::{CacheMode, DeepSeekThinking, Profile, ThinkingDisplay};
     use karaka_model::Effort;
 
     use super::{Config, Provider};
@@ -430,7 +478,7 @@ mod tests {
         let error = config(&[("KARAKA_PROVIDER", "gemini")]).expect_err("the config is rejected");
         assert_eq!(
             error,
-            "KARAKA_PROVIDER is \"gemini\", but it must be \"anthropic\" or \"openai\""
+            "KARAKA_PROVIDER is \"gemini\", but it must be \"anthropic\", \"deepseek\" or \"openai\""
         );
     }
 
@@ -446,6 +494,96 @@ mod tests {
     #[test]
     fn debug_output_leaves_out_the_keys() {
         let config = config(&[("ANTHROPIC_API_KEY", "sk-secret")]).expect("the config reads");
+        assert!(!format!("{config:?}").contains("sk-secret"));
+    }
+
+    #[test]
+    fn deepseek_needs_only_a_key_and_speaks_the_messages_format() {
+        let config = config(&[
+            ("KARAKA_PROVIDER", "deepseek"),
+            ("DEEPSEEK_API_KEY", "sk-test"),
+        ])
+        .expect("the config reads");
+        let Provider::DeepSeek(deepseek) = &config.provider else {
+            panic!("expected deepseek, got {config:?}");
+        };
+        assert_eq!(deepseek.profile, Profile::DeepSeek);
+        assert_eq!(deepseek.api_key, "sk-test");
+        assert_eq!(deepseek.base_url, None);
+        assert_eq!(deepseek.thinking, None);
+        assert_eq!(deepseek.thinking_display, None);
+        assert_eq!(deepseek.default_max_tokens, None);
+        assert_eq!(config.provider.route(), "deepseek");
+        assert_eq!(config.model, "deepseek-flash");
+    }
+
+    #[test]
+    fn every_deepseek_setting_is_read() {
+        let config = config(&[
+            ("KARAKA_PROVIDER", "deepseek"),
+            ("KARAKA_ROUTE", "deepseek-team"),
+            ("KARAKA_MODEL", "deepseek-v4-pro"),
+            ("KARAKA_MAX_TOKENS", "393216"),
+            ("KARAKA_EFFORT", "max"),
+            ("DEEPSEEK_API_KEY", "sk-test"),
+            ("DEEPSEEK_BASE_URL", "http://localhost:8080/anthropic"),
+            ("DEEPSEEK_THINKING", "disabled"),
+        ])
+        .expect("the config reads");
+        let Provider::DeepSeek(deepseek) = &config.provider else {
+            panic!("expected deepseek, got {config:?}");
+        };
+        assert_eq!(
+            deepseek.base_url.as_deref(),
+            Some("http://localhost:8080/anthropic")
+        );
+        assert_eq!(deepseek.thinking, Some(DeepSeekThinking::Disabled));
+        assert_eq!(config.provider.route(), "deepseek-team");
+        assert_eq!(config.model, "deepseek-v4-pro");
+        assert_eq!(config.max_tokens, Some(393_216));
+        assert_eq!(config.effort, Some(Effort::Max));
+    }
+
+    #[test]
+    fn a_missing_deepseek_key_is_named() {
+        let error = config(&[("KARAKA_PROVIDER", "deepseek")]).expect_err("the config is rejected");
+        assert!(error.starts_with("DEEPSEEK_API_KEY is not set"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_deepseek_thinking_setting_is_rejected() {
+        let error = config(&[
+            ("KARAKA_PROVIDER", "deepseek"),
+            ("DEEPSEEK_API_KEY", "k"),
+            ("DEEPSEEK_THINKING", "on"),
+        ])
+        .expect_err("the config is rejected");
+        assert_eq!(
+            error,
+            "DEEPSEEK_THINKING is \"on\", but it must be enabled or disabled"
+        );
+    }
+
+    #[test]
+    fn the_deepseek_plugin_is_named_after_its_route() {
+        let config = config(&[("KARAKA_PROVIDER", "deepseek"), ("DEEPSEEK_API_KEY", "k")])
+            .expect("the config reads");
+        let names: Vec<String> = config
+            .provider
+            .plugins()
+            .iter()
+            .map(|plugin| plugin.name().to_owned())
+            .collect();
+        assert_eq!(names, ["models", "deepseek"]);
+    }
+
+    #[test]
+    fn debug_output_leaves_out_the_deepseek_key() {
+        let config = config(&[
+            ("KARAKA_PROVIDER", "deepseek"),
+            ("DEEPSEEK_API_KEY", "sk-secret"),
+        ])
+        .expect("the config reads");
         assert!(!format!("{config:?}").contains("sk-secret"));
     }
 }
