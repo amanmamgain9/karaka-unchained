@@ -225,3 +225,64 @@ Also still open:
   or the providers.
 - **Unknown event types.** They pass through even when not marked
   `ignorable`, where dsh refuses them.
+
+## Second audit against dsh v4, 2026-11-21
+
+Two fresh read-only audits compared the code with dsh tag
+`dsh-v0.2.1-rc.2` and with pi-ai 1.1.0, the version Play This Life has
+installed.
+
+### Sessions: they follow v4 on real data
+
+All 485 events in Play This Life's captured logs load and write back
+value-equal. They also derive the same history v4 does. Repair matches
+v4 on every prefix of every log. The remaining gaps, most important
+first:
+
+1. **System messages later in the history.** v4 folds only the
+   *leading* system messages into the system prompt (`llm-pi-ai`
+   `context.ts`, `splitSystemPrompt`, checked). A later system message
+   stays where it is. Play This Life's route is `in-history`, so a
+   changed prompt is appended as a new system node. Karaka joins every
+   system node into one prompt, so the stale and new instructions both
+   reach the model.
+2. **Reasoning signatures don't record their model.** v4 and pi-ai
+   replay a signature only to the provider, API and model that made it,
+   and turn it into text otherwise. Karaka's `Block::Reasoning.replay`
+   has no record of where it came from. It also writes `replayState`
+   with no `response` half, which v4 would treat as foreign.
+3. **Karaka accepts events v4 refuses.** One case: a `tool/result`
+   whose `toolCallId` differs from `source.callId`. Repair and
+   derivation then disagree about that call.
+4. **Restore writes no `session/end-seed`**, so seqs after a resume end
+   up one lower than v4's.
+5. **Developer messages.** Their tool additions and removals are
+   dropped, where v4 sends them.
+
+### Providers: Anthropic close, DeepSeek wrong protocol
+
+- **DeepSeek uses the wrong API format.** dsh v4's `llm-deepseek` speaks
+  Anthropic's Messages format at `https://api.deepseek.com/anthropic`,
+  checked in `config.ts:115` and `adapter.ts:144`. It sends signed
+  thinking blocks, `output_config.effort` (low, high or max), `tool_result`
+  blocks, and always a `max_tokens` (Play This Life: 393,216). Karaka's
+  DeepSeek route uses Chat Completions. The real calls worked, but they
+  don't match what dsh sends. The Messages-format crate could serve
+  DeepSeek with a DeepSeek profile: `thinking: enabled|disabled`, no
+  cache markers, unsigned thinking kept as thinking, and a `max_tokens`
+  default.
+- **Failures that look like success**, on both providers:
+  - refusal, `sensitive`, `content_filter` and unknown stop reasons
+    finish as a normal stop;
+  - a reply with no content isn't `EMPTY_RESPONSE`;
+  - there's no error kind for context-window overflow, which compaction
+    needs before it can recover a full context;
+  - tool calls cut off by `max_tokens` are kept.
+- **Unsafe default.** Thinking display and `block_binding` are off
+  unless configured. pi-ai always sends them for Haiku 5.5.
+- **Effort wire.** pi-ai also sends per-message effort markers behind a
+  beta header. The effective level is the same, but changing effort
+  mid-session breaks Karaka's cache.
+- **Tools.** pi-ai sends a trimmed tool schema and
+  `eager_input_streaming`. It also adds synthetic results for orphaned
+  tool calls.
