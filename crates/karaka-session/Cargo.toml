@@ -1,0 +1,20 @@
+[package]
+name = "karaka-session"
+description = "The session seam: an append-only event log per session, and the in-memory store that holds them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# No id generator and no serde yet. Callers supply session ids, and events
+# get `Serialize`/`Deserialize` when the first persistence plugin needs them.
+[dependencies]
+# For the plugin that puts the store in a runtime.
+karaka-kernel.workspace = true
+# The conversation types the log records and derives.
+karaka-model.workspace = true
+
+# Only for running the async plugin test.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

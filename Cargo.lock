@@ -625,6 +625,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-session"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-model",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-sse"
 version = "0.1.0"
 
