@@ -343,12 +343,7 @@ mod tests {
     }
 
     fn attempt() -> SessionEvent {
-        SessionEvent::Passthrough(crate::Passthrough {
-            event_type: "assistant/attempt".into(),
-            data: json!({ "turn": 1, "step": 1, "stream": [] }),
-            surface_op: None,
-            source_event_seqs: None,
-        })
+        SessionEvent::assistant_attempt(1, 1)
     }
 
     // dsh v4 session.spec.ts: "derives message history from the event log".

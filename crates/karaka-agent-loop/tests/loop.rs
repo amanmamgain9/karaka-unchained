@@ -17,13 +17,14 @@ use karaka_agent::{Agent, Agents};
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
 use karaka_model::{
-    Block, ErrorKind, Event, EventStream, Message, Model, ModelError, ModelRegistry, ModelsPlugin,
-    Request, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
+    Block, Effort, ErrorKind, Event, EventStream, Message, Model, ModelError, ModelRegistry,
+    ModelsPlugin, Request, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
 };
 use karaka_session::{
-    CancelCause, Entry, Failure, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin,
-    SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TokenUsage, TurnEndReason, UserMessage,
-    UserSource,
+    CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
+    RequestHeaderData, RequestHeaderReason, Seq, SessionEvent, SessionId, SessionStore,
+    SessionsPlugin, SurfaceIntent, SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TokenUsage,
+    TurnEndReason, UserMessage, UserSource,
 };
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::Value;
@@ -239,6 +240,7 @@ impl Tool for Stuck {
 struct Harness {
     model: Arc<Scripted>,
     sessions: Arc<SessionStore>,
+    tools: Arc<ToolRegistry>,
     agents: Arc<dyn Agents>,
     stuck: Arc<Notify>,
     stuck_dropped: Arc<AtomicBool>,
@@ -284,6 +286,7 @@ impl Harness {
         Self {
             model,
             sessions,
+            tools,
             agents: runtime.get::<dyn Agents>(),
             stuck,
             stuck_dropped,
@@ -304,6 +307,28 @@ impl Harness {
         self.events()
             .iter()
             .map(|entry| entry.event.event_type().to_owned())
+            .collect()
+    }
+
+    /// Every `request/header`, in order.
+    fn headers(&self) -> Vec<RequestHeaderData> {
+        self.events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                SessionEvent::RequestHeader(data) => Some(data),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `request/context`, in order.
+    fn contexts(&self) -> Vec<RequestContext> {
+        self.events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                SessionEvent::RequestContext(context) => Some(context),
+                _ => None,
+            })
             .collect()
     }
 
@@ -336,6 +361,17 @@ fn config(system: Option<&str>) -> LoopConfig {
     config
 }
 
+/// The context the loop logs for `model` at the scripted provider.
+fn context(model: &str) -> RequestContext {
+    RequestContext {
+        provider: PROVIDER.into(),
+        model: model.into(),
+        context_window: None,
+        system_prompt_update: Some(IN_HISTORY.into()),
+        extra: Extra::new(),
+    }
+}
+
 fn user(text: &str) -> UserMessage {
     UserMessage::text(format!("user-{text}"), UserSource::user(), text)
 }
@@ -347,11 +383,15 @@ async fn idle(agent: &dyn Agent) {
         .expect("the agent goes idle");
 }
 
-/// The events of one plain step, from `step/start` to `step/end`.
-const ANSWER_STEP: [&str; 5] = [
+/// The events of a session's first step, from `step/start` to `step/end`:
+/// the prompt, the message, the first request's header and context, and the
+/// answer.
+const ANSWER_STEP: [&str; 7] = [
     "step/start",
     "system/message",
     "user/message",
+    "request/header",
+    "request/context",
     "assistant/message",
     "step/end",
 ];
@@ -389,14 +429,36 @@ async fn a_plain_answer_logs_one_step() {
 
     // The answer names the provider, not the route, and keeps its usage.
     let events = harness.events();
-    let SessionEvent::AssistantMessage { data, .. } = &events[4].event else {
-        panic!("expected the answer, got {:?}", events[4].event);
+    let SessionEvent::AssistantMessage { data, .. } = &events[6].event else {
+        panic!("expected the answer, got {:?}", events[6].event);
     };
     assert_eq!((data.turn, data.step), (1, 1));
     assert_eq!(data.message.source.provider, PROVIDER);
     assert_eq!(data.message.source.model, MODEL);
     assert_eq!(data.usage, Some(TokenUsage::from(usage())));
     assert!(!data.interrupted);
+
+    // The first request logs an `initial` header, naming the provider, the
+    // model and every tool, then the route's context.
+    let all_tools: Vec<ToolSchema> = harness.tools.schemas();
+    assert_eq!(
+        harness.headers(),
+        [RequestHeaderData {
+            header: RequestHeader::new(CallConfig::new(PROVIDER, MODEL), &all_tools).unwrap(),
+            reason: RequestHeaderReason::Initial,
+            starts_series: false,
+            extra: Extra::new(),
+        }]
+    );
+    assert_eq!(
+        serde_json::to_value(&events[4]).unwrap()["data"]["header"]["tools"][0],
+        serde_json::json!({
+            "name": "echo",
+            "description": "The echo tool.",
+            "parameters": { "type": "object", "properties": { "text": { "type": "string" } } },
+        })
+    );
+    assert_eq!(harness.contexts(), [context(MODEL)]);
 
     // The request came from the log: the prompt, the user's message, and
     // every tool.
@@ -441,6 +503,8 @@ async fn a_tool_round_trip_logs_the_call_and_its_result() {
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
+            "request/context",
             "assistant/message",
             "tool/call",
             "tool/result",
@@ -455,7 +519,7 @@ async fn a_tool_round_trip_logs_the_call_and_its_result() {
 
     // The result cites the `tool/call` that started it.
     let events = harness.events();
-    let (result, sources, error) = tool_result(&events[6]);
+    let (result, sources, error) = tool_result(&events[8]);
     assert_eq!(
         result,
         ToolResult {
@@ -464,7 +528,7 @@ async fn a_tool_round_trip_logs_the_call_and_its_result() {
             is_error: false
         }
     );
-    assert_eq!(sources, [5]);
+    assert_eq!(sources, [7]);
     assert_eq!(error, None);
 
     // The second request carries the call and its result.
@@ -507,6 +571,8 @@ async fn two_calls_in_one_step_run_in_the_models_order() {
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
+            "request/context",
             "assistant/message",
             "tool/call",
             "tool/result",
@@ -520,18 +586,18 @@ async fn two_calls_in_one_step_run_in_the_models_order() {
         ]
     );
     let events = harness.events();
-    let first = tool_result(&events[6]);
-    let second = tool_result(&events[8]);
+    let first = tool_result(&events[8]);
+    let second = tool_result(&events[10]);
     assert_eq!(
         (first.0.call_id.as_str(), first.0.content.as_str()),
         ("c1", "echo: one")
     );
-    assert_eq!(first.1, [5]);
+    assert_eq!(first.1, [7]);
     assert_eq!(
         (second.0.call_id.as_str(), second.0.content.as_str()),
         ("c2", "echo: two")
     );
-    assert_eq!(second.1, [7]);
+    assert_eq!(second.1, [9]);
 
     // Both results go back in one user message, in the model's order.
     let requests = harness.model.requests();
@@ -548,11 +614,11 @@ async fn an_unknown_tool_gets_an_error_result_and_the_turn_carries_on() {
     harness.say("weather?").await;
 
     let events = harness.events();
-    assert_eq!(events[5].event.event_type(), "tool/call");
-    let (result, sources, _) = tool_result(&events[6]);
+    assert_eq!(events[7].event.event_type(), "tool/call");
+    let (result, sources, _) = tool_result(&events[8]);
     assert_eq!(result.content, "Error: unknown tool \"weather\"");
     assert!(result.is_error);
-    assert_eq!(sources, [5]);
+    assert_eq!(sources, [7]);
     assert_eq!(harness.endings(), [TurnEndReason::Completed]);
     assert_eq!(harness.model.requests().len(), 2);
 }
@@ -566,11 +632,11 @@ async fn arguments_that_arent_json_get_an_error_result() {
     harness.say("use the tool").await;
 
     let events = harness.events();
-    let SessionEvent::ToolCall(started) = &events[5].event else {
-        panic!("expected the call, got {:?}", events[5].event);
+    let SessionEvent::ToolCall(started) = &events[7].event else {
+        panic!("expected the call, got {:?}", events[7].event);
     };
     assert_eq!(started.arguments, "not json");
-    let (result, _, _) = tool_result(&events[6]);
+    let (result, _, _) = tool_result(&events[8]);
     assert_eq!(
         result.content,
         "Error: invalid arguments: \"arguments\" must be an object"
@@ -589,7 +655,7 @@ async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
     harness.say("weather?").await;
 
     let events = harness.events();
-    let (result, _, error) = tool_result(&events[6]);
+    let (result, _, error) = tool_result(&events[8]);
     assert_eq!(
         result,
         ToolResult {
@@ -664,6 +730,7 @@ async fn a_model_error_ends_the_turn_with_a_structured_failure() {
     harness.say("hi").await;
 
     // No assistant message: the partial answer belongs to a failed call.
+    // An attempt records that the call was made (dsh: `agent.ts:489-494`).
     assert_eq!(
         harness.types(),
         [
@@ -671,6 +738,9 @@ async fn a_model_error_ends_the_turn_with_a_structured_failure() {
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
+            "request/context",
+            "assistant/attempt",
             "step/end",
             "turn/end",
         ]
@@ -768,6 +838,19 @@ async fn a_route_with_no_model_ends_the_turn_with_no_adapter() {
         "no model is registered under the route \"nowhere\""
     );
     assert!(harness.model.requests().is_empty());
+    // No model, so no provider to name in a header, and no call to leave an
+    // attempt.
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
 }
 
 /// dsh: "cancel() mid-stream ends the turn with reason aborted"
@@ -800,8 +883,8 @@ async fn a_cancel_mid_stream_keeps_the_partial_answer() {
     );
 
     let events = harness.events();
-    let SessionEvent::AssistantMessage { data, op } = &events[4].event else {
-        panic!("expected the partial answer, got {:?}", events[4].event);
+    let SessionEvent::AssistantMessage { data, op } = &events[6].event else {
+        panic!("expected the partial answer, got {:?}", events[6].event);
     };
     assert!(data.interrupted);
     assert_eq!(*op, SurfaceOp::Append);
@@ -848,6 +931,8 @@ async fn a_cancel_before_any_text_keeps_no_answer() {
     agent.cancel(CancelCause::User);
     idle(agent.as_ref()).await;
 
+    // An attempt records the call that left nothing to keep (dsh:
+    // `agent.ts:483-488`).
     assert_eq!(
         harness.types(),
         [
@@ -855,6 +940,9 @@ async fn a_cancel_before_any_text_keeps_no_answer() {
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
+            "request/context",
+            "assistant/attempt",
             "step/end",
             "turn/end",
         ]
@@ -894,6 +982,8 @@ async fn a_cancel_during_a_tool_call_answers_every_call() {
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
+            "request/context",
             "assistant/message",
             "tool/call",
             "tool/result",
@@ -909,12 +999,12 @@ async fn a_cancel_during_a_tool_call_answers_every_call() {
         })]
     );
     let events = harness.events();
-    let (started, sources, code) = tool_result(&events[6]);
+    let (started, sources, code) = tool_result(&events[8]);
     assert_eq!(started.call_id, "c1");
     assert!(started.is_error);
-    assert_eq!(sources, [5]);
+    assert_eq!(sources, [7]);
     assert_eq!(code.as_deref(), Some(TOOL_OUTCOME_UNKNOWN));
-    let (skipped, sources, code) = tool_result(&events[7]);
+    let (skipped, sources, code) = tool_result(&events[9]);
     assert_eq!(skipped.call_id, "c2");
     assert!(sources.is_empty());
     assert_eq!(code.as_deref(), Some(TOOL_NOT_STARTED));
@@ -1060,12 +1150,31 @@ async fn a_reloaded_session_sends_its_earlier_tool_results() {
         SessionEvent::turn_start(2),
         "the turns carry on numbering"
     );
-    // The prompt hasn't changed, so none is logged.
-    assert!(
-        !events[stored.len()..]
-            .iter()
-            .any(|entry| entry.event.event_type() == "system/message")
+    // A new loop's first request logs a `resume` header. The prompt and the
+    // route haven't changed, so no system message and no context.
+    let after_types: Vec<&str> = events[stored.len()..]
+        .iter()
+        .map(|entry| entry.event.event_type())
+        .collect();
+    assert_eq!(
+        after_types,
+        [
+            "turn/start",
+            "step/start",
+            "user/message",
+            "request/header",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
     );
+    let headers = after.headers();
+    assert_eq!(
+        headers.iter().map(|data| data.reason).collect::<Vec<_>>(),
+        [RequestHeaderReason::Initial, RequestHeaderReason::Resume]
+    );
+    assert_eq!(headers[0].header, headers[1].header);
+    assert_eq!(after.contexts().len(), 1);
 }
 
 /// A stored log whose last turn a crash left open is closed before the
@@ -1076,12 +1185,12 @@ async fn opening_a_session_a_crash_left_open_closes_its_turn() {
     let crashed = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
     crashed.say("use the tool").await;
     // Cut the log just after the call started, as a crash would.
-    let stored: Vec<Entry> = crashed.events().into_iter().take(6).collect();
-    assert_eq!(stored[5].event.event_type(), "tool/call");
+    let stored: Vec<Entry> = crashed.events().into_iter().take(8).collect();
+    assert_eq!(stored[7].event.event_type(), "tool/call");
 
     let after = Harness::with(vec![text("recovered")], config(None), stored).await;
     let _agent = after.agent();
-    assert_eq!(after.types()[6..], ["tool/result", "step/end", "turn/end"]);
+    assert_eq!(after.types()[8..], ["tool/result", "step/end", "turn/end"]);
     assert_eq!(after.endings(), [TurnEndReason::Interrupted]);
 
     after.say("again").await;
@@ -1107,12 +1216,13 @@ async fn a_changed_prompt_is_logged_where_it_changed() {
     after.say("second").await;
 
     assert_eq!(
-        after.types()[7..],
+        after.types()[9..],
         [
             "turn/start",
             "step/start",
             "system/message",
             "user/message",
+            "request/header",
             "assistant/message",
             "step/end",
             "turn/end",
@@ -1136,8 +1246,8 @@ async fn a_removed_prompt_is_cleared_from_the_history() {
 
     let events = after.events();
     // Seq 2 held the prompt; 7 and 8 open the new turn and its step.
-    let SessionEvent::SystemMessage { data, surface } = &events[9].event else {
-        panic!("expected the cleared prompt, got {:?}", events[9].event);
+    let SessionEvent::SystemMessage { data, surface } = &events[11].event else {
+        panic!("expected the cleared prompt, got {:?}", events[11].event);
     };
     assert!(data.message.content.is_empty());
     assert_eq!(
@@ -1156,6 +1266,10 @@ async fn a_removed_prompt_is_cleared_from_the_history() {
             .iter()
             .all(|message| message.role != Role::System)
     );
+    // The replacement starts a new series, so the `resume` header says so.
+    let headers = after.headers();
+    assert_eq!(headers[1].reason, RequestHeaderReason::Resume);
+    assert!(headers[1].starts_series);
 }
 
 /// Followups sent from threads outside the runtime, such as one reading
@@ -1181,4 +1295,214 @@ async fn followups_from_other_threads_run_one_turn_at_a_time() {
         .collect();
     assert_eq!(brackets, ["turn/start", "turn/end"].repeat(4));
     assert_eq!(harness.model.requests().len(), 4);
+}
+
+fn reasons(harness: &Harness) -> Vec<RequestHeaderReason> {
+    harness.headers().iter().map(|data| data.reason).collect()
+}
+
+/// A loop over a stored log whose model differs logs a `resume` header for
+/// the new model, and a new context. dsh logs `resume` for every loop's
+/// first request, changed or not ("a fresh loop instance over a seeded log
+/// anchors with a resume snapshot", `request-reconstruction.spec.ts:801`,
+/// and the replacement model in its effort case, `:244-266`).
+#[tokio::test]
+async fn a_loop_with_another_model_resumes_with_its_own_header_and_context() {
+    let before = Harness::new(vec![text("one")]).await;
+    before.say("first").await;
+
+    let after = Harness::with(
+        vec![text("two")],
+        LoopConfig::new(ROUTE, "mock-model-2"),
+        before.events(),
+    )
+    .await;
+    after.say("second").await;
+
+    assert_eq!(
+        after.types()[9..],
+        [
+            "turn/start",
+            "step/start",
+            "user/message",
+            "request/header",
+            "request/context",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(
+        reasons(&after),
+        [RequestHeaderReason::Initial, RequestHeaderReason::Resume]
+    );
+    assert_eq!(after.headers()[1].header.config.model, "mock-model-2");
+    assert_eq!(after.contexts(), [context(MODEL), context("mock-model-2")]);
+}
+
+/// A header that differs from the one in force within one loop is logged
+/// as a `change`. With one config per loop, what can change today is the
+/// tool set: a tool registered between two turns. The route is the same,
+/// so no new context. (dsh would also log a `developer/message` announcing
+/// the tool; that isn't ported.)
+#[tokio::test]
+async fn a_tool_registered_between_turns_logs_a_change() {
+    struct Later;
+
+    impl Tool for Later {
+        fn schema(&self) -> ToolSchema {
+            schema("later")
+        }
+
+        fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+            Box::pin(async { ToolOutput::ok("late") })
+        }
+    }
+
+    let harness = Harness::new(vec![text("one"), text("two"), text("three")]).await;
+    harness.say("first").await;
+    harness.tools.register(Arc::new(Later)).unwrap();
+    harness.say("second").await;
+    harness.say("third").await;
+
+    // The third turn changed nothing, so it logs nothing.
+    assert_eq!(
+        reasons(&harness),
+        [RequestHeaderReason::Initial, RequestHeaderReason::Change]
+    );
+    let tools = harness.headers()[1].header.tools.clone().unwrap();
+    assert_eq!(tools.len(), 4);
+    assert_eq!(tools[3]["name"], "later");
+    assert_eq!(harness.contexts().len(), 1);
+}
+
+/// With nothing changed, a request after part of the history was replaced
+/// starts a new series, logged as `series`. Here the test replaces a
+/// message itself, as compaction would.
+#[tokio::test]
+async fn a_request_after_a_replacement_logs_a_series() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    harness.say("first").await;
+    // Seq 3 is the first user message.
+    let summary = UserMessage::text("summary", UserSource::user(), "first, in short");
+    harness
+        .sessions
+        .append(
+            &id(),
+            SessionEvent::UserMessage {
+                message: summary,
+                surface: SurfaceIntent {
+                    op: SurfaceOp::Replace {
+                        start: Seq(3),
+                        end: Seq(3),
+                    },
+                    sources: vec![Seq(3)],
+                },
+            },
+        )
+        .unwrap();
+    harness.say("second").await;
+
+    let headers = harness.headers();
+    assert_eq!(
+        headers.iter().map(|data| data.reason).collect::<Vec<_>>(),
+        [RequestHeaderReason::Initial, RequestHeaderReason::Series]
+    );
+    // `series` says it already, so it carries no marker.
+    assert!(!headers[1].starts_series);
+    assert_eq!(headers[0].header, headers[1].header);
+}
+
+/// dsh's `prepareRequest`: with no effort configured, a restarted loop
+/// keeps the effort the header in force asked for, if that header was for
+/// the same provider and model ("logs adapter defaults, supports per-turn
+/// effort changes, and restores the effective value",
+/// `request-reconstruction.spec.ts:210`).
+#[tokio::test]
+async fn a_resumed_loop_keeps_the_effort_the_session_ran_at() {
+    let mut high = LoopConfig::new(ROUTE, MODEL);
+    high.effort = Some(Effort::High);
+    let before = Harness::with(vec![text("one")], high, Vec::new()).await;
+    before.say("first").await;
+    assert_eq!(
+        before.headers()[0]
+            .header
+            .config
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(before.model.requests()[0].effort, Some(Effort::High));
+
+    // The same model, no effort set: the session's effort carries on.
+    let same = Harness::with(
+        vec![text("two")],
+        LoopConfig::new(ROUTE, MODEL),
+        before.events(),
+    )
+    .await;
+    same.say("second").await;
+    assert_eq!(same.model.requests()[0].effort, Some(Effort::High));
+    let resumed = &same.headers()[1];
+    assert_eq!(resumed.reason, RequestHeaderReason::Resume);
+    assert_eq!(
+        resumed.header.config.reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(resumed.header, before.headers()[0].header);
+
+    // Another model: the effort was the old model's, so it doesn't.
+    let other = Harness::with(
+        vec![text("two")],
+        LoopConfig::new(ROUTE, "mock-model-2"),
+        before.events(),
+    )
+    .await;
+    other.say("second").await;
+    assert_eq!(other.model.requests()[0].effort, None);
+    assert_eq!(other.headers()[1].header.config.reasoning_effort, None);
+
+    // An effort set in the config wins over the session's.
+    let mut low = LoopConfig::new(ROUTE, MODEL);
+    low.effort = Some(Effort::Low);
+    let configured = Harness::with(vec![text("two")], low, before.events()).await;
+    configured.say("second").await;
+    assert_eq!(configured.model.requests()[0].effort, Some(Effort::Low));
+    assert_eq!(
+        configured.headers()[1]
+            .header
+            .config
+            .reasoning_effort
+            .as_deref(),
+        Some("low")
+    );
+}
+
+/// The effort carries on only from a header for the same provider. A
+/// stored header from another provider, for a model of the same id, is
+/// left alone.
+#[tokio::test]
+async fn an_effort_from_another_provider_doesnt_carry_on() {
+    let before = Harness::new(vec![text("one")]).await;
+    before.say("first").await;
+    let mut stored = before.events();
+    let mut config = CallConfig::new("someone-else", MODEL);
+    config.reasoning_effort = Some("max".into());
+    stored.push(Entry {
+        seq: Seq(stored.len() as u64),
+        time: stored[0].time,
+        ignorable: false,
+        event: SessionEvent::request_header(
+            RequestHeader::new(config, &[]).unwrap(),
+            RequestHeaderReason::Change,
+        ),
+    });
+
+    let after = Harness::with(vec![text("two")], LoopConfig::new(ROUTE, MODEL), stored).await;
+    after.say("second").await;
+    assert_eq!(after.model.requests()[0].effort, None);
+    let last = after.headers().pop().unwrap();
+    assert_eq!(last.reason, RequestHeaderReason::Resume);
+    assert_eq!(last.header.config.provider, PROVIDER);
+    assert_eq!(last.header.config.reasoning_effort, None);
 }

@@ -8,7 +8,8 @@
 
 use karaka_model::{Block, ToolResult};
 use karaka_session::{
-    AssistantMessage, AssistantMessageData, ContentBlock, Extra, Passthrough, SessionEvent,
+    AssistantAttemptData, AssistantMessage, AssistantMessageData, CallConfig, ContentBlock, Extra,
+    IN_HISTORY, Passthrough, RequestContext, RequestHeader, RequestHeaderReason, SessionEvent,
     SessionLog, SurfaceIntent, TokenUsage, ToolResultData, TurnEndReason, UserMessage, UserSource,
 };
 use serde_json::json;
@@ -108,17 +109,19 @@ fn noise_event(rng: &mut Rng) -> SessionEvent {
             source_event_seqs: None,
         })
     };
-    match rng.below(7) {
+    match rng.below(9) {
         0 => SessionEvent::turn_start(1),
         1 => SessionEvent::turn_end(1, TurnEndReason::Completed),
         2 => SessionEvent::step_start(1, 1),
         3 => SessionEvent::step_end(1, 1),
-        4 => passthrough(
-            "assistant/attempt",
-            json!({ "turn": 1, "step": 1, "stream": [
-                { "type": "text-chunks", "time0": 1, "index": 0, "dt": [], "texts": [rng.text()] },
-            ] }),
-        ),
+        4 => SessionEvent::AssistantAttempt(AssistantAttemptData {
+            turn: 1,
+            step: 1,
+            stream: vec![json!(
+                { "type": "text-chunks", "time0": 1, "index": 0, "dt": [], "texts": [rng.text()] }
+            )],
+            extra: Extra::new(),
+        }),
         5 => SessionEvent::tool_call(
             1,
             1,
@@ -128,6 +131,17 @@ fn noise_event(rng: &mut Rng) -> SessionEvent {
                 arguments: "{}".into(),
             },
         ),
+        6 => SessionEvent::request_header(
+            RequestHeader::new(CallConfig::new("mock", format!("m-{}", rng.text())), &[]).unwrap(),
+            RequestHeaderReason::Change,
+        ),
+        7 => SessionEvent::RequestContext(RequestContext {
+            provider: "mock".into(),
+            model: format!("m-{}", rng.text()),
+            context_window: None,
+            system_prompt_update: Some(IN_HISTORY.into()),
+            extra: Extra::new(),
+        }),
         _ => passthrough(
             "approval/asked",
             json!({ "id": rng.text(), "toolName": "clock" }),

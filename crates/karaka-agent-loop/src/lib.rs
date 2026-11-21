@@ -10,6 +10,8 @@
 //!
 //! - `agent.rs`: one session's agent and the task that drives its turns.
 //! - `turn.rs`: one turn and its steps, and the events they log.
+//! - `request.rs`: the request header and route context logged before
+//!   each model call.
 //! - `answer.rs`: assembling a streamed answer, and what to keep of one
 //!   that was cut short.
 //! - `failure.rs`: a failed model call as the failure a turn ends with.
@@ -22,6 +24,7 @@ mod agent;
 mod answer;
 mod failure;
 mod plugin;
+mod request;
 mod turn;
 
 pub use plugin::{AgentLoop, AgentLoopPlugin, LoopConfig};

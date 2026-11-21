@@ -9,7 +9,11 @@
 //!   step/start
 //!     system/message      when the prompt first appears or changes
 //!     user/message        the queued message, in the first step only
-//!     assistant/message   the model's answer, with its usage
+//!     request/header      when the settings or tools change, or a loop
+//!                         makes its first request (see `request.rs`)
+//!     request/context     when the route changes
+//!     assistant/message   the model's answer, with its usage, or else
+//!     assistant/attempt   for a call that failed or was cancelled early
 //!     tool/call           for each call, in the model's order:
 //!     tool/result           logged as it starts, then its result
 //!   step/end              always, even when the step fails
@@ -33,8 +37,11 @@
 //!
 //! A cancel while the answer streams keeps the text and reasoning that had
 //! arrived, as an assistant message marked `interrupted`, so the model sees
-//! next time what the user saw. A failed call keeps nothing: its partial
-//! answer belongs to a call that didn't succeed.
+//! next time what the user saw. A failed call keeps no message: its partial
+//! answer belongs to a call that didn't succeed. It, and a cancel before
+//! anything worth keeping arrived, log an `assistant/attempt` instead, as
+//! dsh does, so the log shows the call was made. A call that never started,
+//! because no model serves the route or a cancel came first, logs none.
 //!
 //! # Message ids
 //!
@@ -60,7 +67,7 @@ use crate::answer::Answer;
 use crate::failure::{model_failure, no_model, other_failure};
 
 /// Why a step stopped before it finished.
-enum Stop {
+pub(crate) enum Stop {
     /// Someone cancelled the turn.
     Aborted(CancelCause),
     /// The model call failed, or the log refused an event.
@@ -183,18 +190,35 @@ impl Inner {
             .models
             .get(&config.route)
             .ok_or_else(|| Stop::Failed(no_model(&config.route)))?;
+        let (call, effort) = self.call_config(model.provider());
         let History { system, messages } = self.session.history();
         let mut request = Request::new(config.model.clone(), messages);
         request.system = system;
         request.tools = self.shared.tools.schemas();
         request.max_tokens = config.max_tokens;
-        request.effort = config.effort;
+        request.effort = effort;
+        self.log_request(call, &request.tools)?;
+        // A cancel that came before the call started leaves no attempt, as
+        // in dsh, where `buildRequest` checks the signal before the stream
+        // starts (`agent.ts:684`).
+        if let Some(cause) = cancelled(cancel) {
+            return Err(Stop::Aborted(cause));
+        }
 
         let response = match stream(model.as_ref(), request, cancel).await {
             Streamed::Finished(response) => response,
-            Streamed::Failed(error) => return Err(Stop::Failed(model_failure(&error))),
+            // A call that left no message is logged as an attempt, so the log
+            // shows it was made. (dsh: `agent.ts:489-510`.)
+            Streamed::Failed(error) => {
+                self.session
+                    .append(SessionEvent::assistant_attempt(turn, step))?;
+                return Err(Stop::Failed(model_failure(&error)));
+            }
             Streamed::Cancelled(cause, content) => {
-                if !content.is_empty() {
+                if content.is_empty() {
+                    self.session
+                        .append(SessionEvent::assistant_attempt(turn, step))?;
+                } else {
                     self.append_interrupted(turn, step, model.provider(), &content)?;
                 }
                 return Err(Stop::Aborted(cause));

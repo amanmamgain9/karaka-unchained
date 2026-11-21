@@ -8,6 +8,7 @@ use karaka_model::Message;
 use crate::derive::History;
 use crate::event::{Entry, Seq, SessionEvent};
 use crate::log::{LogError, SessionLog};
+use crate::request::{RequestContext, RequestHeader};
 
 /// Names one session in a [`SessionStore`]. (dsh: `SessionId`.)
 ///
@@ -139,6 +140,21 @@ impl Session {
     /// A copy of the events from `seq` on. See [`SessionLog::events_since`].
     pub fn events_since(&self, seq: Seq) -> Vec<Entry> {
         self.lock().events_since(seq).to_vec()
+    }
+
+    /// See [`SessionLog::request_header`].
+    pub fn request_header(&self) -> Option<RequestHeader> {
+        self.lock().request_header()
+    }
+
+    /// See [`SessionLog::request_context`].
+    pub fn request_context(&self) -> Option<RequestContext> {
+        self.lock().request_context()
+    }
+
+    /// See [`SessionLog::surface_generation`].
+    pub fn surface_generation(&self) -> u64 {
+        self.lock().surface_generation()
     }
 
     /// The seqs of the events the model sees, in order. See

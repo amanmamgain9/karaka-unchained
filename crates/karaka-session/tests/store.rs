@@ -7,7 +7,8 @@ use std::thread;
 
 use karaka_model::Message;
 use karaka_session::{
-    Entry, LogError, Seq, SessionError, SessionEvent, SessionId, SessionStore, SurfaceIntent,
+    AdapterDefaults, CallConfig, Entry, Extra, LogError, RequestContext, RequestHeader,
+    RequestHeaderReason, Seq, SessionError, SessionEvent, SessionId, SessionStore, SurfaceIntent,
     SurfaceOp, Time, UserMessage, UserSource,
 };
 
@@ -347,4 +348,87 @@ fn many_threads_append_at_once_without_losing_or_reusing_a_seq() {
         let expected: Vec<String> = (0..APPENDS).map(|n| format!("{thread}/{n}")).collect();
         assert_eq!(mine, expected.iter().collect::<Vec<_>>());
     }
+}
+
+fn context(model: &str, window: Option<u64>) -> RequestContext {
+    RequestContext {
+        provider: "mock".into(),
+        model: model.into(),
+        context_window: window,
+        system_prompt_update: None,
+        extra: Extra::new(),
+    }
+}
+
+/// dsh v4 `request-header.spec.ts`: "takes the latest full snapshot and
+/// skips unrelated events", and the `Session.requestContext` cases.
+#[test]
+fn the_latest_header_and_context_are_in_force() {
+    let store = SessionStore::new();
+    let session = store.create(id("requests")).unwrap();
+    assert_eq!(session.request_header(), None);
+    assert_eq!(session.request_context(), None);
+
+    let first = RequestHeader::new(CallConfig::new("mock", "m"), &[]).unwrap();
+    let mut second = RequestHeader::new(CallConfig::new("mock", "other"), &[]).unwrap();
+    session.append(SessionEvent::turn_start(1)).unwrap();
+    session
+        .append(SessionEvent::request_header(
+            first,
+            RequestHeaderReason::Initial,
+        ))
+        .unwrap();
+    session
+        .append(SessionEvent::RequestContext(context("m", Some(128_000))))
+        .unwrap();
+    session.append(user("hi")).unwrap();
+    // A header with an empty adapter-defaults marker list is refused, as v4
+    // refuses it, so the latest one stays in force.
+    second.adapter_defaults = Some(AdapterDefaults::default());
+    assert!(matches!(
+        session.append(SessionEvent::request_header(
+            second.clone(),
+            RequestHeaderReason::Change
+        )),
+        Err(LogError::Invalid { .. })
+    ));
+    second.adapter_defaults = None;
+    session
+        .append(SessionEvent::request_header(
+            second.clone(),
+            RequestHeaderReason::Change,
+        ))
+        .unwrap();
+    session
+        .append(SessionEvent::RequestContext(context("other", None)))
+        .unwrap();
+
+    assert_eq!(session.request_header(), Some(second));
+    assert_eq!(session.request_context(), Some(context("other", None)));
+}
+
+/// A request built after a replacement starts a new series; the count of
+/// replacements is how the loop tells.
+#[test]
+fn each_surface_replacement_counts() {
+    let store = SessionStore::new();
+    let session = store.create(id("generations")).unwrap();
+    session.append(user("hi")).unwrap();
+    assert_eq!(session.surface_generation(), 0);
+    let SessionEvent::UserMessage { message, .. } = user("again") else {
+        unreachable!()
+    };
+    session
+        .append(SessionEvent::UserMessage {
+            message,
+            surface: SurfaceIntent {
+                op: SurfaceOp::Replace {
+                    start: Seq(0),
+                    end: Seq(0),
+                },
+                sources: vec![Seq(0)],
+            },
+        })
+        .unwrap();
+    assert_eq!(session.surface_generation(), 1);
 }

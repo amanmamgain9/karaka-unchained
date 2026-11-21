@@ -365,13 +365,6 @@ Four pieces, one crate each where they are seams:
 
 Each lives in dsh at the path given, under `packages/`.
 
-- **`request/header` and `request/context` events.** `buildRequest`,
-  `core/agent-loop/src/agent.ts:615-704`. Without them, the developer
-  messages that announce tool changes can't be written either.
-- **`assistant/attempt` events** for failed and cancelled calls.
-  `step`, `core/agent-loop/src/agent.ts:484-510`, with
-  `core/agent-loop/src/assistant-stream.ts`. A failed call logs nothing
-  here, and a cancel with nothing worth keeping logs nothing.
 - **Retry**, through the `agent/request-error` hook
   (`core/agent-loop/src/agent.ts:511-526`) and `llm/llm-retry`. A failed
   model call ends the turn.
@@ -391,9 +384,11 @@ Each lives in dsh at the path given, under `packages/`.
 - **`concludesTurn`.** `ToolRunContext.concludeTurn` in
   `core/tools/src/index.ts`, read in `core/agent-loop/src/tool-calls.ts:158`.
 - **Developer messages with `tool-addition` and `tool-removal` blocks.**
-  `buildRequest`, `core/agent-loop/src/agent.ts:652-666`. They appear only
-  when the tool set changes mid-session, through deferred tools. The tool
-  set is fixed for now.
+  `buildRequest`, `core/agent-loop/src/agent.ts:652-666`. dsh writes one
+  after a `request/header` whose tools differ from the one before, such as
+  after a restart with other tools, or a tool registered between turns.
+  Karaka's model seam has no block for them, so only the header records the
+  change (see step two).
 - **Assistant stream frames for a live UI.** `AssistantStreamAttempt`,
   `core/agent-loop/src/assistant-stream.ts`, sent as `agent/assistant-stream`.
 - **Compaction.** `compaction/compaction` and its siblings.
@@ -451,3 +446,75 @@ the queue is empty.
   isn't an object, with the text dsh's schema check gives for that case.
 - **One loop config for every session.** dsh gives each agent its own
   options and lets the `agent/request` hook change the request per step.
+
+## Agent loop, step two: what the loop logs around each model call
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-21.*
+
+`karaka-session` now models `request/header`, `request/context` and
+`assistant/attempt` as typed events, where they were passthrough (`request.rs`):
+
+- Their JSON is v4's both ways, and unknown fields stay in `extra`.
+- A header's tools are kept as raw JSON, so each keeps its key order: dsh
+  compares tools by their JSON text.
+- `canonical_header`, `header_equals` and `call_config_equals` follow
+  `request-header.ts` and `call-config.ts`.
+- `Session::request_header` and `Session::request_context` give the latest
+  of each, as v4's session folds them.
+- A header is checked as v4 checks it on append and on load: no `system`, no
+  empty `tools` or `adapterDefaults`, adapter-default markers only for fields
+  the config has, and only v4's four reasons.
+- `Session::surface_generation` counts replacements, as v4's surface counts
+  `contentGeneration`.
+- The fixture's header and attempt write back byte for byte. The rest of the
+  fixture still round-trips as equal values, not bytes: the other typed
+  events write their keys in struct order, as before.
+
+The loop logs them where dsh's `buildRequest` and `step` do: after the
+system and user messages, before the stream.
+
+- **`request/header`.** The loop's first request logs `initial`, or `resume`
+  over a log that already has a header. Later requests log `change` when the
+  header differs from the one in force. When nothing changed but part of the
+  history was replaced since the last request, they log `series`. A `resume`
+  or `change` that starts a new series carries `startsSeries`. In Karaka
+  today only clearing the system prompt replaces history, and only a tool
+  registered between turns can cause a `change`, since the config is fixed.
+- **`request/context`.** Logged when the provider, model, context window or
+  system prompt update mode differs from the last one.
+- **`assistant/attempt`.** `{ turn, step, stream: [] }` for a model call that
+  failed, and for one cancelled before anything worth keeping arrived. A
+  cancel after content still logs the interrupted message instead.
+- **Effort on resume.** With no effort configured, the loop takes the header
+  in force's `reasoningEffort`, if that header is for the same provider and
+  model and doesn't mark effort as a provider default (`prepareRequest`,
+  `agent.ts:569-582`).
+
+### Where step two differs from dsh
+
+- **The provider is the provider's name, not the route**, in the header's
+  config and in the context, as in `source.provider`. dsh writes the route
+  in all three. So a provider routed under a new name over an old log
+  resumes with the same header.
+- **No `adapterDefaults`.** Karaka's providers fill in their defaults, such
+  as DeepSeek's `max_tokens` or Anthropic's effort, inside the request, and
+  the loop never learns the values. A header names only what the loop
+  asked for. So an effort the provider chose is never restored, and nothing
+  marks a field as a provider default.
+- **No context window.** Karaka's models advertise none.
+- **`systemPromptUpdate` is always `in-history`**, matching how the loop
+  updates a changed prompt (step one's system prompt deviation): it appends
+  a changed prompt where it changed.
+- **A route with no model logs no header or context.** dsh still logs both,
+  naming the route, and then fails with `NO_ADAPTER`. Karaka can't name the
+  provider without the model. Both log no attempt: the call never started.
+- **An effort Karaka has no level for doesn't carry on.** dsh's effort is
+  the adapter's own string, such as DeepSeek's `off`. Karaka maps only
+  `low`, `medium`, `high`, `xhigh` and `max`, so another string is dropped
+  on resume, and the resumed header leaves it out.
+- **No `developer/message` for tool changes**, as above: only the `change`
+  header records them.
+- **Attempt streams are empty.** dsh embeds the exact stream it received.
+  Karaka keeps no streams, and v4 accepts an empty one.
+- **The `agent/request` hook and `startsRequestSeries` aren't ported**, so a
+  plugin can't change the config per step or start a series itself.

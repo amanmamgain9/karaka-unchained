@@ -31,6 +31,7 @@
 //! driver deciding it is done and saying so.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karaka_agent::{Agent, WhenIdle};
@@ -63,6 +64,14 @@ pub(crate) struct Inner {
     /// such as one reading stdin.
     runtime: Handle,
     state: Mutex<State>,
+    /// Whether this agent has logged a `request/header` yet. Its first
+    /// request always logs one. (dsh: `requestHeaderLogged`.) Only the
+    /// driver reads and writes it, one turn at a time.
+    pub(crate) header_logged: AtomicBool,
+    /// The surface's replacement count when the last request was built. A
+    /// request built after a replacement starts a new series.
+    /// (dsh: `requestSurfaceGeneration`.)
+    pub(crate) request_generation: AtomicU64,
     /// `true` while no driver runs. [`Agent::when_idle`] waits on it.
     /// Messages may still be queued, after a failed turn.
     idle: watch::Sender<bool>,
@@ -98,7 +107,10 @@ impl LoopAgent {
                 _ => None,
             })
             .unwrap_or(0);
+        let generation = session.surface_generation();
         let inner = Inner {
+            header_logged: AtomicBool::new(false),
+            request_generation: AtomicU64::new(generation),
             session,
             shared,
             runtime: Handle::current(),

@@ -39,6 +39,9 @@ fn every_event_reads_into_its_karaka_variant() {
                 SessionEvent::StepStart(_) => "StepStart",
                 SessionEvent::StepEnd(_) => "StepEnd",
                 SessionEvent::ToolCall(_) => "ToolCall",
+                SessionEvent::RequestHeader(_) => "RequestHeader",
+                SessionEvent::RequestContext(_) => "RequestContext",
+                SessionEvent::AssistantAttempt(_) => "AssistantAttempt",
                 SessionEvent::Passthrough(_) => "Passthrough",
                 _ => "unknown",
             };
@@ -48,11 +51,11 @@ fn every_event_reads_into_its_karaka_variant() {
     let expected = [
         ("turn/start", "TurnStart"),
         ("step/start", "StepStart"),
-        ("request/header", "Passthrough"),
+        ("request/header", "RequestHeader"),
         ("system/message", "SystemMessage"),
         ("user/message", "UserMessage"),
         ("user/message", "UserMessage"),
-        ("assistant/attempt", "Passthrough"),
+        ("assistant/attempt", "AssistantAttempt"),
         ("assistant/message", "AssistantMessage"),
         ("approval/asked", "Passthrough"),
         ("approval/decided", "Passthrough"),
@@ -81,6 +84,32 @@ fn the_log_writes_back_to_the_same_json() {
     // Compared as JSON values: the same keys, values and array order. Key
     // order inside the typed events may differ; see the crate docs.
     assert_eq!(written, original);
+}
+
+/// The request header and the failed attempt write back byte for byte:
+/// their keys come out in the order dsh writes them, which is the order the
+/// fixture holds. The other typed events are equal as values only, with
+/// their keys in Karaka's struct order (see the crate docs).
+#[test]
+fn the_request_events_write_back_byte_for_byte() {
+    let original: Value = serde_json::from_str(FIXTURE).unwrap();
+    let entries = entries();
+    let mut checked = 0;
+    for (entry, raw) in entries.iter().zip(original.as_array().unwrap()) {
+        if matches!(
+            entry.event,
+            SessionEvent::RequestHeader(_)
+                | SessionEvent::RequestContext(_)
+                | SessionEvent::AssistantAttempt(_)
+        ) {
+            assert_eq!(
+                serde_json::to_string(entry).unwrap(),
+                serde_json::to_string(raw).unwrap()
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 2);
 }
 
 #[test]

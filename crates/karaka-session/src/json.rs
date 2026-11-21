@@ -11,7 +11,8 @@
 //! ```
 //!
 //! The last three are optional. `surfaceOp` is required on the five surface
-//! types and forbidden on the lifecycle types Karaka models. Other types are
+//! types and forbidden on the lifecycle types Karaka models, which include
+//! `request/header`, `request/context` and `assistant/attempt`. Other types are
 //! passthrough and keep whatever they carry.
 //!
 //! Only the shape of one event is checked here. Whether it fits the log,
@@ -90,6 +91,9 @@ fn envelope_of(entry: &Entry) -> Result<Envelope, serde_json::Error> {
         SessionEvent::TurnEnd(data) => (to_json(data)?, None, None),
         SessionEvent::StepStart(data) | SessionEvent::StepEnd(data) => (to_json(data)?, None, None),
         SessionEvent::ToolCall(data) => (to_json(data)?, None, None),
+        SessionEvent::RequestHeader(data) => (to_json(data)?, None, None),
+        SessionEvent::RequestContext(data) => (to_json(data)?, None, None),
+        SessionEvent::AssistantAttempt(data) => (to_json(data)?, None, None),
         SessionEvent::Passthrough(passthrough) => (
             passthrough.data.clone(),
             passthrough.surface_op.clone(),
@@ -147,7 +151,8 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
             data: from_json(data)?,
             surface: intent_of(&event_type, surface_op, source_event_seqs)?,
         },
-        "turn/start" | "turn/end" | "step/start" | "step/end" | "tool/call" => {
+        "turn/start" | "turn/end" | "step/start" | "step/end" | "tool/call" | "request/header"
+        | "request/context" | "assistant/attempt" => {
             if surface_op.is_some() || source_event_seqs.is_some() {
                 return Err(format!(
                     "session event \"{event_type}\" is not surface-eligible and cannot \
@@ -159,7 +164,10 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
                 "turn/end" => SessionEvent::TurnEnd(from_json(data)?),
                 "step/start" => SessionEvent::StepStart(from_json(data)?),
                 "step/end" => SessionEvent::StepEnd(from_json(data)?),
-                _ => SessionEvent::ToolCall(from_json(data)?),
+                "tool/call" => SessionEvent::ToolCall(from_json(data)?),
+                "request/header" => SessionEvent::RequestHeader(from_json(data)?),
+                "request/context" => SessionEvent::RequestContext(from_json(data)?),
+                _ => SessionEvent::AssistantAttempt(from_json(data)?),
             }
         }
         _ => SessionEvent::Passthrough(Passthrough {
@@ -315,18 +323,109 @@ mod tests {
                 "reason": "initial", "extra": ["retained"],
             },
         });
-        assert!(matches!(
-            round_trip(header).event,
-            SessionEvent::Passthrough(_)
-        ));
+        let SessionEvent::RequestHeader(data) = round_trip(header).event else {
+            panic!("a request/header is typed");
+        };
+        assert_eq!(data.extra["extra"], json!(["retained"]));
+        assert_eq!(
+            data.header.extra["extra"],
+            json!({ "nested": [true, null] })
+        );
     }
 
     #[test]
     fn a_passthrough_event_writes_back_with_its_keys_in_the_same_order() {
-        // dsh compares tool schemas by their JSON text, so key order matters.
+        let text = r#"{"type":"approval/asked","seq":0,"time":1,"data":{"toolName":"clock","id":"a-1","args":{"zone":"UTC","at":1}}}"#;
+        let entry: Entry = serde_json::from_str(text).unwrap();
+        assert!(matches!(entry.event, SessionEvent::Passthrough(_)));
+        assert_eq!(serde_json::to_string(&entry).unwrap(), text);
+    }
+
+    /// dsh compares tools by their JSON text, so each tool in a header
+    /// keeps its keys in the order they were read. The header's own fields
+    /// come out in dsh's order.
+    #[test]
+    fn a_headers_tools_keep_their_key_order() {
         let text = r#"{"type":"request/header","seq":0,"time":1,"data":{"reason":"initial","header":{"tools":[{"name":"clock","parameters":{"type":"object","properties":{"zone":{"type":"string"}}},"description":""}],"config":{"provider":"mock","model":"mock"}}}}"#;
         let entry: Entry = serde_json::from_str(text).unwrap();
-        assert_eq!(serde_json::to_string(&entry).unwrap(), text);
+        assert!(matches!(entry.event, SessionEvent::RequestHeader(_)));
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            concat!(
+                r#"{"type":"request/header","seq":0,"time":1,"data":{"header":{"config":"#,
+                r#"{"provider":"mock","model":"mock"},"tools":[{"name":"clock","parameters":"#,
+                r#"{"type":"object","properties":{"zone":{"type":"string"}}},"description":""}]},"#,
+                r#""reason":"initial"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn the_three_request_events_read_as_typed_and_write_back() {
+        let header = round_trip(json!({
+            "type": "request/header", "seq": 0, "time": 1,
+            "data": {
+                "header": {
+                    "config": { "provider": "anthropic", "model": "claude-opus-5-5",
+                                "reasoningEffort": "high", "maxTokens": 256000, "temperature": 1 },
+                    "adapterDefaults": { "maxTokens": true },
+                },
+                "reason": "change", "startsSeries": true,
+            },
+        }));
+        let SessionEvent::RequestHeader(data) = header.event else {
+            panic!("a request/header is typed");
+        };
+        assert_eq!(data.reason, crate::RequestHeaderReason::Change);
+        assert!(data.starts_series);
+        assert_eq!(data.header.config.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(data.header.config.max_tokens, Some(256_000));
+
+        let context = round_trip(json!({
+            "type": "request/context", "seq": 0, "time": 1,
+            "data": { "provider": "anthropic", "model": "claude-opus-5-5",
+                      "contextWindow": 200000, "systemPromptUpdate": "in-history", "note": 1 },
+        }));
+        let SessionEvent::RequestContext(context) = context.event else {
+            panic!("a request/context is typed");
+        };
+        assert_eq!(context.context_window, Some(200_000));
+        assert_eq!(
+            context.system_prompt_update.as_deref(),
+            Some(crate::IN_HISTORY)
+        );
+        assert_eq!(context.extra["note"], json!(1));
+
+        let attempt = round_trip(json!({
+            "type": "assistant/attempt", "seq": 0, "time": 1,
+            "data": { "turn": 1, "step": 2, "stream": [{ "type": "text-chunks", "texts": ["x"] }] },
+        }));
+        assert!(matches!(attempt.event, SessionEvent::AssistantAttempt(_)));
+    }
+
+    /// v4's `assertCurrentLlmShape`: a reason it doesn't define, a marker
+    /// other than `true`, and an adapter-default key it doesn't define.
+    #[test]
+    fn a_header_v4_would_refuse_is_refused() {
+        let header =
+            |data: Value| json!({ "type": "request/header", "seq": 0, "time": 1, "data": data });
+        let config = json!({ "provider": "mock", "model": "mock" });
+        for data in [
+            json!({ "header": { "config": config }, "reason": "restart" }),
+            json!({ "header": { "config": config }, "reason": "initial", "startsSeries": false }),
+            json!({ "header": { "config": config, "adapterDefaults": { "temperature": true } },
+                    "reason": "initial" }),
+            json!({ "header": {}, "reason": "initial" }),
+        ] {
+            refusal(header(data));
+        }
+        assert!(
+            refusal(json!({
+                "type": "request/context", "seq": 0, "time": 1, "surfaceOp": "append",
+                "data": { "provider": "mock", "model": "mock" },
+            }))
+            .contains("not surface-eligible")
+        );
     }
 
     // "requires markers and forbids non-surface and assistant source-event

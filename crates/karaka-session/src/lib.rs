@@ -20,6 +20,8 @@
 //! - `derive.rs`: the history, and which system messages become the prompt.
 //! - `convert.rs`: between v4's messages and `karaka-model`'s.
 //! - `repair.rs`: the events that close a turn a crash left open.
+//! - `request.rs`: the request header, the route's context and failed
+//!   attempts, which the loop logs around each model call.
 //!
 //! # Storage
 //!
@@ -39,6 +41,7 @@ mod log;
 mod message;
 mod plugin;
 mod repair;
+mod request;
 mod store;
 mod surface;
 
@@ -61,5 +64,9 @@ pub use repair::{
     CloseCause, FORKED_NOT_STARTED, FORKED_STARTED, INTERRUPTED_NOT_STARTED, INTERRUPTED_STARTED,
     TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, ToolCallRecovery, interrupted_turn_closers,
     open_turn_closers,
+};
+pub use request::{
+    AdapterDefaults, AssistantAttemptData, CallConfig, IN_HISTORY, RequestContext, RequestHeader,
+    RequestHeaderData, RequestHeaderReason, call_config_equals, canonical_header, header_equals,
 };
 pub use store::{Session, SessionError, SessionId, SessionStore};

@@ -9,6 +9,9 @@ use crate::data::{
     ToolResultData, TurnEnd, TurnEndReason, TurnStart,
 };
 use crate::message::{Extra, SystemMessage, UserMessage};
+use crate::request::{
+    AssistantAttemptData, RequestContext, RequestHeader, RequestHeaderData, RequestHeaderReason,
+};
 
 /// One thing that happened in a session, as the log records it.
 /// (dsh v4: `SessionEventMap` in `types.ts`.)
@@ -22,11 +25,11 @@ use crate::message::{Extra, SystemMessage, UserMessage};
 ///   system, developer, user, assistant and tool result. Each says how it
 ///   joins the model-visible surface (see [`SurfaceIntent`]).
 /// - **Lifecycle events**, which Karaka's loop writes and reads: turn and
-///   step boundaries, and `tool/call`. They never change the history the
-///   model sees.
+///   step boundaries, `tool/call`, and the three it logs around each model
+///   call, `request/header`, `request/context` and `assistant/attempt`.
+///   They never change the history the model sees.
 /// - **[`Passthrough`]**, for every other type: approvals, questions,
-///   `assistant/attempt`, `request/header`, compaction, plugin events, and
-///   whatever comes next. Karaka keeps the type and payload untouched, so a
+///   compaction, plugin events, and whatever comes next. Karaka keeps the type and payload untouched, so a
 ///   v4 log keeps every event, and every event keeps its seq.
 ///
 /// dsh plugins add event types by merging keys into one TypeScript
@@ -81,6 +84,13 @@ pub enum SessionEvent {
     StepEnd(Step),
     /// A tool started running. (dsh v4: `tool/call`.)
     ToolCall(ToolCallData),
+    /// The settings and tools of the next request. (dsh v4: `request/header`.)
+    RequestHeader(RequestHeaderData),
+    /// The route of the next request, when it changed.
+    /// (dsh v4: `request/context`.)
+    RequestContext(RequestContext),
+    /// A model call that left no message. (dsh v4: `assistant/attempt`.)
+    AssistantAttempt(AssistantAttemptData),
     /// Any other event type, kept as it was.
     Passthrough(Passthrough),
 }
@@ -99,6 +109,9 @@ impl SessionEvent {
             Self::StepStart(_) => "step/start",
             Self::StepEnd(_) => "step/end",
             Self::ToolCall(_) => "tool/call",
+            Self::RequestHeader(_) => "request/header",
+            Self::RequestContext(_) => "request/context",
+            Self::AssistantAttempt(_) => "assistant/attempt",
             Self::Passthrough(passthrough) => &passthrough.event_type,
         }
     }
@@ -184,6 +197,26 @@ impl SessionEvent {
             call_id: call.id.clone(),
             name: call.name.clone(),
             arguments: call.arguments.clone(),
+            extra: Extra::new(),
+        })
+    }
+
+    /// A `request/header` logged for `reason`.
+    pub fn request_header(header: RequestHeader, reason: RequestHeaderReason) -> Self {
+        Self::RequestHeader(RequestHeaderData {
+            header,
+            reason,
+            starts_series: false,
+            extra: Extra::new(),
+        })
+    }
+
+    /// An `assistant/attempt` with no stream: Karaka keeps none.
+    pub fn assistant_attempt(turn: u64, step: u64) -> Self {
+        Self::AssistantAttempt(AssistantAttemptData {
+            turn,
+            step,
+            stream: Vec::new(),
             extra: Extra::new(),
         })
     }

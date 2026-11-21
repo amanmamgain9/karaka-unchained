@@ -6,6 +6,7 @@ use karaka_model::Message;
 use crate::derive::{self, History};
 use crate::event::{Entry, Seq, SessionEvent, Time};
 use crate::repair;
+use crate::request::{self, RequestContext, RequestHeader, canonical_header};
 use crate::surface::SurfaceFold;
 
 /// One session's events, in the order they happened. (dsh v4: `Session`.)
@@ -192,11 +193,46 @@ impl SessionLog {
     pub fn messages(&self) -> Vec<Message> {
         self.history().messages
     }
+
+    /// The request header in force: the latest `request/header`'s, in
+    /// canonical form. `None` before the first. (dsh v4:
+    /// `Session.requestHeader`, which folds with `foldRequestHeader`.)
+    pub fn request_header(&self) -> Option<RequestHeader> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.event {
+                SessionEvent::RequestHeader(data) => Some(canonical_header(&data.header)),
+                _ => None,
+            })
+    }
+
+    /// The latest `request/context`. `None` before the first. (dsh v4:
+    /// `Session.requestContext`.)
+    pub fn request_context(&self) -> Option<RequestContext> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.event {
+                SessionEvent::RequestContext(context) => Some(context.clone()),
+                _ => None,
+            })
+    }
+
+    /// How many replacements the surface has taken so far. A request built
+    /// after a replacement starts a new series of messages. (dsh v4:
+    /// `session.surface.contentGeneration`.)
+    pub fn surface_generation(&self) -> u64 {
+        self.surface.generation()
+    }
 }
 
 /// Checks the parts of one event that v4 checks on its own, apart from the
 /// log (dsh v4: `validateSessionEventData` in `surface.ts`).
 fn check_event(event: &SessionEvent) -> Result<(), String> {
+    if let SessionEvent::RequestHeader(data) = event {
+        request::check_header(data)?;
+    }
     if let SessionEvent::ToolResult { data, .. } = event
         && data.error.is_some()
         && data.message.is_error != Some(true)

@@ -23,12 +23,20 @@ use crate::event::{Entry, Seq, SessionEvent, SurfaceOp};
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SurfaceFold {
     nodes: Vec<Seq>,
+    /// How many replacements were admitted. (dsh v4: `contentGeneration`,
+    /// which also counts plugin projections Karaka doesn't have.)
+    generation: u64,
 }
 
 impl SurfaceFold {
     /// The seqs on the surface, in the order the model sees them.
     pub(crate) fn nodes(&self) -> &[Seq] {
         &self.nodes
+    }
+
+    /// How many replacements were admitted so far.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Checks `entry` against `log`, the events before it, and adds it to
@@ -106,6 +114,7 @@ impl SurfaceFold {
         }
 
         self.nodes.splice(start_index..=end_index, [seq]);
+        self.generation += 1;
         Ok(())
     }
 }
