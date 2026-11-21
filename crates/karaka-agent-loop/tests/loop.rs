@@ -13,12 +13,15 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
-use karaka_agent::{Agent, Agents};
+use karaka_agent::{
+    Agent, Agents, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
+    RequestErrorHooks,
+};
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
 use karaka_model::{
     Block, Effort, ErrorKind, Event, EventStream, Message, Model, ModelError, ModelRegistry,
-    ModelsPlugin, Request, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
+    ModelsPlugin, Request, RetryPolicy, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
 };
 use karaka_session::{
     CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
@@ -241,6 +244,7 @@ struct Harness {
     model: Arc<Scripted>,
     sessions: Arc<SessionStore>,
     tools: Arc<ToolRegistry>,
+    hooks: Arc<RequestErrorHooks>,
     agents: Arc<dyn Agents>,
     stuck: Arc<Notify>,
     stuck_dropped: Arc<AtomicBool>,
@@ -287,6 +291,7 @@ impl Harness {
             model,
             sessions,
             tools,
+            hooks: runtime.get::<RequestErrorHooks>(),
             agents: runtime.get::<dyn Agents>(),
             stuck,
             stuck_dropped,
@@ -1505,4 +1510,203 @@ async fn an_effort_from_another_provider_doesnt_carry_on() {
     assert_eq!(last.reason, RequestHeaderReason::Resume);
     assert_eq!(last.header.config.provider, PROVIDER);
     assert_eq!(last.header.config.reasoning_effort, None);
+}
+
+// The request-error hook. Ported from dsh's
+// `agent-loop/tests/request-error.spec.ts`.
+
+/// A handler that runs `decide` on each failed request.
+struct Handler<F>(F);
+
+impl<F> RequestErrorHandler for Handler<F>
+where
+    F: Fn(&RequestError) -> Result<Option<RequestErrorAction>, String> + Send + Sync,
+{
+    fn handle<'a>(&'a self, error: &'a RequestError, _next: Next<'a>) -> HookFuture<'a> {
+        let decision = (self.0)(error).map_err(Into::into);
+        Box::pin(async move { decision })
+    }
+}
+
+fn failing(kind: ErrorKind, message: &str) -> Reply {
+    Reply::Events(vec![Err(ModelError::new(kind, message))])
+}
+
+/// dsh: "lets each failed request return a retry action before its turn
+/// closes" (`request-error.spec.ts:52`). Each failure leaves an attempt; the
+/// retried request logs no new header, context or user message.
+#[tokio::test]
+async fn a_handler_can_retry_each_failed_request() {
+    let harness = Harness::new(vec![
+        failing(ErrorKind::RateLimited, "busy"),
+        failing(ErrorKind::Unavailable, "unavailable"),
+        text("ok"),
+    ])
+    .await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let noted = Arc::clone(&seen);
+    harness
+        .hooks
+        .register(Arc::new(Handler(move |error: &RequestError| {
+            noted.lock().unwrap().push((
+                error.turn,
+                error.step,
+                error.provider.clone(),
+                error.failure.code.clone(),
+                error.retry_policy.clone(),
+            ));
+            Ok(Some(RequestErrorAction::Retry))
+        })));
+    harness.say("go").await;
+
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "request/header",
+            "request/context",
+            "assistant/attempt",
+            "assistant/attempt",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+    let seen = seen.lock().unwrap();
+    let codes: Vec<(u64, u64, &str, &str)> = seen
+        .iter()
+        .map(|(turn, step, provider, code, _)| (*turn, *step, provider.as_str(), code.as_str()))
+        .collect();
+    assert_eq!(
+        codes,
+        [(1, 1, PROVIDER, "RATE_LIMIT"), (1, 1, PROVIDER, "SERVER")]
+    );
+    assert!(
+        seen.iter()
+            .all(|(.., policy)| *policy == RetryPolicy::default())
+    );
+    // Every attempt asked the model with the same history.
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.messages == [Message::user("go")])
+    );
+}
+
+/// dsh: "lets cancellation win over a retry action"
+/// (`request-error.spec.ts:105`).
+#[tokio::test]
+async fn a_cancel_wins_over_a_retry() {
+    let harness = Harness::new(vec![
+        failing(ErrorKind::RateLimited, "busy"),
+        text("unused"),
+    ])
+    .await;
+    let agents = Arc::clone(&harness.agents);
+    harness
+        .hooks
+        .register(Arc::new(Handler(move |_error: &RequestError| {
+            agents.open(id()).unwrap().cancel(CancelCause::User);
+            Ok(Some(RequestErrorAction::Retry))
+        })));
+    harness.say("go").await;
+
+    assert_eq!(harness.model.requests().len(), 1);
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
+    assert_eq!(
+        harness.types()[6..],
+        ["assistant/attempt", "step/end", "turn/end"]
+    );
+}
+
+/// dsh: "does not retry when the recovery listener fails before returning
+/// its action" (`request-error.spec.ts:125`). The turn ends with the
+/// handler's error.
+#[tokio::test]
+async fn a_handler_that_fails_means_no_retry() {
+    let harness = Harness::new(vec![
+        failing(ErrorKind::RateLimited, "busy"),
+        text("unused"),
+    ])
+    .await;
+    harness
+        .hooks
+        .register(Arc::new(Handler(|_error: &RequestError| {
+            Err("recovery failed".to_owned())
+        })));
+    harness.say("go").await;
+
+    assert_eq!(harness.model.requests().len(), 1);
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("expected one failed turn, got {endings:?}");
+    };
+    assert_eq!(
+        (failure.message.as_str(), failure.code.as_str()),
+        ("recovery failed", "UNKNOWN")
+    );
+}
+
+/// A handler that panics fails its turn, not the agent: the next turn runs.
+#[tokio::test]
+async fn a_handler_that_panics_means_no_retry() {
+    let harness = Harness::new(vec![failing(ErrorKind::RateLimited, "busy"), text("later")]).await;
+    harness
+        .hooks
+        .register(Arc::new(Handler(|error: &RequestError| {
+            if error.turn == 1 {
+                panic!("a broken handler");
+            }
+            Ok(None)
+        })));
+    harness.say("go").await;
+    harness.say("again").await;
+
+    let endings = harness.endings();
+    let TurnEndReason::Error(failure) = &endings[0] else {
+        panic!("expected a failed turn, got {endings:?}");
+    };
+    assert_eq!(failure.message, "a request-error handler panicked");
+    assert_eq!(endings[1], TurnEndReason::Completed);
+}
+
+/// The chain runs in the order handlers were registered. A handler that
+/// calls `next` hands the decision on; here the second asks for a retry.
+#[tokio::test]
+async fn a_handler_can_hand_the_decision_on() {
+    struct Passes(Arc<Mutex<Vec<&'static str>>>);
+
+    impl RequestErrorHandler for Passes {
+        fn handle<'a>(&'a self, _error: &'a RequestError, next: Next<'a>) -> HookFuture<'a> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push("first");
+                next.run().await
+            })
+        }
+    }
+
+    let harness = Harness::new(vec![failing(ErrorKind::Unavailable, "down"), text("ok")]).await;
+    let order = Arc::new(Mutex::new(Vec::new()));
+    harness.hooks.register(Arc::new(Passes(Arc::clone(&order))));
+    let noted = Arc::clone(&order);
+    harness
+        .hooks
+        .register(Arc::new(Handler(move |_error: &RequestError| {
+            noted.lock().unwrap().push("second");
+            Ok(Some(RequestErrorAction::Retry))
+        })));
+    harness.say("go").await;
+
+    assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+    assert_eq!(harness.model.requests().len(), 2);
 }

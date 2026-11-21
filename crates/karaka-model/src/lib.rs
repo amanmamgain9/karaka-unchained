@@ -9,6 +9,7 @@ mod message;
 mod model;
 mod plugin;
 mod registry;
+mod retry;
 mod retry_after;
 mod wording;
 
@@ -19,6 +20,10 @@ pub use model::{
 };
 pub use plugin::ModelsPlugin;
 pub use registry::{ModelRegistry, RegistryError};
+pub use retry::{
+    Backoff, BackoffConfig, DEFAULT_RETRYABLE_CODES, MAX_DELAY_MS, RetryMode, RetryPolicy,
+    RetryPolicyConfig, RetryPolicyError,
+};
 // Helpers for provider crates, which all read failures the same way.
 pub use retry_after::parse_retry_after;
 pub use wording::{is_context_overflow, is_out_of_quota};

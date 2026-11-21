@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use karaka_agent::{Agent, Agents};
+use karaka_agent::{Agent, Agents, RequestErrorHooks};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
 use karaka_session::{SessionError, SessionId, SessionStore};
@@ -57,6 +57,7 @@ pub(crate) struct Shared {
     pub(crate) models: Arc<ModelRegistry>,
     pub(crate) tools: Arc<ToolRegistry>,
     sessions: Arc<SessionStore>,
+    pub(crate) hooks: Arc<RequestErrorHooks>,
 }
 
 /// The default loop's [`Agents`]: one agent per session, made the first
@@ -73,12 +74,14 @@ pub struct AgentLoop {
 
 impl AgentLoop {
     /// A loop that asks the models in `models`, runs the tools in `tools`,
-    /// and keeps its sessions in `sessions`.
+    /// keeps its sessions in `sessions`, and runs `hooks` when a request
+    /// fails.
     pub fn new(
         config: LoopConfig,
         models: Arc<ModelRegistry>,
         tools: Arc<ToolRegistry>,
         sessions: Arc<SessionStore>,
+        hooks: Arc<RequestErrorHooks>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -86,6 +89,7 @@ impl AgentLoop {
                 models,
                 tools,
                 sessions,
+                hooks,
             }),
             agents: Mutex::new(HashMap::new()),
         }
@@ -133,8 +137,12 @@ impl fmt::Debug for AgentLoop {
 /// `dsh-agent-loop` plugin, which registers its factory with the agent
 /// registry.)
 ///
-/// It requires the model and tool registries and the session store. It
-/// doesn't check its route at setup: a route may be registered later, and a
+/// It requires the model and tool registries and the session store, and
+/// provides the [`RequestErrorHooks`] port beside `Agents`, empty: the loop
+/// runs the hook, so it owns the list. A plugin that registers a handler,
+/// such as `karaka-retry`, requires that port, so it starts after this one.
+///
+/// It doesn't check its route at setup: a route may be registered later, and a
 /// turn whose route has no model ends with `NO_ADAPTER`, as in dsh.
 #[derive(Debug)]
 pub struct AgentLoopPlugin {
@@ -153,7 +161,10 @@ impl Plugin for AgentLoopPlugin {
     }
 
     fn provides(&self) -> Vec<PortId> {
-        vec![PortId::of::<dyn Agents>()]
+        vec![
+            PortId::of::<dyn Agents>(),
+            PortId::of::<RequestErrorHooks>(),
+        ]
     }
 
     fn requires(&self) -> Vec<PortId> {
@@ -165,13 +176,16 @@ impl Plugin for AgentLoopPlugin {
     }
 
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+        let hooks = Arc::new(RequestErrorHooks::new());
         let agents: Arc<dyn Agents> = Arc::new(AgentLoop::new(
             self.config.clone(),
             ctx.get::<ModelRegistry>(),
             ctx.get::<ToolRegistry>(),
             ctx.get::<SessionStore>(),
+            Arc::clone(&hooks),
         ));
         ctx.provide(agents);
+        ctx.provide(hooks);
         Ok(())
     }
 }

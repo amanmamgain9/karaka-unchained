@@ -20,6 +20,7 @@ karaka-agent.workspace = true
 karaka-agent-loop.workspace = true
 karaka-session.workspace = true
 karaka-tools.workspace = true
+karaka-retry.workspace = true
 # The arguments a tool takes.
 serde_json.workspace = true
 # Writes the time `current_time` answers with.

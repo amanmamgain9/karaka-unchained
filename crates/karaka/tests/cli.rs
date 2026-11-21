@@ -18,6 +18,7 @@ const VARIABLES: &[&str] = &[
     "KARAKA_SYSTEM",
     "KARAKA_MAX_TOKENS",
     "KARAKA_EFFORT",
+    "KARAKA_MAX_RETRIES",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
@@ -585,6 +586,8 @@ fn chat_reports_a_failed_turn_and_carries_on() {
         &[
             ("ANTHROPIC_API_KEY", "test-key".into()),
             ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            // Off, so the failure reaches the chat.
+            ("KARAKA_MAX_RETRIES", "0".into()),
         ],
         "hi\nhi again\n",
     );
@@ -607,4 +610,37 @@ fn chat_needs_the_same_settings_as_ask() {
         stderr.starts_with("karaka: ANTHROPIC_API_KEY is not set"),
         "{stderr}"
     );
+}
+
+/// A rate limit is retried before the turn gives up: the server refuses
+/// once, the chat waits about half a second, as dsh's default policy
+/// does, and the answer comes on the second request.
+#[test]
+fn chat_retries_a_rate_limit_and_answers() {
+    let (address, server) = serve(vec![
+        http_response(
+            "429 Too Many Requests",
+            &[("content-type", "application/json")],
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down."}}"#,
+        ),
+        streamed(&anthropic_text("Hello after a wait.")),
+    ]);
+
+    let output = karaka(
+        &["chat"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "hi\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(text(&output.stdout), "Hello after a wait.\n");
+    let sent = server.join().expect("the server ran");
+    assert_eq!(sent.len(), 2);
+    // Both requests carried the same conversation.
+    assert_eq!(body(&sent[0]), body(&sent[1]));
 }

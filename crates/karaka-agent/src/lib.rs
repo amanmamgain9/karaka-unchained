@@ -11,6 +11,21 @@
 //! The default loop lives in `karaka-agent-loop`. Another loop can replace
 //! it by providing [`Agents`] instead, and nothing that uses this seam
 //! changes.
+//!
+//! The seam also holds the loop's first extension point:
+//! [`RequestErrorHooks`], which a failed model request runs so a plugin
+//! such as `karaka-retry` can ask for it to be tried again
+//! (`request_error.rs`). Its payload can wait on the turn's
+//! [`Cancellation`] (`cancel.rs`).
+
+mod cancel;
+mod request_error;
+
+pub use cancel::{CancelSwitch, Cancellation, cancellation};
+pub use request_error::{
+    HandlerError, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
+    RequestErrorHooks,
+};
 
 use std::future::Future;
 use std::pin::Pin;

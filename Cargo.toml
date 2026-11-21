@@ -44,3 +44,4 @@ karaka-agent = { path = "crates/karaka-agent" }
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }
 karaka-agent-loop = { path = "crates/karaka-agent-loop" }
+karaka-retry = { path = "crates/karaka-retry" }

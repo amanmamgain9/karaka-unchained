@@ -10,7 +10,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, DynPlugin, Plugin, PluginContext, PortId, Runtime, StartError};
-use karaka_model::{Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, complete};
+use karaka_model::{
+    Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, RetryPolicy, RetryPolicyConfig,
+    complete,
+};
 use karaka_openai::{MaxTokensField, OpenAiConfig, OpenAiModel, OpenAiPlugin};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,6 +103,7 @@ fn config(route: &str, base_url: String) -> OpenAiConfig {
         thinking: None,
         max_tokens_field: MaxTokensField::MaxTokens,
         system_messages_in_history: false,
+        retry_policy: None,
     }
 }
 
@@ -134,6 +138,7 @@ async fn the_plugin_registers_a_model_that_answers() {
         thinking: Some(true),
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
         system_messages_in_history: false,
+        retry_policy: None,
     });
 
     let runtime = Runtime::start(with_registry(vec![plugin]))
@@ -197,6 +202,7 @@ async fn a_default_effort_with_thinking_off_stops_the_runtime_from_starting() {
         thinking: Some(false),
         max_tokens_field: MaxTokensField::MaxTokens,
         system_messages_in_history: false,
+        retry_policy: None,
     });
 
     let Err(StartError::Failed { source, .. }) = Runtime::start(with_registry(vec![plugin])).await
@@ -314,5 +320,31 @@ async fn an_empty_route_stops_the_runtime_from_starting() {
     assert!(
         source.to_string().starts_with("the model route is empty"),
         "{source}"
+    );
+}
+
+/// The config's retry policy reaches the model; with none, it has dsh's.
+#[tokio::test]
+async fn the_retry_policy_comes_from_the_config() {
+    let mut limited = config("ollama", "http://127.0.0.1:1/v1".into());
+    limited.retry_policy = Some(RetryPolicyConfig {
+        max_retries: Some(0),
+        ..RetryPolicyConfig::default()
+    });
+    let runtime = Runtime::start(with_registry(vec![
+        OpenAiPlugin::new(limited),
+        OpenAiPlugin::new(config("local", "http://127.0.0.1:1/v1".into())),
+    ]))
+    .await
+    .expect("the runtime starts");
+    let registry = runtime.get::<ModelRegistry>();
+    let RetryPolicy::Normal { max_retries, .. } = registry.get("ollama").unwrap().retry_policy()
+    else {
+        panic!("a normal policy");
+    };
+    assert_eq!(max_retries, 0);
+    assert_eq!(
+        registry.get("local").unwrap().retry_policy(),
+        RetryPolicy::default()
     );
 }

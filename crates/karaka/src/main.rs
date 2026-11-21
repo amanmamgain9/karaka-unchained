@@ -32,7 +32,8 @@ With no question, or with -, the question is read from stdin.
 
 chat reads messages from stdin, one per line, and answers each through
 the agent loop, which can call one tool, current_time. Each tool call is
-printed on a line of its own, then the answer.
+printed on a line of its own, then the answer. A request that fails for a
+reason worth retrying, such as a rate limit, is tried again first.
 
 Settings come from the environment:
   KARAKA_PROVIDER     anthropic (the default), deepseek or openai. deepseek
@@ -50,6 +51,10 @@ Settings come from the environment:
   KARAKA_EFFORT       low, medium, high, xhigh or max (optional; the
                       provider's default otherwise). deepseek takes only
                       low, high or max, and high is its default
+  KARAKA_MAX_RETRIES  how many times chat retries a request that failed
+                      for a reason worth retrying, such as a rate limit
+                      (optional; 5 otherwise). 0 turns retries off. ask
+                      doesn't retry
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY

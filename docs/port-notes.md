@@ -365,9 +365,6 @@ Four pieces, one crate each where they are seams:
 
 Each lives in dsh at the path given, under `packages/`.
 
-- **Retry**, through the `agent/request-error` hook
-  (`core/agent-loop/src/agent.ts:511-526`) and `llm/llm-retry`. A failed
-  model call ends the turn.
 - **Parallel tool calls and exclusive barriers.** `runGroup`,
   `core/agent-loop/src/tool-calls.ts`. Calls run one after another.
 - **Steering, `inject` and the next-step inbox.** `send`, `steer` and
@@ -518,3 +515,106 @@ system and user messages, before the stream.
   Karaka keeps no streams, and v4 accepts an empty one.
 - **The `agent/request` hook and `startsRequestSeries` aren't ported**, so a
   plugin can't change the config per step or start a series itself.
+
+## Agent loop, step three: retries
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-21.*
+
+### What is done
+
+- **The policy belongs to the provider** (`karaka-model`, `retry.rs`; dsh
+  `llm/src/retry-policy.ts`).
+  - `RetryPolicy` is either normal (a retry limit, retryable codes and a
+    backoff) or always (a backoff only). It has dsh's defaults: 5 retries,
+    500 ms initial delay, 10 s longest wait, 0.1 jitter, and
+    `DEFAULT_RETRYABLE_CODES`.
+  - `RetryPolicyConfig::resolve` checks a config as `resolveRetryPolicy`
+    does.
+  - `Model::retry_policy` returns the policy, with dsh's default unless a
+    provider overrides it. `AnthropicConfig` and `OpenAiConfig` take an
+    optional `retry_policy`, and their models return it.
+  - `ErrorKind::code` moved from the loop into `karaka-model`, so the
+    policy's codes and the codes the loop writes come from one table. A test
+    checks that the default policy retries exactly the kinds that
+    `is_retryable` says.
+- **The request-error hook** (`karaka-agent`, `request_error.rs`; dsh's
+  `agent/request-error` waterfall).
+  - It is the first hook, and is built as a registry port, not a kernel
+    change. Plugins register a `RequestErrorHandler` in
+    `RequestErrorHooks`. Each handler gets the failed request and a `Next`
+    for the rest of the chain, and returns `Retry` or nothing. Handlers run
+    in the order they were registered.
+  - The payload holds the session, turn, step, provider, the `Failure` (with
+    `providerRetryAfterMs`), the policy and the turn's `Cancellation`.
+  - The loop's plugin provides the port, so a plugin that registers into it
+    starts after the loop.
+  - It lives in `karaka-agent` because it is the agent's extension point,
+    as dsh declares it beside `Agent`. The turn's cancel switch moved there
+    too, as `CancelSwitch` and `Cancellation`, so a handler can wait on it.
+  - A general hook mechanism in the kernel could replace this port later.
+- **The loop runs it.** It runs after a failed attempt's `assistant/attempt`.
+  On retry it goes round again, as dsh's `continue` does: the system prompt,
+  model lookup, header and context run again, and the queued message is
+  logged only once. A cancel during the chain, or after it, wins and the
+  turn ends aborted. A handler that fails, or panics, means no retry: the
+  turn ends with that error, as when a dsh listener rejects.
+- **`karaka-retry`** (dsh `llm/llm-retry`). `RetryPlugin` registers
+  `RetryHandler`:
+  - Normal mode retries the listed codes, up to the limit, then calls
+    `next`. Always mode calls `next` first, then retries anyway.
+  - A provider's `Retry-After` is used when it is positive and no more than
+    the longest wait. Past it, normal mode calls `next` and always mode backs
+    off. Otherwise the wait is dsh's jittered exponential backoff
+    (`localDelay`).
+  - `llm/retry` is logged before the wait and `llm/retry-started` after it,
+    with dsh's data and key order, `policyKey` included, as passthrough
+    events. A cancel during the wait means no `llm/retry-started`.
+  - The count is read from the log, as dsh's `llmRetry` projection reads
+    it: the latest `llm/retry` for the provider and policy key since the
+    last `step/start` or `turn/end`.
+  - The jitter's random source can be injected (`RetryPlugin::with_random`,
+    dsh's `RetryInternals.random`). Waits use Tokio's timers, so the tests
+    run on paused time.
+- **The binary.** `karaka chat` runs `RetryPlugin`, and `KARAKA_MAX_RETRIES`
+  sets the provider's retry limit, with 0 turning retries off.
+
+### Where step three differs from dsh
+
+- **The provider in the payload and in `llm/retry` is the provider's name**,
+  as in the header (step two), where dsh gives the route. The count is
+  keyed by it.
+- **Retry ids name a seq**, `retry-{seq}` after the chain's first
+  `llm/retry`, in the style of the loop's message ids. dsh uses a random
+  UUID. Both are unique in the session.
+- **The default random source** hashes the time with `std`'s randomly
+  keyed hasher, so no new crate is needed. Jitter needs no strong
+  randomness.
+- **A failure further down the chain is dropped silently in always mode.**
+  dsh logs a warning first; Karaka has no logger yet.
+- **A handler that panics** ends the turn with `UNKNOWN`, "a request-error
+  handler panicked". dsh has no panics; a thrown error ends the turn with
+  its text under `UNKNOWN`, as here.
+- **The policy is always there.** dsh's payload has none when no adapter
+  served the request. In Karaka a route with no model never reaches the
+  hook (step two).
+- **No plugin disposal.** dsh aborts and drains running waits when the
+  plugin unloads. Karaka's kernel can't stop plugins yet.
+- **The retry config is snake_case** (`max_retries`, `retryable_codes`,
+  `backoff.initial_delay_ms`, ...), like the rest of a Karaka provider
+  config. dsh's is camelCase. The logged events keep dsh's names.
+- **`TIMEOUT` is in the default codes but never written.** Karaka files a
+  timeout under `TRANSPORT`, which is in them too.
+- **Counting across a restart.** The count is never held in memory, so
+  whatever reads the log mid-step carries on counting. But opening a
+  session closes a turn that a crash left open, as dsh's resume does, and
+  that `turn/end` resets the count, so a restarted agent starts its next
+  turn from zero, as dsh's does.
+- **`karaka ask` doesn't retry.** It streams the answer straight from the
+  model, outside the loop, and the hook needs a session and a turn. Running
+  `ask` through the loop would print the answer only once it is finished,
+  unless the loop published stream frames for a live view (dsh's
+  `agent/assistant-stream`, left out in step one). With those, `ask` could
+  become a one-turn chat.
+- **The retry tests use the real loop**, so `karaka-retry` has
+  `karaka-agent-loop` as a dev-dependency. Its library depends only on
+  seams.

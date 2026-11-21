@@ -119,6 +119,7 @@ async fn anthropic_and_deepseek_answer_side_by_side() {
         cache: CacheMode::Off,
         profile: Profile::Anthropic,
         thinking: None,
+        retry_policy: None,
     });
     let deepseek = OpenAiPlugin::new(OpenAiConfig {
         route: "deepseek".into(),
@@ -128,6 +129,7 @@ async fn anthropic_and_deepseek_answer_side_by_side() {
         thinking: None,
         max_tokens_field: Default::default(),
         system_messages_in_history: false,
+        retry_policy: None,
     });
 
     let runtime = Runtime::start(vec![
@@ -208,6 +210,7 @@ async fn both_profiles_of_the_messages_crate_answer_side_by_side() {
         cache: CacheMode::Off,
         profile,
         thinking: None,
+        retry_policy: None,
     };
     let anthropic = config(
         "anthropic",

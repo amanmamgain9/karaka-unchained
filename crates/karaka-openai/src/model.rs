@@ -8,7 +8,8 @@ use std::time::{Duration, SystemTime};
 
 use futures_util::stream::unfold;
 use karaka_model::{
-    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, parse_retry_after,
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, RetryPolicy,
+    parse_retry_after,
 };
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -45,6 +46,8 @@ pub struct OpenAiModel {
     /// `None` for a local server that needs no key.
     api_key: Option<String>,
     settings: Settings,
+    /// dsh's default unless set.
+    retry_policy: RetryPolicy,
 }
 
 impl OpenAiModel {
@@ -65,7 +68,15 @@ impl OpenAiModel {
             endpoint: endpoint(&base_url.into()),
             api_key: None,
             settings: Settings::default(),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Sets how failed requests should be retried. dsh's default unless
+    /// set: see [`RetryPolicy`].
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Sends `key` with every request, as `Authorization: Bearer <key>`.
@@ -150,6 +161,10 @@ impl Model for OpenAiModel {
     /// names the format it speaks, whichever server answers.
     fn provider(&self) -> &str {
         "openai"
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy.clone()
     }
 
     fn stream(&self, request: Request) -> EventStream {

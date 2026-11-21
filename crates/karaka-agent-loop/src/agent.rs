@@ -15,8 +15,8 @@
 //!
 //! # Cancelling
 //!
-//! Each turn has a switch, a watch channel that holds the cancel's cause
-//! once someone cancels. The turn races every model stream and every tool
+//! Each turn has a switch, `karaka-agent`'s [`CancelSwitch`], that holds
+//! the cancel's cause once someone cancels. The turn races every model stream and every tool
 //! call against it, and drops whichever is still running when the switch
 //! flips. Dropping a stream closes its connection; dropping a tool's future
 //! stops the tool. dsh aborts an `AbortSignal` instead and waits for the
@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use karaka_agent::{Agent, WhenIdle};
+use karaka_agent::{Agent, CancelSwitch, Cancellation, WhenIdle, cancellation};
 use karaka_session::{CancelCause, Session, SessionEvent, SessionId, UserMessage};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -42,12 +42,11 @@ use tokio::sync::watch;
 use crate::plugin::Shared;
 use crate::turn::Ran;
 
-/// The switch that cancels one turn: `None` until someone cancels it, then
-/// the cause. Only the first cause counts.
-pub(crate) type Switch = watch::Sender<Option<CancelCause>>;
+/// The switch that cancels one turn. Only the first cause counts.
+pub(crate) type Switch = CancelSwitch;
 
 /// What a turn watches for a cancel.
-pub(crate) type Cancel = watch::Receiver<Option<CancelCause>>;
+pub(crate) type Cancel = Cancellation;
 
 /// One session's agent. Cheap to share; every clone of the inner `Arc`
 /// reaches the same queue and session.
@@ -139,7 +138,7 @@ impl Agent for LoopAgent {
             // The running driver takes it when the current turn ends.
             return;
         }
-        let (switch, cancel) = watch::channel(None);
+        let (switch, cancel) = cancellation();
         state.switch = Some(switch);
         self.inner.idle.send_replace(false);
         drop(state);
@@ -151,13 +150,7 @@ impl Agent for LoopAgent {
         let mut state = self.inner.lock();
         state.queue.clear();
         if let Some(switch) = &state.switch {
-            switch.send_if_modified(|current| {
-                if current.is_some() {
-                    return false;
-                }
-                *current = Some(cause);
-                true
-            });
+            switch.cancel(cause);
         }
     }
 
@@ -184,7 +177,7 @@ impl Inner {
         };
         loop {
             let turn = self.lock().last_turn + 1;
-            let ran = self.turn(turn, &mut cancel).await;
+            let ran = self.turn(turn, &cancel).await;
             let mut state = self.lock();
             if !matches!(ran, Ran::NotStarted) {
                 state.last_turn = turn;
@@ -202,7 +195,7 @@ impl Inner {
             // A new switch for the next turn: a cancel of the turn that
             // just ended doesn't reach it. (dsh: `phase.abort = new
             // AbortController()`.)
-            let (switch, next) = watch::channel(None);
+            let (switch, next) = cancellation();
             state.switch = Some(switch);
             cancel = next;
         }

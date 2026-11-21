@@ -8,7 +8,8 @@ use std::time::{Duration, SystemTime};
 
 use futures_util::stream::unfold;
 use karaka_model::{
-    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, parse_retry_after,
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, RetryPolicy,
+    parse_retry_after,
 };
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
@@ -42,6 +43,8 @@ pub struct AnthropicModel {
     endpoint: String,
     api_key: String,
     settings: ProfileSettings,
+    /// dsh's default unless set.
+    retry_policy: RetryPolicy,
 }
 
 /// The settings for the profile in use. Each profile writes its own body
@@ -74,6 +77,7 @@ impl AnthropicModel {
                 thinking_display: None,
                 cache: CacheMode::default(),
             }),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -95,7 +99,15 @@ impl AnthropicModel {
             endpoint: deepseek::endpoint(deepseek::BASE_URL),
             api_key: api_key.into(),
             settings: ProfileSettings::DeepSeek(deepseek::Settings::default()),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    /// Sets how failed requests should be retried. dsh's default unless
+    /// set: see [`RetryPolicy`].
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
     }
 
     /// Which profile this model speaks.
@@ -256,6 +268,10 @@ impl Model for AnthropicModel {
             Profile::Anthropic => crate::request::PROVIDER,
             Profile::DeepSeek => deepseek::PROVIDER,
         }
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.retry_policy.clone()
     }
 
     fn stream(&self, request: Request) -> EventStream {

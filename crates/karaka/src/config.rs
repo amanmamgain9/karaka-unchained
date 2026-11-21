@@ -8,7 +8,7 @@ use karaka_anthropic::{
     AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
 };
 use karaka_kernel::DynPlugin;
-use karaka_model::{Effort, ModelsPlugin};
+use karaka_model::{Effort, ModelsPlugin, RetryPolicyConfig};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
 
 /// Used when `KARAKA_MODEL` isn't set and the provider is Anthropic.
@@ -80,6 +80,19 @@ impl Config {
         // The provider's own name unless set, so `KARAKA_ROUTE=deepseek`
         // only needs saying when it helps someone read the setup.
         let route = var("KARAKA_ROUTE").unwrap_or_else(|| provider.to_owned());
+        // The provider's retry policy: dsh's default, or as many retries of
+        // transient failures as this says. 0 turns retries off.
+        let retry_policy = match var("KARAKA_MAX_RETRIES") {
+            None => None,
+            Some(text) => Some(RetryPolicyConfig {
+                max_retries: Some(text.trim().parse::<u64>().map_err(|_| {
+                    format!(
+                        "KARAKA_MAX_RETRIES is \"{text}\", but it must be a whole number, such as 0 or 5"
+                    )
+                })?),
+                ..RetryPolicyConfig::default()
+            }),
+        };
         let (provider, model) = match provider {
             "anthropic" => {
                 let api_key = var("ANTHROPIC_API_KEY").ok_or(
@@ -123,6 +136,7 @@ impl Config {
                     cache,
                     profile: Profile::Anthropic,
                     thinking: None,
+                    retry_policy: retry_policy.clone(),
                 };
                 let model = model.unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_owned());
                 (Provider::Anthropic(config), model)
@@ -157,6 +171,7 @@ impl Config {
                     cache: CacheMode::default(),
                     profile: Profile::DeepSeek,
                     thinking,
+                    retry_policy: retry_policy.clone(),
                 };
                 let model = model.unwrap_or_else(|| DEFAULT_DEEPSEEK_MODEL.to_owned());
                 (Provider::DeepSeek(config), model)
@@ -176,6 +191,7 @@ impl Config {
                     thinking: None,
                     max_tokens_field: Default::default(),
                     system_messages_in_history: false,
+                    retry_policy: retry_policy.clone(),
                 };
                 // Each OpenAI-compatible server has its own models, so there
                 // is no default that would work everywhere.
@@ -481,6 +497,31 @@ mod tests {
         assert_eq!(
             error,
             "KARAKA_PROVIDER is \"gemini\", but it must be \"anthropic\", \"deepseek\" or \"openai\""
+        );
+    }
+
+    #[test]
+    fn max_retries_sets_the_providers_retry_policy() {
+        let limited = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_MAX_RETRIES", "0")])
+            .expect("the config reads");
+        let Provider::Anthropic(anthropic) = limited.provider else {
+            panic!("expected anthropic");
+        };
+        assert_eq!(
+            anthropic.retry_policy.and_then(|policy| policy.max_retries),
+            Some(0)
+        );
+        let unset = Config::from_env(|name| (name == "ANTHROPIC_API_KEY").then(|| "k".into()))
+            .expect("the config reads");
+        let Provider::Anthropic(anthropic) = unset.provider else {
+            panic!("expected anthropic");
+        };
+        assert_eq!(anthropic.retry_policy, None);
+        let error = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_MAX_RETRIES", "lots")])
+            .expect_err("not a number");
+        assert!(
+            error.starts_with("KARAKA_MAX_RETRIES is \"lots\""),
+            "{error}"
         );
     }
 

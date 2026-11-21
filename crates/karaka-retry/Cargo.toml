@@ -1,0 +1,30 @@
+[package]
+name = "karaka-retry"
+description = "Retries a failed model request as its provider's retry policy says: a port of dsh's llm-retry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the handler.
+karaka-kernel.workspace = true
+# The request-error hook the handler joins.
+karaka-agent.workspace = true
+# The provider's retry policy.
+karaka-model.workspace = true
+# The log the retry events go into, and the count is read back from.
+karaka-session.workspace = true
+# The retry events' data, written as v4 JSON.
+serde_json.workspace = true
+# `time` for the wait between attempts, `macros` for the `select!` that
+# lets a cancel end it.
+tokio = { workspace = true, features = ["time", "macros"] }
+
+# The tests run the real loop over a scripted model, on paused time.
+[dev-dependencies]
+karaka-agent-loop.workspace = true
+karaka-tools.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

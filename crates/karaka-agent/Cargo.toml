@@ -1,15 +1,23 @@
 [package]
 name = "karaka-agent"
-description = "The agent seam: the trait a main loop implements, and the port callers find each session's agent through"
+description = "The agent seam: the trait a main loop implements, the port callers find each session's agent through, and the hook a failed model request runs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Only traits, so this crate has no executor and no runtime of its own.
+# Traits and small types, with no executor and no runtime of their own.
 [dependencies]
 # An agent drives one session: it is named by the session's id, takes the
 # session's user messages, and ends a cancelled turn with the session's
-# cancel causes.
+# cancel causes. A failed request is described by the session's `Failure`.
 karaka-session.workspace = true
+# The retry policy a failed request's provider asks for.
+karaka-model.workspace = true
+# Only `sync`, for the watch channel behind a turn's cancel switch. It needs
+# no runtime, so the seam stays executor-free in practice.
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

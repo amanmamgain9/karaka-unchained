@@ -602,6 +602,7 @@ dependencies = [
  "karaka-kernel",
  "karaka-model",
  "karaka-openai",
+ "karaka-retry",
  "karaka-session",
  "karaka-tools",
  "serde_json",
@@ -612,7 +613,9 @@ dependencies = [
 name = "karaka-agent"
 version = "0.1.0"
 dependencies = [
+ "karaka-model",
  "karaka-session",
+ "tokio",
 ]
 
 [[package]]
@@ -672,6 +675,21 @@ dependencies = [
  "karaka-sse",
  "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-retry"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "karaka-agent",
+ "karaka-agent-loop",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-session",
+ "karaka-tools",
  "serde_json",
  "tokio",
 ]

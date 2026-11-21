@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_core::Stream;
 
-use crate::{Block, Message, Role};
+use crate::{Block, Message, RetryPolicy, Role};
 
 /// What a model provider implements.
 ///
@@ -45,6 +45,15 @@ pub trait Model: Send + Sync {
     /// it needs (`'static`), so it can outlive the borrow of `self` and move
     /// between threads.
     fn stream(&self, request: Request) -> EventStream;
+
+    /// How this provider wants its failed requests retried. (dsh: each
+    /// adapter's `providerRetryPolicy`, from its config's `retryPolicy`.)
+    ///
+    /// Only read: whatever retries requests follows it. A provider whose
+    /// config sets no policy gets dsh's default, which this method returns.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::default()
+    }
 }
 
 /// What [`Model::stream`] returns. Boxed so that every provider, whatever its
@@ -346,6 +355,32 @@ impl ErrorKind {
             self,
             Self::EmptyResponse | Self::RateLimited | Self::Unavailable | Self::Network
         )
+    }
+
+    /// dsh's code for this kind, as dsh's adapters write it into a failure,
+    /// such as `RATE_LIMIT`. Where a kind stands for several codes (see the
+    /// table above), this is the one dsh writes most.
+    ///
+    /// A refusal has no dsh code: pi-ai reports one as a plain error, which
+    /// dsh files as `PI_AI_ERROR`, a code that names an adapter Karaka
+    /// doesn't have. Karaka writes `REFUSED`, so a reader can tell a
+    /// refusal from a breakage.
+    ///
+    /// These are the codes a [`RetryPolicy`] lists, so the default policy
+    /// retries exactly the kinds that are [retryable](Self::is_retryable).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auth => "AUTH",
+            Self::Quota => "QUOTA",
+            Self::InvalidRequest => "INVALID_REQUEST",
+            Self::ContextWindowExceeded => "CONTEXT_WINDOW_EXCEEDED",
+            Self::Refused => "REFUSED",
+            Self::Malformed => "MALFORMED_RESPONSE",
+            Self::EmptyResponse => "EMPTY_RESPONSE",
+            Self::RateLimited => "RATE_LIMIT",
+            Self::Unavailable => "SERVER",
+            Self::Network => "TRANSPORT",
+        }
     }
 
     fn describe(self) -> &'static str {

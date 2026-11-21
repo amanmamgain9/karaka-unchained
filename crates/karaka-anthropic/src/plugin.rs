@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::{Effort, ModelRegistry};
+use karaka_model::{Effort, ModelRegistry, RetryPolicyConfig};
 use serde::Deserialize;
 
 use crate::{AnthropicModel, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay, deepseek};
@@ -63,6 +63,11 @@ pub struct AnthropicConfig {
     /// DeepSeek only. Turns thinking on or off. `None` leaves it on, as dsh
     /// does. With it off, no effort can be set.
     pub thinking: Option<DeepSeekThinking>,
+    /// How failed requests to this provider should be retried, as dsh's
+    /// provider configs hold a `retryPolicy`. dsh's default unless set:
+    /// five retries of transient failures.
+    #[serde(default)]
+    pub retry_policy: Option<RetryPolicyConfig>,
 }
 
 /// The route when the config doesn't name one.
@@ -82,6 +87,7 @@ impl fmt::Debug for AnthropicConfig {
             .field("cache", &self.cache)
             .field("profile", &self.profile)
             .field("thinking", &self.thinking)
+            .field("retry_policy", &self.retry_policy)
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +223,13 @@ impl Plugin for AnthropicPlugin {
             Profile::Anthropic => self.anthropic()?,
             Profile::DeepSeek => self.deepseek()?,
         };
+        let model = match &self.config.retry_policy {
+            Some(policy) => {
+                let path = format!("{}.retry_policy", self.config.route);
+                model.with_retry_policy(policy.resolve(&path)?)
+            }
+            None => model,
+        };
         // An empty or taken route fails here. Its error becomes this
         // plugin's setup error, which the runtime reports by plugin name.
         ctx.get::<ModelRegistry>()
@@ -292,6 +305,7 @@ mod tests {
             cache: CacheMode::Short,
             profile: Profile::Anthropic,
             thinking: None,
+            retry_policy: None,
         };
         assert!(!format!("{config:?}").contains("sk-secret"));
     }

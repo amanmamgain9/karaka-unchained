@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::{Effort, ModelRegistry};
+use karaka_model::{Effort, ModelRegistry, RetryPolicyConfig};
 use serde::Deserialize;
 
 use crate::{MaxTokensField, OpenAiModel};
@@ -43,6 +43,11 @@ pub struct OpenAiConfig {
     /// prompt, as pi-ai does for a server it knows nothing about.
     #[serde(default)]
     pub system_messages_in_history: bool,
+    /// How failed requests to this server should be retried, as dsh's
+    /// provider configs hold a `retryPolicy`. dsh's default unless set:
+    /// five retries of transient failures.
+    #[serde(default)]
+    pub retry_policy: Option<RetryPolicyConfig>,
 }
 
 /// Leaves out the API key, so a config can be logged safely.
@@ -55,6 +60,7 @@ impl fmt::Debug for OpenAiConfig {
             .field("default_effort", &self.default_effort)
             .field("thinking", &self.thinking)
             .field("max_tokens_field", &self.max_tokens_field)
+            .field("retry_policy", &self.retry_policy)
             .field(
                 "system_messages_in_history",
                 &self.system_messages_in_history,
@@ -118,6 +124,10 @@ impl Plugin for OpenAiPlugin {
         model = model
             .with_max_tokens_field(self.config.max_tokens_field)
             .with_system_messages_in_history(self.config.system_messages_in_history);
+        if let Some(policy) = &self.config.retry_policy {
+            let path = format!("{}.retry_policy", self.config.route);
+            model = model.with_retry_policy(policy.resolve(&path)?);
+        }
         // An empty or taken route fails here. Its error becomes this
         // plugin's setup error, which the runtime reports by plugin name.
         ctx.get::<ModelRegistry>()
@@ -183,6 +193,7 @@ mod tests {
             thinking: None,
             max_tokens_field: MaxTokensField::MaxTokens,
             system_messages_in_history: false,
+            retry_policy: None,
         };
         assert!(!format!("{config:?}").contains("sk-secret"));
     }

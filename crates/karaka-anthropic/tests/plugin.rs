@@ -12,7 +12,10 @@ use karaka_anthropic::{
     AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
 };
 use karaka_kernel::{DynPlugin, Runtime, StartError};
-use karaka_model::{Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, complete};
+use karaka_model::{
+    Backoff, Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, RetryPolicy,
+    RetryPolicyConfig, complete,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -98,6 +101,7 @@ fn plugin(route: &str, api_key: &str, address: SocketAddr) -> AnthropicPlugin {
         cache: CacheMode::Off,
         profile: Profile::Anthropic,
         thinking: None,
+        retry_policy: None,
     })
 }
 
@@ -197,6 +201,7 @@ fn deepseek_config(address: SocketAddr) -> AnthropicConfig {
         cache: CacheMode::default(),
         profile: Profile::DeepSeek,
         thinking: Some(DeepSeekThinking::Enabled),
+        retry_policy: None,
     }
 }
 
@@ -311,5 +316,52 @@ async fn deepseeks_thinking_switch_is_refused_for_anthropic() {
     assert_eq!(
         deepseek_start_error(config).await,
         "`thinking` is for the deepseek profile; the anthropic profile uses `thinking_display`"
+    );
+}
+
+/// The config's retry policy, as dsh's provider configs hold a
+/// `retryPolicy`, reaches the model, and one dsh would refuse stops the
+/// runtime. With none set, the model has dsh's default.
+#[tokio::test]
+async fn the_retry_policy_comes_from_the_config() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+    let model = |config: AnthropicConfig| async move {
+        let runtime = Runtime::start(with_registry(AnthropicPlugin::new(config)))
+            .await
+            .expect("the runtime starts");
+        runtime.get::<ModelRegistry>().get("deepseek").unwrap()
+    };
+    assert_eq!(
+        model(deepseek_config(address)).await.retry_policy(),
+        RetryPolicy::default()
+    );
+
+    let config: AnthropicConfig = serde_json::from_value(serde_json::json!({
+        "route": "deepseek",
+        "profile": "deepseek",
+        "api_key": "deepseek-key",
+        "retry_policy": { "mode": "always", "backoff": { "max_delay_ms": 2000 } },
+    }))
+    .expect("the config reads");
+    assert_eq!(
+        model(config.clone()).await.retry_policy(),
+        RetryPolicy::Always {
+            backoff: Backoff {
+                max_delay_ms: 2000.0,
+                ..Backoff::default()
+            }
+        }
+    );
+
+    let refused = AnthropicConfig {
+        retry_policy: Some(RetryPolicyConfig {
+            retryable_codes: Some(Vec::new()),
+            ..RetryPolicyConfig::default()
+        }),
+        ..deepseek_config(address)
+    };
+    assert_eq!(
+        deepseek_start_error(refused).await,
+        "deepseek.retry_policy.retryable_codes must not be empty"
     );
 }

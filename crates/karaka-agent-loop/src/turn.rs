@@ -13,7 +13,11 @@
 //!                         makes its first request (see `request.rs`)
 //!     request/context     when the route changes
 //!     assistant/message   the model's answer, with its usage, or else
-//!     assistant/attempt   for a call that failed or was cancelled early
+//!     assistant/attempt   for a call that failed or was cancelled early;
+//!                         after a failure the request-error hook may ask
+//!                         for the call to be made again, in the same
+//!                         step, and a handler such as `karaka-retry` may
+//!                         log its own events first
 //!     tool/call           for each call, in the model's order:
 //!     tool/result           logged as it starts, then its result
 //!   step/end              always, even when the step fails
@@ -50,7 +54,13 @@
 //! `assistant-7`. Only the agent appends to its session, so the next seq is
 //! known before the append, and the ids are unique within the session.
 
-use std::future::{pending, poll_fn};
+use std::future::{Future, poll_fn};
+use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use karaka_agent::{RequestError, RequestErrorAction};
 
 use karaka_model::{
     Block, ErrorKind, Event, Message, Model, ModelError, Request, Response, Role, StopReason,
@@ -64,7 +74,7 @@ use karaka_session::{
 
 use crate::agent::{Cancel, Inner};
 use crate::answer::Answer;
-use crate::failure::{model_failure, no_model, other_failure};
+use crate::failure::{handler_panicked, model_failure, no_model, other_failure};
 
 /// Why a step stopped before it finished.
 pub(crate) enum Stop {
@@ -102,7 +112,7 @@ enum Streamed {
 impl Inner {
     /// Runs turn `turn` from `turn/start` to `turn/end`, and says whether
     /// the driver may go on to the next queued message.
-    pub(crate) async fn turn(&self, turn: u64, cancel: &mut Cancel) -> Ran {
+    pub(crate) async fn turn(&self, turn: u64, cancel: &Cancel) -> Ran {
         if self.session.append(SessionEvent::turn_start(turn)).is_err() {
             return Ran::NotStarted;
         }
@@ -118,10 +128,10 @@ impl Inner {
     }
 
     /// Runs steps until one ends the turn, and says how it ended.
-    async fn steps(&self, turn: u64, cancel: &mut Cancel) -> Result<TurnEndReason, Stop> {
+    async fn steps(&self, turn: u64, cancel: &Cancel) -> Result<TurnEndReason, Stop> {
         let mut step = 0;
         loop {
-            if let Some(cause) = cancelled(cancel) {
+            if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
             // Only the first step takes input: the queued message the turn
@@ -134,7 +144,7 @@ impl Inner {
                     // to claim. It has flipped the switch by then: both
                     // happen under the agent's lock.
                     None => {
-                        return match cancelled(cancel) {
+                        return match cancel.cause() {
                             Some(cause) => Err(Stop::Aborted(cause)),
                             // Nothing queued and nothing cancelled. dsh ends
                             // such a turn as completed, without a step
@@ -157,7 +167,7 @@ impl Inner {
             let ended = self.session.append(SessionEvent::step_end(turn, step));
             let ending = outcome?;
             ended?;
-            if let Some(cause) = cancelled(cancel) {
+            if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
             // dsh keeps a `max-tokens` ending even if a later step of the
@@ -177,53 +187,10 @@ impl Inner {
         turn: u64,
         step: u64,
         input: Option<UserMessage>,
-        cancel: &mut Cancel,
+        cancel: &Cancel,
     ) -> Result<Option<TurnEndReason>, Stop> {
-        self.update_system_prompt(turn, step)?;
-        if let Some(message) = input {
-            self.session.append(SessionEvent::user(message))?;
-        }
-
+        let (model, response) = self.call_model(turn, step, input, cancel).await?;
         let config = &self.shared.config;
-        let model = self
-            .shared
-            .models
-            .get(&config.route)
-            .ok_or_else(|| Stop::Failed(no_model(&config.route)))?;
-        let (call, effort) = self.call_config(model.provider());
-        let History { system, messages } = self.session.history();
-        let mut request = Request::new(config.model.clone(), messages);
-        request.system = system;
-        request.tools = self.shared.tools.schemas();
-        request.max_tokens = config.max_tokens;
-        request.effort = effort;
-        self.log_request(call, &request.tools)?;
-        // A cancel that came before the call started leaves no attempt, as
-        // in dsh, where `buildRequest` checks the signal before the stream
-        // starts (`agent.ts:684`).
-        if let Some(cause) = cancelled(cancel) {
-            return Err(Stop::Aborted(cause));
-        }
-
-        let response = match stream(model.as_ref(), request, cancel).await {
-            Streamed::Finished(response) => response,
-            // A call that left no message is logged as an attempt, so the log
-            // shows it was made. (dsh: `agent.ts:489-510`.)
-            Streamed::Failed(error) => {
-                self.session
-                    .append(SessionEvent::assistant_attempt(turn, step))?;
-                return Err(Stop::Failed(model_failure(&error)));
-            }
-            Streamed::Cancelled(cause, content) => {
-                if content.is_empty() {
-                    self.session
-                        .append(SessionEvent::assistant_attempt(turn, step))?;
-                } else {
-                    self.append_interrupted(turn, step, model.provider(), &content)?;
-                }
-                return Err(Stop::Aborted(cause));
-            }
-        };
         let data = AssistantMessageData::from_response(
             self.next_id("assistant"),
             turn,
@@ -256,7 +223,7 @@ impl Inner {
         // One at a time, in the model's order. dsh runs calls that are safe
         // to overlap in parallel (`tool-calls.ts`); that isn't ported.
         for call in calls {
-            if let Some(cause) = cancelled(cancel) {
+            if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
             // Logged as the call starts, so repair can tell a call that ran
@@ -266,7 +233,7 @@ impl Inner {
                 .append(SessionEvent::tool_call(turn, step, call))?;
             let output = tokio::select! {
                 biased;
-                cause = cancellation(cancel) => return Err(Stop::Aborted(cause)),
+                cause = cancel.cancelled() => return Err(Stop::Aborted(cause)),
                 output = self.shared.tools.execute(call) => output,
             };
             let result = output.into_result(&call.id);
@@ -275,6 +242,111 @@ impl Inner {
                 .append(SessionEvent::tool_result(data, started))?;
         }
         Ok(None)
+    }
+
+    /// The step's model call, tried again for as long as the request-error
+    /// hook asks. (dsh: the `while (true)` in `step`, `agent.ts:409-560`.)
+    ///
+    /// Each attempt does again what dsh's does: it updates the system prompt,
+    /// looks up the model, logs the header and context if they are due, and
+    /// builds the request from the log anew. Only the queued message is
+    /// logged once, on the first attempt (`agent.ts:426-437`). A failed
+    /// attempt is logged as an `assistant/attempt`, then the hook decides.
+    async fn call_model(
+        &self,
+        turn: u64,
+        step: u64,
+        mut input: Option<UserMessage>,
+        cancel: &Cancel,
+    ) -> Result<(Arc<dyn Model>, Response), Stop> {
+        loop {
+            self.update_system_prompt(turn, step)?;
+            if let Some(message) = input.take() {
+                self.session.append(SessionEvent::user(message))?;
+            }
+
+            let config = &self.shared.config;
+            let model = self
+                .shared
+                .models
+                .get(&config.route)
+                .ok_or_else(|| Stop::Failed(no_model(&config.route)))?;
+            let (call, effort) = self.call_config(model.provider());
+            let History { system, messages } = self.session.history();
+            let mut request = Request::new(config.model.clone(), messages);
+            request.system = system;
+            request.tools = self.shared.tools.schemas();
+            request.max_tokens = config.max_tokens;
+            request.effort = effort;
+            self.log_request(call, &request.tools)?;
+            // A cancel that came before the call started leaves no attempt,
+            // as in dsh, where `buildRequest` checks the signal before the
+            // stream starts (`agent.ts:684`).
+            if let Some(cause) = cancel.cause() {
+                return Err(Stop::Aborted(cause));
+            }
+
+            match stream(model.as_ref(), request, cancel).await {
+                Streamed::Finished(response) => return Ok((model, response)),
+                // A call that left no message is logged as an attempt, so the
+                // log shows it was made. (dsh: `agent.ts:489-510`.)
+                Streamed::Failed(error) => {
+                    self.session
+                        .append(SessionEvent::assistant_attempt(turn, step))?;
+                    self.recover(turn, step, model.as_ref(), model_failure(&error), cancel)
+                        .await?;
+                }
+                Streamed::Cancelled(cause, content) => {
+                    if content.is_empty() {
+                        self.session
+                            .append(SessionEvent::assistant_attempt(turn, step))?;
+                    } else {
+                        self.append_interrupted(turn, step, model.provider(), &content)?;
+                    }
+                    return Err(Stop::Aborted(cause));
+                }
+            }
+        }
+    }
+
+    /// Runs the request-error hook for a failed call. `Ok` means try again;
+    /// otherwise the error is how the step ends. (dsh: `agent.ts:511-526`.)
+    ///
+    /// A cancel wins, during the chain or after it, even over a retry, as in
+    /// dsh ("lets cancellation win over a retry action",
+    /// `request-error.spec.ts:105`). A handler that fails or panics ends the
+    /// turn with its own error, as a dsh listener that rejects does.
+    async fn recover(
+        &self,
+        turn: u64,
+        step: u64,
+        model: &dyn Model,
+        failure: Failure,
+        cancel: &Cancel,
+    ) -> Result<(), Stop> {
+        let error = RequestError {
+            session: self.session.clone(),
+            turn,
+            step,
+            provider: model.provider().to_owned(),
+            failure,
+            retry_policy: model.retry_policy(),
+            cancel: cancel.clone(),
+        };
+        let outcome = tokio::select! {
+            biased;
+            cause = cancel.cancelled() => return Err(Stop::Aborted(cause)),
+            outcome = CatchUnwind(self.shared.hooks.run(&error)) => outcome,
+        };
+        if let Some(cause) = cancel.cause() {
+            return Err(Stop::Aborted(cause));
+        }
+        match outcome {
+            Ok(Ok(Some(RequestErrorAction::Retry))) => Ok(()),
+            Ok(Ok(None)) => Err(Stop::Failed(error.failure)),
+            Ok(Err(handler)) => Err(Stop::Failed(other_failure(handler.as_ref()))),
+            Err(Panicked) => Err(Stop::Failed(handler_panicked())),
+        }
     }
 
     /// Logs the system prompt when the session has none yet, or when the
@@ -406,7 +478,7 @@ impl Inner {
 
 /// Streams one model call to its end, or until a cancel. A cancel drops the
 /// stream, which closes its connection.
-async fn stream(model: &dyn Model, request: Request, cancel: &mut Cancel) -> Streamed {
+async fn stream(model: &dyn Model, request: Request, cancel: &Cancel) -> Streamed {
     let mut events = model.stream(request);
     let mut answer = Answer::default();
     loop {
@@ -414,7 +486,7 @@ async fn stream(model: &dyn Model, request: Request, cancel: &mut Cancel) -> Str
         // that is ready at the same moment.
         let event = tokio::select! {
             biased;
-            cause = cancellation(cancel) => return Streamed::Cancelled(cause, answer.interrupted()),
+            cause = cancel.cancelled() => return Streamed::Cancelled(cause, answer.interrupted()),
             event = poll_fn(|cx| events.as_mut().poll_next(cx)) => event,
         };
         match event {
@@ -438,27 +510,6 @@ async fn stream(model: &dyn Model, request: Request, cancel: &mut Cancel) -> Str
                 ));
             }
         }
-    }
-}
-
-/// The cause, if the turn has been cancelled.
-fn cancelled(cancel: &Cancel) -> Option<CancelCause> {
-    cancel.borrow().clone()
-}
-
-/// Waits for the turn to be cancelled, and gives the cause.
-async fn cancellation(cancel: &mut Cancel) -> CancelCause {
-    // The value is cloned out in its own statement, so the lock `wait_for`
-    // holds isn't kept across the `.await` below.
-    let cause = cancel
-        .wait_for(Option::is_some)
-        .await
-        .ok()
-        .and_then(|cause| cause.clone());
-    match cause {
-        Some(cause) => cause,
-        // The switch was dropped, so nothing can cancel the turn any more.
-        None => pending().await,
     }
 }
 
@@ -496,5 +547,28 @@ fn replacing(seq: Seq) -> SurfaceIntent {
             end: seq,
         },
         sources: vec![seq],
+    }
+}
+
+/// A handler panicked.
+struct Panicked;
+
+/// Runs a future, turning a panic in it into [`Panicked`], so a broken
+/// handler fails its turn rather than the agent's driver. The panic message
+/// is still printed by the panic hook.
+struct CatchUnwind<F>(F);
+
+impl<F: Future + Unpin> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Panicked>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = &mut self.0;
+        // Nothing of the future is used again after a panic, so whatever
+        // state it was left in can't be seen.
+        match panic::catch_unwind(AssertUnwindSafe(|| Pin::new(inner).poll(cx))) {
+            Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(Err(Panicked)),
+        }
     }
 }

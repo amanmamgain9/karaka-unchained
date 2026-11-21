@@ -12,6 +12,7 @@ use karaka_agent::Agents;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::{DynPlugin, Runtime};
 use karaka_model::Block;
+use karaka_retry::RetryPlugin;
 use karaka_session::{
     Entry, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEndReason, UserMessage,
     UserSource,
@@ -38,6 +39,9 @@ pub async fn chat(config: Config) -> Result<(), String> {
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
+    // Retries a failed request as the provider's policy says, before the
+    // turn gives up.
+    plugins.push(Box::new(RetryPlugin::new()));
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;

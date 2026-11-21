@@ -4,7 +4,7 @@
 
 use std::error::Error;
 
-use karaka_model::{ErrorKind, ModelError};
+use karaka_model::ModelError;
 use karaka_session::Failure;
 
 /// dsh's code for a failure that isn't a model call's (`agent.ts:381`).
@@ -14,14 +14,15 @@ const UNKNOWN: &str = "UNKNOWN";
 /// (`llm/src/index.ts:1018`).
 const NO_ADAPTER: &str = "NO_ADAPTER";
 
-/// A failed model call, with its kind as one of dsh's error codes. dsh keeps
+/// A failed model call, with its kind as one of dsh's error codes
+/// ([`ErrorKind::code`](karaka_model::ErrorKind::code)). dsh keeps
 /// an `LlmError`'s own facts (`error.failure`); a [`ModelError`] carries the
 /// message and the wait the provider asked for, but no HTTP status or
 /// request id.
 pub(crate) fn model_failure(error: &ModelError) -> Failure {
     Failure {
         message: error.message.clone(),
-        code: code(error.kind).into(),
+        code: error.kind.code().into(),
         status: None,
         provider_retry_after_ms: error
             .retry_after
@@ -47,6 +48,12 @@ pub(crate) fn no_model(route: &str) -> Failure {
     )
 }
 
+/// A request-error handler panicked. Like any other failure outside a
+/// model call, it is `UNKNOWN`.
+pub(crate) fn handler_panicked() -> Failure {
+    plain("a request-error handler panicked".into(), UNKNOWN)
+}
+
 fn plain(message: String, code: &str) -> Failure {
     Failure {
         message,
@@ -58,55 +65,13 @@ fn plain(message: String, code: &str) -> Failure {
     }
 }
 
-/// dsh's code for each kind, as `ErrorKind`'s table in `karaka-model` maps
-/// them. Where a kind stands for several codes, this is the one dsh's
-/// adapters write most.
-///
-/// A refusal has no dsh code: pi-ai reports one as a plain error, which dsh
-/// files as `PI_AI_ERROR`, a code that names an adapter Karaka doesn't
-/// have. Karaka writes `REFUSED`, so a reader can tell a refusal from a
-/// breakage.
-fn code(kind: ErrorKind) -> &'static str {
-    match kind {
-        ErrorKind::Auth => "AUTH",
-        ErrorKind::Quota => "QUOTA",
-        ErrorKind::InvalidRequest => "INVALID_REQUEST",
-        ErrorKind::ContextWindowExceeded => "CONTEXT_WINDOW_EXCEEDED",
-        ErrorKind::Refused => "REFUSED",
-        ErrorKind::Malformed => "MALFORMED_RESPONSE",
-        ErrorKind::EmptyResponse => "EMPTY_RESPONSE",
-        ErrorKind::RateLimited => "RATE_LIMIT",
-        ErrorKind::Unavailable => "SERVER",
-        ErrorKind::Network => "TRANSPORT",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use karaka_model::{ErrorKind, ModelError};
 
-    use super::{code, model_failure};
-
-    #[test]
-    fn each_kind_gets_the_code_dsh_gives_it() {
-        let codes = [
-            (ErrorKind::Auth, "AUTH"),
-            (ErrorKind::Quota, "QUOTA"),
-            (ErrorKind::InvalidRequest, "INVALID_REQUEST"),
-            (ErrorKind::ContextWindowExceeded, "CONTEXT_WINDOW_EXCEEDED"),
-            (ErrorKind::Malformed, "MALFORMED_RESPONSE"),
-            (ErrorKind::EmptyResponse, "EMPTY_RESPONSE"),
-            (ErrorKind::RateLimited, "RATE_LIMIT"),
-            (ErrorKind::Unavailable, "SERVER"),
-            (ErrorKind::Network, "TRANSPORT"),
-            (ErrorKind::Refused, "REFUSED"),
-        ];
-        for (kind, expected) in codes {
-            assert_eq!(code(kind), expected, "{kind:?}");
-        }
-    }
+    use super::model_failure;
 
     #[test]
     fn a_failure_keeps_the_message_and_the_wait() {
