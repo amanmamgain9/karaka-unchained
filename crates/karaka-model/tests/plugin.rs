@@ -18,6 +18,10 @@ use karaka_model::{
 struct Named(&'static str);
 
 impl Model for Named {
+    fn provider(&self) -> &str {
+        self.0
+    }
+
     fn stream(&self, _request: Request) -> EventStream {
         Box::pin(Playback(VecDeque::from([
             Ok(Event::Block(Block::Text(self.0.into()))),

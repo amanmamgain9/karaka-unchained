@@ -595,10 +595,37 @@ dependencies = [
 name = "karaka"
 version = "0.1.0"
 dependencies = [
+ "httpdate",
+ "karaka-agent",
+ "karaka-agent-loop",
  "karaka-anthropic",
  "karaka-kernel",
  "karaka-model",
  "karaka-openai",
+ "karaka-session",
+ "karaka-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-agent"
+version = "0.1.0"
+dependencies = [
+ "karaka-session",
+]
+
+[[package]]
+name = "karaka-agent-loop"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "karaka-agent",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-session",
+ "karaka-tools",
+ "serde_json",
  "tokio",
 ]
 
@@ -663,6 +690,16 @@ dependencies = [
 [[package]]
 name = "karaka-sse"
 version = "0.1.0"
+
+[[package]]
+name = "karaka-tools"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-model",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "libc"

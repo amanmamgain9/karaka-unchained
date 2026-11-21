@@ -1,0 +1,167 @@
+//! `karaka chat`: a line-by-line conversation with the agent loop.
+//!
+//! Each line read from stdin is a followup to one session's agent. Once the
+//! agent is idle, the turn's tool calls are printed one per line, then the
+//! model's final text, all read back from the session's log.
+
+use std::collections::HashMap;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::sync::Arc;
+
+use karaka_agent::Agents;
+use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
+use karaka_kernel::{DynPlugin, Runtime};
+use karaka_model::Block;
+use karaka_session::{
+    Entry, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEndReason, UserMessage,
+    UserSource,
+};
+use karaka_tools::{ToolRegistry, ToolsPlugin};
+
+use crate::config::Config;
+use crate::current_time::CurrentTime;
+
+/// The one session a chat runs in. It lives only as long as the process.
+const SESSION: &str = "chat";
+
+/// How much of a tool's result its line shows.
+const SHORT_RESULT: usize = 80;
+
+/// Runs the chat until stdin ends.
+pub async fn chat(config: Config) -> Result<(), String> {
+    let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
+    loop_config.system = config.system;
+    loop_config.max_tokens = config.max_tokens;
+    loop_config.effort = config.effort;
+
+    let mut plugins: Vec<Box<dyn DynPlugin>> = config.provider.plugins();
+    plugins.push(Box::new(ToolsPlugin));
+    plugins.push(Box::new(SessionsPlugin));
+    plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
+    let runtime = Runtime::start(plugins)
+        .await
+        .map_err(|error| error.to_string())?;
+    runtime
+        .get::<ToolRegistry>()
+        .register(Arc::new(CurrentTime))
+        .map_err(|error| error.to_string())?;
+
+    let id = SessionId::new(SESSION);
+    let agent = runtime
+        .get::<dyn Agents>()
+        .open(id.clone())
+        .map_err(|error| error.to_string())?;
+    // Opening the agent started the session, so it is there to read.
+    let session = runtime
+        .get::<SessionStore>()
+        .get(&id)
+        .ok_or("the chat's session wasn't started")?;
+
+    let interactive = io::stdin().is_terminal();
+    if interactive {
+        eprintln!("Type a message and press Enter. Ctrl-D ends the chat.");
+    }
+    let mut lines = io::stdin().lock().lines();
+    loop {
+        if interactive {
+            eprint!("> ");
+        }
+        // This blocks the thread, but the agent is idle, and its turns run
+        // on the runtime's other threads anyway.
+        let Some(line) = lines.next() else {
+            return Ok(());
+        };
+        let line = line.map_err(|error| format!("couldn't read the message: {error}"))?;
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // The turn's events start here. The message is named after this
+        // seq, as the loop names its own messages.
+        let start = Seq(session.len() as u64);
+        let message = UserMessage::text(format!("user-{start}"), UserSource::user(), line);
+        agent.followup(message);
+        agent.when_idle().await;
+        print_turn(&session.events_since(start))
+            .map_err(|error| format!("couldn't write the answer: {error}"))?;
+    }
+}
+
+/// Prints one turn: a line per tool call, then the model's last text on
+/// stdout, and how the turn ended on stderr if it didn't complete.
+fn print_turn(events: &[Entry]) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    let mut names = HashMap::new();
+    let mut answer = String::new();
+    for entry in events {
+        match &entry.event {
+            SessionEvent::ToolCall(call) => {
+                names.insert(call.call_id.clone(), call.name.clone());
+            }
+            SessionEvent::ToolResult { data, .. } => {
+                let result = data.message.to_model();
+                let name = names.get(&result.call_id).map_or("a tool", String::as_str);
+                let verb = if result.is_error { "failed" } else { "gave" };
+                writeln!(stdout, "[{name} {verb}: {}]", short(&result.content))?;
+            }
+            SessionEvent::AssistantMessage { data, .. } => {
+                let text: String = data
+                    .message
+                    .blocks()
+                    .iter()
+                    .filter_map(|block| match block {
+                        Block::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.trim().is_empty() {
+                    answer = text;
+                }
+            }
+            SessionEvent::TurnEnd(end) => match &end.reason {
+                TurnEndReason::Completed => {}
+                TurnEndReason::MaxTokens => eprintln!("(the answer reached the token limit)"),
+                TurnEndReason::Aborted(_) => eprintln!("(the turn was cancelled)"),
+                TurnEndReason::Error(failure) => {
+                    eprintln!("karaka: {} ({})", failure.message, failure.code);
+                }
+                other => eprintln!("(the turn ended: {other:?})"),
+            },
+            _ => {}
+        }
+    }
+    if !answer.is_empty() {
+        writeln!(stdout, "{answer}")?;
+    }
+    stdout.flush()
+}
+
+/// The first line of `text`, cut to [`SHORT_RESULT`] characters.
+fn short(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    if line.chars().count() <= SHORT_RESULT && line.len() == text.len() {
+        return line.to_owned();
+    }
+    let cut: String = line.chars().take(SHORT_RESULT).collect();
+    format!("{cut}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short;
+
+    #[test]
+    fn a_short_result_is_shown_whole() {
+        assert_eq!(
+            short("Sat, 21 Nov 2026 09:30:00 GMT"),
+            "Sat, 21 Nov 2026 09:30:00 GMT"
+        );
+    }
+
+    #[test]
+    fn a_long_or_many_line_result_is_cut() {
+        assert_eq!(short("first\nsecond"), "first…");
+        let long = "x".repeat(100);
+        assert_eq!(short(&long), format!("{}…", "x".repeat(80)));
+    }
+}

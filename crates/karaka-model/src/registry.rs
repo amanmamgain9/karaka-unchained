@@ -143,6 +143,10 @@ mod tests {
     struct Idle;
 
     impl Model for Idle {
+        fn provider(&self) -> &str {
+            "idle"
+        }
+
         fn stream(&self, _request: Request) -> EventStream {
             Box::pin(Ended)
         }

@@ -1,0 +1,240 @@
+//! The tool registry, started in a runtime by `ToolsPlugin`, with fake tools.
+
+use std::future::{pending, poll_fn};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
+
+use karaka_kernel::{BoxError, Plugin, PluginContext, PortId, Runtime};
+use karaka_model::{ToolCall, ToolSchema};
+use karaka_tools::{
+    Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRegistryError, ToolRun, ToolsPlugin,
+};
+use serde_json::Value;
+
+fn schema(name: &str) -> ToolSchema {
+    ToolSchema {
+        name: name.into(),
+        description: format!("The {name} tool."),
+        parameters: r#"{"type":"object","properties":{}}"#.into(),
+    }
+}
+
+/// Answers with its arguments and which call it ran for, so a test can see
+/// both arrived.
+struct Echo;
+
+impl Tool for Echo {
+    fn schema(&self) -> ToolSchema {
+        schema("echo")
+    }
+
+    fn execute<'a>(&'a self, arguments: Value, run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async move { ToolOutput::ok(format!("{} {} {arguments}", run.call_id, run.name)) })
+    }
+}
+
+/// Always fails, as a tool does when the thing it calls is down.
+struct Broken;
+
+impl Tool for Broken {
+    fn schema(&self) -> ToolSchema {
+        schema("broken")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async { ToolOutput::error("the weather service is down") })
+    }
+}
+
+/// Never finishes. It sets `dropped` when its future is dropped, the way a
+/// tool would kill a child process it started.
+struct Stuck {
+    dropped: Arc<AtomicBool>,
+}
+
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Tool for Stuck {
+    fn schema(&self) -> ToolSchema {
+        schema("stuck")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        let guard = SetOnDrop(Arc::clone(&self.dropped));
+        Box::pin(async move {
+            let _guard = guard;
+            pending::<ToolOutput>().await
+        })
+    }
+}
+
+fn call(name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: "call_1".into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
+}
+
+#[tokio::test]
+async fn a_registered_tool_runs_with_its_parsed_arguments() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+
+    let output = registry.execute(&call("echo", r#"{"text": "ping"}"#)).await;
+    assert_eq!(output, ToolOutput::ok(r#"call_1 echo {"text":"ping"}"#));
+}
+
+#[tokio::test]
+async fn empty_arguments_reach_the_tool_as_an_empty_object() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+
+    let output = registry.execute(&call("echo", "")).await;
+    assert_eq!(output, ToolOutput::ok("call_1 echo {}"));
+}
+
+#[test]
+fn schemas_come_in_the_order_the_tools_were_registered() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Broken)).unwrap();
+    registry.register(Arc::new(Echo)).unwrap();
+    assert_eq!(registry.schemas(), [schema("broken"), schema("echo")]);
+    assert_eq!(
+        format!("{registry:?}"),
+        r#"ToolRegistry { tools: ["broken", "echo"] }"#
+    );
+}
+
+#[test]
+fn a_second_tool_with_the_same_name_is_rejected() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+
+    let error = registry
+        .register(Arc::new(Echo))
+        .expect_err("the name is taken");
+    assert_eq!(error, ToolRegistryError::DuplicateName("echo".into()));
+    assert_eq!(error.to_string(), "tool \"echo\" is already registered");
+    assert_eq!(registry.schemas().len(), 1);
+}
+
+/// dsh's wording for a `ToolNotFoundError`.
+#[tokio::test]
+async fn an_unknown_tool_is_an_error_for_the_model() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+
+    let output = registry.execute(&call("weather", "{}")).await;
+    assert_eq!(output, ToolOutput::error("Error: unknown tool \"weather\""));
+}
+
+/// dsh's wording for the `ToolArgsError` a typed tool throws on arguments
+/// that aren't an object.
+#[tokio::test]
+async fn arguments_that_arent_a_json_object_are_an_error_for_the_model() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Echo)).unwrap();
+
+    for raw in ["not json", r#"{"text": "pi"#, "[1]"] {
+        let output = registry.execute(&call("echo", raw)).await;
+        assert_eq!(
+            output,
+            ToolOutput::error("Error: invalid arguments: \"arguments\" must be an object"),
+            "{raw:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_name_nobody_registered_is_reported_before_its_arguments() {
+    let registry = ToolRegistry::new();
+    let output = registry.execute(&call("weather", "not json")).await;
+    assert_eq!(output, ToolOutput::error("Error: unknown tool \"weather\""));
+}
+
+#[tokio::test]
+async fn a_tools_own_failure_reaches_the_model_unchanged() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Broken)).unwrap();
+
+    let output = registry.execute(&call("broken", "{}")).await;
+    assert_eq!(output, ToolOutput::error("the weather service is down"));
+    let result = output.into_result("call_1");
+    assert!(result.is_error);
+    assert_eq!(result.call_id, "call_1");
+}
+
+#[tokio::test]
+async fn dropping_the_call_cancels_the_tool() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(Stuck {
+            dropped: Arc::clone(&dropped),
+        }))
+        .unwrap();
+
+    let mut running = registry.execute(&call("stuck", "{}"));
+    // Polled once, so the tool has started, and it is still waiting.
+    assert!(poll_once(&mut running).await.is_pending());
+    assert!(!dropped.load(Ordering::SeqCst));
+    drop(running);
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+/// Polls `future` once, and says whether it was ready.
+async fn poll_once(future: &mut ToolFuture<'static>) -> Poll<ToolOutput> {
+    poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+}
+
+/// A plugin with a tool, as a real one would register it.
+struct EchoPlugin;
+
+impl Plugin for EchoPlugin {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    fn requires(&self) -> Vec<PortId> {
+        vec![PortId::of::<ToolRegistry>()]
+    }
+
+    async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+        ctx.get::<ToolRegistry>().register(Arc::new(Echo))?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_plugin_registers_its_tool_in_the_port() {
+    let runtime = Runtime::start(vec![Box::new(EchoPlugin), Box::new(ToolsPlugin)])
+        .await
+        .expect("the runtime starts");
+    // The registry's plugin starts first, though it was listed second.
+    assert_eq!(runtime.plugins(), ["tools", "echo"]);
+
+    let registry = runtime.get::<ToolRegistry>();
+    assert_eq!(registry.schemas(), [schema("echo")]);
+    let output = registry.execute(&call("echo", "{}")).await;
+    assert_eq!(output.content, "call_1 echo {}");
+}
+
+/// Compiles only if the registry can be shared between threads, as a port
+/// must be, and a call can move between them.
+#[test]
+fn the_registry_and_its_calls_work_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>(_: T) {}
+
+    assert_send_sync::<ToolRegistry>();
+    let registry = ToolRegistry::new();
+    assert_send(registry.execute(&call("echo", "{}")));
+}

@@ -248,6 +248,16 @@ impl fmt::Debug for AnthropicModel {
 }
 
 impl Model for AnthropicModel {
+    /// The provider in the origin of every signature this model receives:
+    /// `anthropic`, or `deepseek` for the DeepSeek profile. See
+    /// `Decoder::anthropic` and `Decoder::deepseek`.
+    fn provider(&self) -> &str {
+        match self.profile() {
+            Profile::Anthropic => crate::request::PROVIDER,
+            Profile::DeepSeek => deepseek::PROVIDER,
+        }
+    }
+
     fn stream(&self, request: Request) -> EventStream {
         // The body is written out now, while `request` is still here to
         // borrow. The stream then owns plain bytes, so it can be `'static`.
@@ -476,6 +486,23 @@ mod tests {
         );
         assert!(!format!("{model:?}").contains("sk-secret"));
         assert_eq!(AnthropicModel::new("k").profile(), Profile::Anthropic);
+    }
+
+    /// Each profile names the provider its signatures' origin names, so an
+    /// answer logged under that name keeps its signatures when read back.
+    #[test]
+    fn each_profile_names_the_provider_in_its_origins() {
+        // The decoders build their origins from these two constants.
+        assert_eq!(AnthropicModel::new("k").provider(), "anthropic");
+        assert_eq!(
+            AnthropicModel::new("k").provider(),
+            crate::request::PROVIDER
+        );
+        assert_eq!(AnthropicModel::deepseek("k").provider(), "deepseek");
+        assert_eq!(
+            AnthropicModel::deepseek("k").provider(),
+            crate::deepseek::PROVIDER
+        );
     }
 
     #[test]

@@ -141,6 +141,12 @@ impl Session {
         self.lock().events_since(seq).to_vec()
     }
 
+    /// The seqs of the events the model sees, in order. See
+    /// [`SessionLog::surface_nodes`].
+    pub fn surface_nodes(&self) -> Vec<Seq> {
+        self.lock().surface_nodes().to_vec()
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }

@@ -1,0 +1,1184 @@
+//! The default loop, started in a runtime with a scripted model and fake
+//! tools. Ported from dsh's `agent-loop/tests/loop.spec.ts`,
+//! `tool-calls.spec.ts`, `cancel.spec.ts` and `coverage-edges.spec.ts`,
+//! where their cases fit step one. Each test asserts the exact events a
+//! turn logs.
+
+use std::collections::VecDeque;
+use std::future::pending;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use futures_core::Stream;
+use karaka_agent::{Agent, Agents};
+use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
+use karaka_kernel::Runtime;
+use karaka_model::{
+    Block, ErrorKind, Event, EventStream, Message, Model, ModelError, ModelRegistry, ModelsPlugin,
+    Request, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
+};
+use karaka_session::{
+    CancelCause, Entry, Failure, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin,
+    SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TokenUsage, TurnEndReason, UserMessage,
+    UserSource,
+};
+use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
+use serde_json::Value;
+use tokio::sync::Notify;
+use tokio::time::timeout;
+
+/// The route the loop asks. Deliberately not the provider's own name, which
+/// is what an answer's source must record.
+const ROUTE: &str = "mock-work";
+const PROVIDER: &str = "mock";
+const MODEL: &str = "mock-model";
+
+// The scripted model.
+
+/// One model call's script.
+enum Reply {
+    /// These events, one per poll, then the end of the stream.
+    Events(Vec<Result<Event, ModelError>>),
+    /// These events, then a wait that never ends, until the stream is
+    /// dropped. `waiting` is notified when the wait begins.
+    Hang(Vec<Event>, Arc<Notify>),
+}
+
+/// Plays one reply per call, in order, and keeps every request it got.
+/// (dsh: `MockAdapter` in `tests/mock-adapter.ts`.)
+struct Scripted {
+    replies: Mutex<VecDeque<Reply>>,
+    requests: Mutex<Vec<Request>>,
+}
+
+impl Scripted {
+    fn new(replies: Vec<Reply>) -> Self {
+        Self {
+            replies: Mutex::new(replies.into()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Model for Scripted {
+    fn provider(&self) -> &str {
+        PROVIDER
+    }
+
+    fn stream(&self, request: Request) -> EventStream {
+        self.requests.lock().unwrap().push(request);
+        let playback = match self.replies.lock().unwrap().pop_front() {
+            Some(Reply::Events(events)) => Playback {
+                events: events.into(),
+                hang: None,
+            },
+            Some(Reply::Hang(events, waiting)) => Playback {
+                events: events.into_iter().map(Ok).collect(),
+                hang: Some(waiting),
+            },
+            // dsh's mock throws "script exhausted".
+            None => Playback {
+                events: VecDeque::from([Err(ModelError::new(
+                    ErrorKind::InvalidRequest,
+                    "the script is exhausted",
+                ))]),
+                hang: None,
+            },
+        };
+        Box::pin(playback)
+    }
+}
+
+struct Playback {
+    events: VecDeque<Result<Event, ModelError>>,
+    hang: Option<Arc<Notify>>,
+}
+
+impl Stream for Playback {
+    type Item = Result<Event, ModelError>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(event) = this.events.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        match &this.hang {
+            // Never woken: only dropping the stream ends it.
+            Some(waiting) => {
+                waiting.notify_one();
+                Poll::Pending
+            }
+            None => Poll::Ready(None),
+        }
+    }
+}
+
+fn usage() -> Usage {
+    Usage {
+        input_tokens: 10,
+        output_tokens: 5,
+        ..Usage::default()
+    }
+}
+
+fn done(stop: StopReason) -> Result<Event, ModelError> {
+    Ok(Event::Done {
+        stop,
+        usage: usage(),
+    })
+}
+
+/// dsh's `textResponse`: the text in deltas, then whole, then the finish.
+fn text(answer: &str) -> Reply {
+    Reply::Events(vec![
+        Ok(Event::TextDelta(answer.into())),
+        Ok(Event::Block(Block::Text(answer.into()))),
+        done(StopReason::EndTurn),
+    ])
+}
+
+fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
+}
+
+/// dsh's `toolCallResponse`, for any number of calls.
+fn calls(calls: &[ToolCall]) -> Reply {
+    let mut events: Vec<_> = calls
+        .iter()
+        .map(|call| Ok(Event::Block(Block::ToolCall(call.clone()))))
+        .collect();
+    events.push(done(StopReason::ToolCalls));
+    Reply::Events(events)
+}
+
+// The fake tools.
+
+fn schema(name: &str) -> ToolSchema {
+    ToolSchema {
+        name: name.into(),
+        description: format!("The {name} tool."),
+        parameters: r#"{"type":"object","properties":{"text":{"type":"string"}}}"#.into(),
+    }
+}
+
+/// dsh's `echo` fixture: answers `echo: <text>`.
+struct Echo;
+
+impl Tool for Echo {
+    fn schema(&self) -> ToolSchema {
+        schema("echo")
+    }
+
+    fn execute<'a>(&'a self, arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let text = arguments["text"].as_str().unwrap_or_default();
+            ToolOutput::ok(format!("echo: {text}"))
+        })
+    }
+}
+
+/// Always fails.
+struct Broken;
+
+impl Tool for Broken {
+    fn schema(&self) -> ToolSchema {
+        schema("broken")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async { ToolOutput::error("the weather service is down") })
+    }
+}
+
+/// Never finishes. Notifies `started` when it runs, and sets `dropped`
+/// when its call is dropped.
+struct Stuck {
+    started: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Tool for Stuck {
+    fn schema(&self) -> ToolSchema {
+        schema("stuck")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        let guard = SetOnDrop(Arc::clone(&self.dropped));
+        Box::pin(async move {
+            let _guard = guard;
+            self.started.notify_one();
+            pending::<ToolOutput>().await
+        })
+    }
+}
+
+// The harness.
+
+/// A started runtime with the loop, the scripted model under [`ROUTE`] and
+/// the fake tools, as dsh's tests build theirs (`harness` in
+/// `loop.spec.ts`).
+struct Harness {
+    model: Arc<Scripted>,
+    sessions: Arc<SessionStore>,
+    agents: Arc<dyn Agents>,
+    stuck: Arc<Notify>,
+    stuck_dropped: Arc<AtomicBool>,
+    _runtime: Runtime,
+}
+
+impl Harness {
+    async fn new(replies: Vec<Reply>) -> Self {
+        Self::with(replies, config(None), Vec::new()).await
+    }
+
+    /// A harness with `config`, whose store already holds `restored` as the
+    /// session [`id`].
+    async fn with(replies: Vec<Reply>, config: LoopConfig, restored: Vec<Entry>) -> Self {
+        let runtime = Runtime::start(vec![
+            Box::new(AgentLoopPlugin::new(config)),
+            Box::new(SessionsPlugin),
+            Box::new(ToolsPlugin),
+            Box::new(ModelsPlugin),
+        ])
+        .await
+        .expect("the runtime starts");
+        let model = Arc::new(Scripted::new(replies));
+        runtime
+            .get::<ModelRegistry>()
+            .register(ROUTE, Arc::clone(&model) as Arc<dyn Model>)
+            .unwrap();
+        let stuck = Arc::new(Notify::new());
+        let stuck_dropped = Arc::new(AtomicBool::new(false));
+        let tools = runtime.get::<ToolRegistry>();
+        tools.register(Arc::new(Echo)).unwrap();
+        tools.register(Arc::new(Broken)).unwrap();
+        tools
+            .register(Arc::new(Stuck {
+                started: Arc::clone(&stuck),
+                dropped: Arc::clone(&stuck_dropped),
+            }))
+            .unwrap();
+        let sessions = runtime.get::<SessionStore>();
+        if !restored.is_empty() {
+            sessions.restore(id(), restored).expect("the log restores");
+        }
+        Self {
+            model,
+            sessions,
+            agents: runtime.get::<dyn Agents>(),
+            stuck,
+            stuck_dropped,
+            _runtime: runtime,
+        }
+    }
+
+    fn agent(&self) -> Arc<dyn Agent> {
+        self.agents.open(id()).expect("the agent opens")
+    }
+
+    fn events(&self) -> Vec<Entry> {
+        self.sessions.events(&id()).expect("the session exists")
+    }
+
+    /// The type of every event logged, in order.
+    fn types(&self) -> Vec<String> {
+        self.events()
+            .iter()
+            .map(|entry| entry.event.event_type().to_owned())
+            .collect()
+    }
+
+    /// The reason of every `turn/end`, in order.
+    fn endings(&self) -> Vec<TurnEndReason> {
+        self.events()
+            .into_iter()
+            .filter_map(|entry| match entry.event {
+                SessionEvent::TurnEnd(end) => Some(end.reason),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Sends `text` as a followup and waits for the agent to be idle.
+    async fn say(&self, text: &str) {
+        let agent = self.agent();
+        agent.followup(user(text));
+        idle(agent.as_ref()).await;
+    }
+}
+
+fn id() -> SessionId {
+    SessionId::new("a1")
+}
+
+fn config(system: Option<&str>) -> LoopConfig {
+    let mut config = LoopConfig::new(ROUTE, MODEL);
+    config.system = system.map(str::to_owned);
+    config
+}
+
+fn user(text: &str) -> UserMessage {
+    UserMessage::text(format!("user-{text}"), UserSource::user(), text)
+}
+
+/// Waits for `agent` to be idle, failing the test rather than hanging it.
+async fn idle(agent: &dyn Agent) {
+    timeout(Duration::from_secs(5), agent.when_idle())
+        .await
+        .expect("the agent goes idle");
+}
+
+/// The events of one plain step, from `step/start` to `step/end`.
+const ANSWER_STEP: [&str; 5] = [
+    "step/start",
+    "system/message",
+    "user/message",
+    "assistant/message",
+    "step/end",
+];
+
+fn tool_result(entry: &Entry) -> (ToolResult, Vec<u64>, Option<String>) {
+    match &entry.event {
+        SessionEvent::ToolResult { data, surface } => (
+            data.message.to_model(),
+            surface.sources.iter().map(|seq| seq.0).collect(),
+            data.error.as_ref().map(|error| error.code.clone()),
+        ),
+        other => panic!("expected a tool result, got {other:?}"),
+    }
+}
+
+// The cases.
+
+/// dsh: "runs a simple turn: queued message → model → idle, with ordered
+/// events" (`loop.spec.ts:452`).
+#[tokio::test]
+async fn a_plain_answer_logs_one_step() {
+    let harness = Harness::with(
+        vec![text("hello there")],
+        config(Some("Be brief.")),
+        Vec::new(),
+    )
+    .await;
+    harness.say("hi").await;
+
+    let mut expected = vec!["turn/start"];
+    expected.extend(ANSWER_STEP);
+    expected.push("turn/end");
+    assert_eq!(harness.types(), expected);
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+
+    // The answer names the provider, not the route, and keeps its usage.
+    let events = harness.events();
+    let SessionEvent::AssistantMessage { data, .. } = &events[4].event else {
+        panic!("expected the answer, got {:?}", events[4].event);
+    };
+    assert_eq!((data.turn, data.step), (1, 1));
+    assert_eq!(data.message.source.provider, PROVIDER);
+    assert_eq!(data.message.source.model, MODEL);
+    assert_eq!(data.usage, Some(TokenUsage::from(usage())));
+    assert!(!data.interrupted);
+
+    // The request came from the log: the prompt, the user's message, and
+    // every tool.
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, MODEL);
+    assert_eq!(requests[0].system.as_deref(), Some("Be brief."));
+    assert_eq!(requests[0].messages, [Message::user("hi")]);
+    let tools: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(tools, ["echo", "broken", "stuck"]);
+
+    let history = harness.sessions.history(&id()).unwrap();
+    assert_eq!(history.system.as_deref(), Some("Be brief."));
+    assert_eq!(
+        history.messages,
+        [
+            Message::user("hi"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text("hello there".into())]
+            }
+        ]
+    );
+}
+
+/// dsh: "round-trips tool calls: model requests tool → executes → result in
+/// next request" (`loop.spec.ts:488`).
+#[tokio::test]
+async fn a_tool_round_trip_logs_the_call_and_its_result() {
+    let ping = call("c1", "echo", r#"{"text":"ping"}"#);
+    let harness = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
+    harness.say("use the tool").await;
+
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "step/end",
+            "step/start",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+
+    // The result cites the `tool/call` that started it.
+    let events = harness.events();
+    let (result, sources, error) = tool_result(&events[6]);
+    assert_eq!(
+        result,
+        ToolResult {
+            call_id: "c1".into(),
+            content: "echo: ping".into(),
+            is_error: false
+        }
+    );
+    assert_eq!(sources, [5]);
+    assert_eq!(error, None);
+
+    // The second request carries the call and its result.
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].messages,
+        [
+            Message::user("use the tool"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::ToolCall(ping)]
+            },
+            Message {
+                role: Role::User,
+                content: vec![Block::ToolResult(result)]
+            },
+        ]
+    );
+}
+
+/// dsh: "commits tool/result in model order" (`tool-calls.spec.ts:230`),
+/// here with the calls run one after another.
+#[tokio::test]
+async fn two_calls_in_one_step_run_in_the_models_order() {
+    let harness = Harness::new(vec![
+        calls(&[
+            call("c1", "echo", r#"{"text":"one"}"#),
+            call("c2", "echo", r#"{"text":"two"}"#),
+        ]),
+        text("done"),
+    ])
+    .await;
+    harness.say("use both").await;
+
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "tool/call",
+            "tool/result",
+            "step/end",
+            "step/start",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    let events = harness.events();
+    let first = tool_result(&events[6]);
+    let second = tool_result(&events[8]);
+    assert_eq!(
+        (first.0.call_id.as_str(), first.0.content.as_str()),
+        ("c1", "echo: one")
+    );
+    assert_eq!(first.1, [5]);
+    assert_eq!(
+        (second.0.call_id.as_str(), second.0.content.as_str()),
+        ("c2", "echo: two")
+    );
+    assert_eq!(second.1, [7]);
+
+    // Both results go back in one user message, in the model's order.
+    let requests = harness.model.requests();
+    let results = &requests[1].messages[2];
+    assert_eq!(results.role, Role::User);
+    assert_eq!(results.content.len(), 2);
+}
+
+/// dsh: an unknown name is answered with `ToolNotFoundError`'s text, and the
+/// turn carries on.
+#[tokio::test]
+async fn an_unknown_tool_gets_an_error_result_and_the_turn_carries_on() {
+    let harness = Harness::new(vec![calls(&[call("c1", "weather", "{}")]), text("sorry")]).await;
+    harness.say("weather?").await;
+
+    let events = harness.events();
+    assert_eq!(events[5].event.event_type(), "tool/call");
+    let (result, sources, _) = tool_result(&events[6]);
+    assert_eq!(result.content, "Error: unknown tool \"weather\"");
+    assert!(result.is_error);
+    assert_eq!(sources, [5]);
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+    assert_eq!(harness.model.requests().len(), 2);
+}
+
+/// dsh: "passes through non-JSON arguments string without crashing"
+/// (`coverage-edges.spec.ts:54`). The raw text is logged as the model wrote
+/// it, and the model reads why it failed.
+#[tokio::test]
+async fn arguments_that_arent_json_get_an_error_result() {
+    let harness = Harness::new(vec![calls(&[call("c1", "echo", "not json")]), text("oops")]).await;
+    harness.say("use the tool").await;
+
+    let events = harness.events();
+    let SessionEvent::ToolCall(started) = &events[5].event else {
+        panic!("expected the call, got {:?}", events[5].event);
+    };
+    assert_eq!(started.arguments, "not json");
+    let (result, _, _) = tool_result(&events[6]);
+    assert_eq!(
+        result.content,
+        "Error: invalid arguments: \"arguments\" must be an object"
+    );
+    assert!(result.is_error);
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+}
+
+#[tokio::test]
+async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
+    let harness = Harness::new(vec![
+        calls(&[call("c1", "broken", "{}")]),
+        text("it's down"),
+    ])
+    .await;
+    harness.say("weather?").await;
+
+    let events = harness.events();
+    let (result, _, error) = tool_result(&events[6]);
+    assert_eq!(
+        result,
+        ToolResult {
+            call_id: "c1".into(),
+            content: "the weather service is down".into(),
+            is_error: true
+        }
+    );
+    // A tool's own failure carries no error code in step one.
+    assert_eq!(error, None);
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+    let second = &harness.model.requests()[1];
+    assert_eq!(second.messages[2].content, [Block::ToolResult(result)]);
+}
+
+/// dsh: "surfaces max-tokens as the turn-end reason when the last step is
+/// cut off" (`loop.spec.ts:1439`) and "does not dispatch tool calls from a
+/// max-tokens-truncated step" (`loop.spec.ts:1530`).
+#[tokio::test]
+async fn an_answer_cut_off_by_the_limit_ends_the_turn_with_max_tokens() {
+    let harness = Harness::new(vec![Reply::Events(vec![
+        Ok(Event::Block(Block::Text("truncat".into()))),
+        // A model that breaks the rule and sends a cut-off call anyway.
+        Ok(Event::Block(Block::ToolCall(call("c1", "echo", r#"{"te"#)))),
+        done(StopReason::MaxTokens),
+    ])])
+    .await;
+    harness.say("go").await;
+
+    let mut expected = vec!["turn/start"];
+    expected.extend(ANSWER_STEP);
+    expected.push("turn/end");
+    assert_eq!(harness.types(), expected);
+    assert_eq!(harness.endings(), [TurnEndReason::MaxTokens]);
+    assert_eq!(harness.model.requests().len(), 1);
+    // The text is kept, the call isn't.
+    let history = harness.sessions.messages(&id()).unwrap();
+    assert_eq!(history[1].content, [Block::Text("truncat".into())]);
+}
+
+/// dsh: "a completed step after no max-tokens keeps the turn completed"
+/// (`loop.spec.ts:1512`): the reason doesn't leak into the next turn.
+#[tokio::test]
+async fn max_tokens_ends_only_its_own_turn() {
+    let harness = Harness::new(vec![
+        Reply::Events(vec![
+            Ok(Event::Block(Block::Text("cut".into()))),
+            done(StopReason::MaxTokens),
+        ]),
+        text("clean"),
+    ])
+    .await;
+    harness.say("first").await;
+    harness.say("second").await;
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::MaxTokens, TurnEndReason::Completed]
+    );
+}
+
+/// dsh: "records normalized model errors on the turn boundary"
+/// (`loop.spec.ts:1861`).
+#[tokio::test]
+async fn a_model_error_ends_the_turn_with_a_structured_failure() {
+    let mut busy = ModelError::new(ErrorKind::RateLimited, "Slow down.");
+    busy.retry_after = Some(Duration::from_secs(2));
+    let harness = Harness::new(vec![Reply::Events(vec![
+        Ok(Event::TextDelta("Hel".into())),
+        Err(busy),
+    ])])
+    .await;
+    harness.say("hi").await;
+
+    // No assistant message: the partial answer belongs to a failed call.
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Error(Failure {
+            message: "Slow down.".into(),
+            code: "RATE_LIMIT".into(),
+            status: None,
+            provider_retry_after_ms: Some(2000),
+            request_id: None,
+            offload_images: None,
+        })]
+    );
+}
+
+/// dsh: a turn that ends with an error stops the driver (`kick`,
+/// `agent.ts:252-265`). A message queued behind it stays queued, and the
+/// next followup's driver runs it first, then the new one.
+#[tokio::test]
+async fn a_failed_turn_leaves_the_queue_for_the_next_followup() {
+    let harness = Harness::new(vec![
+        Reply::Events(vec![Err(ModelError::new(
+            ErrorKind::Unavailable,
+            "overloaded",
+        ))]),
+        text("second answer"),
+        text("third answer"),
+    ])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("first"));
+    agent.followup(user("second"));
+    idle(agent.as_ref()).await;
+
+    // Only the failed turn ran; "second" is still waiting.
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("expected one failed turn, got {endings:?}");
+    };
+    assert_eq!(failure.code, "SERVER");
+    assert_eq!(harness.model.requests().len(), 1);
+
+    agent.followup(user("third"));
+    idle(agent.as_ref()).await;
+
+    let endings = harness.endings();
+    assert_eq!(endings.len(), 3);
+    assert!(matches!(endings[0], TurnEndReason::Error(_)));
+    assert_eq!(
+        endings[1..],
+        [TurnEndReason::Completed, TurnEndReason::Completed]
+    );
+    // The queued message ran before the new one.
+    let said: Vec<String> = harness
+        .events()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::UserMessage { message, .. } => Some(message.id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, ["user-first", "user-second", "user-third"]);
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].messages,
+        [
+            Message::user("first"),
+            Message::user("second"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text("second answer".into())]
+            },
+            Message::user("third"),
+        ]
+    );
+}
+
+/// dsh resolves the route when it calls the model, and fails the turn with
+/// `NO_ADAPTER` if nothing serves it.
+#[tokio::test]
+async fn a_route_with_no_model_ends_the_turn_with_no_adapter() {
+    let harness = Harness::with(Vec::new(), LoopConfig::new("nowhere", MODEL), Vec::new()).await;
+    harness.say("hi").await;
+
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("expected one failed turn, got {endings:?}");
+    };
+    assert_eq!(failure.code, "NO_ADAPTER");
+    assert_eq!(
+        failure.message,
+        "no model is registered under the route \"nowhere\""
+    );
+    assert!(harness.model.requests().is_empty());
+}
+
+/// dsh: "cancel() mid-stream ends the turn with reason aborted"
+/// (`loop.spec.ts:1413`) and "cancel mid-stream finalizes the streamed
+/// prefix onto the surface" (`cancel.spec.ts:571`).
+#[tokio::test]
+async fn a_cancel_mid_stream_keeps_the_partial_answer() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![
+        Reply::Hang(
+            vec![Event::TextDelta("partial".into())],
+            Arc::clone(&waiting),
+        ),
+        text("after"),
+    ])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("go"));
+    waiting.notified().await;
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+
+    let mut expected = vec!["turn/start"];
+    expected.extend(ANSWER_STEP);
+    expected.push("turn/end");
+    assert_eq!(harness.types(), expected);
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
+
+    let events = harness.events();
+    let SessionEvent::AssistantMessage { data, op } = &events[4].event else {
+        panic!("expected the partial answer, got {:?}", events[4].event);
+    };
+    assert!(data.interrupted);
+    assert_eq!(*op, SurfaceOp::Append);
+    assert_eq!(data.usage, None);
+    assert_eq!(data.message.source.provider, PROVIDER);
+    assert_eq!(data.message.blocks(), [Block::Text("partial".into())]);
+
+    // The next request shows the model what the user saw.
+    harness.say("continue").await;
+    let requests = harness.model.requests();
+    assert_eq!(
+        requests[1].messages[1],
+        Message {
+            role: Role::Assistant,
+            content: vec![Block::Text("partial".into())]
+        }
+    );
+    assert_eq!(
+        harness.endings(),
+        [
+            TurnEndReason::Aborted(CancelCause::User),
+            TurnEndReason::Completed
+        ]
+    );
+}
+
+/// dsh: "cancel before any visible content finalizes nothing"
+/// (`cancel.spec.ts:775`). Spaces aren't content, and a call that never ran
+/// isn't kept.
+#[tokio::test]
+async fn a_cancel_before_any_text_keeps_no_answer() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![Reply::Hang(
+        vec![
+            Event::TextDelta("   ".into()),
+            Event::Block(Block::ToolCall(call("c1", "echo", "{}"))),
+        ],
+        Arc::clone(&waiting),
+    )])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("go"));
+    waiting.notified().await;
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
+}
+
+/// A cancel while a tool runs drops the tool. Its call started, so it gets
+/// an "outcome unknown" result; the call after it never started. Both come
+/// from `karaka-session`'s `ToolCallRecovery`, so the log stays valid.
+#[tokio::test]
+async fn a_cancel_during_a_tool_call_answers_every_call() {
+    let harness = Harness::new(vec![calls(&[
+        call("c1", "stuck", "{}"),
+        call("c2", "echo", r#"{"text":"never"}"#),
+    ])])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("go"));
+    harness.stuck.notified().await;
+    agent.cancel(CancelCause::Hook {
+        reason: "policy stopped this turn".into(),
+    });
+    idle(agent.as_ref()).await;
+
+    assert!(
+        harness.stuck_dropped.load(Ordering::SeqCst),
+        "the tool was stopped"
+    );
+    assert_eq!(
+        harness.types(),
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "assistant/message",
+            "tool/call",
+            "tool/result",
+            "tool/result",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::Hook {
+            reason: "policy stopped this turn".into()
+        })]
+    );
+    let events = harness.events();
+    let (started, sources, code) = tool_result(&events[6]);
+    assert_eq!(started.call_id, "c1");
+    assert!(started.is_error);
+    assert_eq!(sources, [5]);
+    assert_eq!(code.as_deref(), Some(TOOL_OUTCOME_UNKNOWN));
+    let (skipped, sources, code) = tool_result(&events[7]);
+    assert_eq!(skipped.call_id, "c2");
+    assert!(sources.is_empty());
+    assert_eq!(code.as_deref(), Some(TOOL_NOT_STARTED));
+
+    // Every call has its result, so the session can carry on.
+    let history = harness.sessions.messages(&id()).unwrap();
+    assert_eq!(history[2].content.len(), 2);
+}
+
+/// dsh: "cancel after waking send closes its synchronously opened turn
+/// without a step" (`cancel.spec.ts:333`): the cancel empties the queue, so
+/// the turn the followup opened has no input.
+#[tokio::test]
+async fn a_cancel_right_after_a_followup_ends_its_turn_without_a_step() {
+    let harness = Harness::new(vec![text("should not run")]).await;
+    let agent = harness.agent();
+    agent.followup(user("drop me first"));
+    agent.followup(user("drop me second"));
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+
+    assert_eq!(harness.types(), ["turn/start", "turn/end"]);
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
+    assert!(harness.model.requests().is_empty());
+}
+
+/// dsh: "cancel() on an idle agent with nothing queued is a no-op; the next
+/// prompt runs" (`cancel.spec.ts:147`).
+#[tokio::test]
+async fn a_cancel_while_idle_doesnt_stop_the_next_turn() {
+    let harness = Harness::new(vec![text("reply")]).await;
+    harness.agent().cancel(CancelCause::User);
+    harness.say("real prompt").await;
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+}
+
+/// Two followups sent at once run as two turns, one after the other, and
+/// the second turn's request carries the first turn.
+#[tokio::test]
+async fn two_queued_followups_run_as_two_turns() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let agent = harness.agent();
+    agent.followup(user("first"));
+    agent.followup(user("second"));
+    idle(agent.as_ref()).await;
+
+    // The prompt is logged once: it hasn't changed by the second turn.
+    let mut expected = vec!["turn/start"];
+    expected.extend(ANSWER_STEP);
+    expected.extend(["turn/end", "turn/start", "step/start", "user/message"]);
+    expected.extend(["assistant/message", "step/end", "turn/end"]);
+    assert_eq!(harness.types(), expected);
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Completed, TurnEndReason::Completed]
+    );
+    let turns: Vec<u64> = harness
+        .events()
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::TurnStart(start) => Some(start.turn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(turns, [1, 2]);
+
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].messages,
+        [
+            Message::user("first"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text("one".into())]
+            },
+            Message::user("second"),
+        ]
+    );
+}
+
+/// The same agent comes back for the same session, so two connections share
+/// its turns.
+#[tokio::test]
+async fn opening_a_session_twice_gives_the_same_agent() {
+    let harness = Harness::new(Vec::new()).await;
+    let first = harness.agent();
+    let second = harness.agent();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.id(), &id());
+}
+
+/// A session read back from storage continues where it stopped: its next
+/// request is derived from the restored log, earlier tool results included,
+/// and its turns carry on numbering.
+#[tokio::test]
+async fn a_reloaded_session_sends_its_earlier_tool_results() {
+    let ping = call("c1", "echo", r#"{"text":"ping"}"#);
+    let before = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
+    before.say("use the tool").await;
+    let stored = before.events();
+    // What storage gives back is the JSON of each event.
+    let stored: Vec<Entry> = stored
+        .iter()
+        .map(|entry| serde_json::from_str(&serde_json::to_string(entry).unwrap()).unwrap())
+        .collect();
+
+    let after = Harness::with(vec![text("again")], config(None), stored.clone()).await;
+    after.say("and again").await;
+
+    let requests = after.model.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages,
+        [
+            Message::user("use the tool"),
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::ToolCall(ping)]
+            },
+            Message {
+                role: Role::User,
+                content: vec![Block::ToolResult(ToolResult {
+                    call_id: "c1".into(),
+                    content: "echo: ping".into(),
+                    is_error: false
+                })]
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![Block::Text("done".into())]
+            },
+            Message::user("and again"),
+        ]
+    );
+    let events = after.events();
+    assert_eq!(&events[..stored.len()], stored.as_slice());
+    assert_eq!(
+        events[stored.len()].event,
+        SessionEvent::turn_start(2),
+        "the turns carry on numbering"
+    );
+    // The prompt hasn't changed, so none is logged.
+    assert!(
+        !events[stored.len()..]
+            .iter()
+            .any(|entry| entry.event.event_type() == "system/message")
+    );
+}
+
+/// A stored log whose last turn a crash left open is closed before the
+/// agent runs anything on it, as dsh's resume repairs the log.
+#[tokio::test]
+async fn opening_a_session_a_crash_left_open_closes_its_turn() {
+    let ping = call("c1", "echo", r#"{"text":"ping"}"#);
+    let crashed = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
+    crashed.say("use the tool").await;
+    // Cut the log just after the call started, as a crash would.
+    let stored: Vec<Entry> = crashed.events().into_iter().take(6).collect();
+    assert_eq!(stored[5].event.event_type(), "tool/call");
+
+    let after = Harness::with(vec![text("recovered")], config(None), stored).await;
+    let _agent = after.agent();
+    assert_eq!(after.types()[6..], ["tool/result", "step/end", "turn/end"]);
+    assert_eq!(after.endings(), [TurnEndReason::Interrupted]);
+
+    after.say("again").await;
+    assert_eq!(
+        after.endings(),
+        [TurnEndReason::Interrupted, TurnEndReason::Completed]
+    );
+}
+
+/// A prompt changed since the session was stored is logged in place, after
+/// the history, as dsh does for a route that takes prompts in its history.
+#[tokio::test]
+async fn a_changed_prompt_is_logged_where_it_changed() {
+    let before = Harness::with(vec![text("one")], config(Some("Be brief.")), Vec::new()).await;
+    before.say("first").await;
+
+    let after = Harness::with(
+        vec![text("two")],
+        config(Some("Be thorough.")),
+        before.events(),
+    )
+    .await;
+    after.say("second").await;
+
+    assert_eq!(
+        after.types()[7..],
+        [
+            "turn/start",
+            "step/start",
+            "system/message",
+            "user/message",
+            "assistant/message",
+            "step/end",
+            "turn/end",
+        ]
+    );
+    let request = &after.model.requests()[0];
+    assert_eq!(request.system.as_deref(), Some("Be brief."));
+    assert_eq!(request.messages[2], Message::system("Be thorough."));
+    assert_eq!(request.messages[3], Message::user("second"));
+}
+
+/// A prompt taken away replaces every system message on the surface with
+/// an empty one, as dsh clears a prompt.
+#[tokio::test]
+async fn a_removed_prompt_is_cleared_from_the_history() {
+    let before = Harness::with(vec![text("one")], config(Some("Be brief.")), Vec::new()).await;
+    before.say("first").await;
+
+    let after = Harness::with(vec![text("two")], config(None), before.events()).await;
+    after.say("second").await;
+
+    let events = after.events();
+    // Seq 2 held the prompt; 7 and 8 open the new turn and its step.
+    let SessionEvent::SystemMessage { data, surface } = &events[9].event else {
+        panic!("expected the cleared prompt, got {:?}", events[9].event);
+    };
+    assert!(data.message.content.is_empty());
+    assert_eq!(
+        surface.op,
+        SurfaceOp::Replace {
+            start: Seq(2),
+            end: Seq(2)
+        }
+    );
+    assert_eq!(surface.sources, [Seq(2)]);
+    let request = &after.model.requests()[0];
+    assert_eq!(request.system, None);
+    assert!(
+        request
+            .messages
+            .iter()
+            .all(|message| message.role != Role::System)
+    );
+}
+
+/// Followups sent from threads outside the runtime, such as one reading
+/// stdin, still run, each as a turn of its own, one turn at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn followups_from_other_threads_run_one_turn_at_a_time() {
+    let harness = Harness::new((0..4).map(|n| text(&format!("answer {n}"))).collect()).await;
+    let agent = harness.agent();
+    std::thread::scope(|scope| {
+        for n in 0..4 {
+            let agent = Arc::clone(&agent);
+            scope.spawn(move || agent.followup(user(&format!("question {n}"))));
+        }
+    });
+    idle(agent.as_ref()).await;
+
+    assert_eq!(harness.endings(), vec![TurnEndReason::Completed; 4]);
+    // Every turn ends before the next one starts.
+    let brackets: Vec<String> = harness
+        .types()
+        .into_iter()
+        .filter(|kind| kind.starts_with("turn/"))
+        .collect();
+    assert_eq!(brackets, ["turn/start", "turn/end"].repeat(4));
+    assert_eq!(harness.model.requests().len(), 4);
+}

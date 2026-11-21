@@ -1,0 +1,85 @@
+//! The agent seam: the [`Agent`] trait a replaceable main loop implements,
+//! and the [`Agents`] port callers get each session's agent through.
+//! (dsh: `packages/core/agent`, `dsh-agent`.)
+//!
+//! An agent drives one session. Callers queue what the user said with
+//! [`Agent::followup`], stop the running turn with [`Agent::cancel`], and
+//! wait for the agent to settle with [`Agent::when_idle`]. Everything the
+//! agent does goes into the session's log, so that is where callers read
+//! the answer: an agent returns nothing itself.
+//!
+//! The default loop lives in `karaka-agent-loop`. Another loop can replace
+//! it by providing [`Agents`] instead, and nothing that uses this seam
+//! changes.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use karaka_session::{CancelCause, SessionError, SessionId, UserMessage};
+
+/// One session's agent: the loop that turns what the user says into turns
+/// of the session. (dsh: `Agent` in `agent/src/types.ts`, with the live
+/// methods `runtime-types.ts` adds to it.)
+///
+/// dsh's agent has more: `steer` and `inject` for input between steps, an
+/// inbox to edit what is queued, a status, maintenance tasks, and its own
+/// plugin scope. Karaka adds them as the loop needs them.
+pub trait Agent: Send + Sync {
+    /// The session this agent drives. An agent and its session share their
+    /// id, as in dsh.
+    fn id(&self) -> &SessionId;
+
+    /// Queues `message` as the input of a turn of its own, and starts the
+    /// agent if it is idle. A message sent while a turn runs waits for that
+    /// turn to end. Messages run in the order they were queued, so a
+    /// followup to an idle agent with messages still queued runs those
+    /// first. (dsh: `followup`.)
+    fn followup(&self, message: UserMessage);
+
+    /// Drops every queued message and stops the running turn, which ends
+    /// with `cause` as its reason. With no turn running it only empties the
+    /// queue: it doesn't stop the next turn. Only the first cause for a
+    /// turn counts. (dsh: `cancel`, without `keepInbox`.)
+    fn cancel(&self, cause: CancelCause);
+
+    /// Resolves once the agent is idle: no driver is running its turns.
+    /// (dsh: `whenIdle`.)
+    ///
+    /// Idle doesn't mean nothing is queued. A turn that ends with an error
+    /// stops the driver, as in dsh, and any messages queued behind it wait
+    /// for the next followup, which runs them first, oldest first. A
+    /// followup sent before the call is waited for, along with every turn
+    /// its driver runs.
+    fn when_idle(&self) -> WhenIdle<'_>;
+}
+
+/// The future [`Agent::when_idle`] returns. Boxed so the trait works as
+/// `dyn Agent`, as the kernel boxes a plugin's setup.
+pub type WhenIdle<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// The port callers get each session's agent through.
+///
+/// Karaka serves many connections, and each session gets an agent of its
+/// own, made the first time someone asks for it. dsh splits this in two: the
+/// `agents` registry in `dsh-agent` looks agents up, and the loop package
+/// plugs in a factory that makes them (`AgentRegistry` and `AgentFactory` in
+/// `agent/src/index.ts`). The kernel lets the loop's plugin provide this
+/// port itself, so here one trait does both, and the plugin that makes the
+/// agents is the one that keeps them.
+///
+/// dsh also tells creating a session from resuming a stored one, and lets
+/// the creator dispose of the agent. Here [`open`](Self::open) covers both,
+/// since the session store already holds restored sessions, and agents live
+/// as long as the runtime.
+pub trait Agents: Send + Sync {
+    /// The agent for the session `id`. The first call makes it, starting the
+    /// session if the store has none. Every later call gives back the same
+    /// agent, so two connections to one session share its turns.
+    ///
+    /// A session the store already holds, such as one restored from
+    /// storage, may end in a turn a crash left open. The agent closes that
+    /// turn before it is returned, as dsh's resume repairs the log. That is
+    /// the one way this fails: the closing events don't fit the log.
+    fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, SessionError>;
+}

@@ -74,6 +74,25 @@ fn serve_once(response: String) -> (SocketAddr, JoinHandle<String>) {
     (address, server)
 }
 
+/// Serves one request with each of `responses`, in order, one connection
+/// each. The handle gives back the requests the server received.
+fn serve(responses: Vec<String>) -> (SocketAddr, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server = thread::spawn(move || {
+        responses
+            .into_iter()
+            .map(|response| {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let request = read_request(&mut socket);
+                socket.write_all(response.as_bytes()).expect("write");
+                request
+            })
+            .collect()
+    });
+    (address, server)
+}
+
 /// Reads up to the end of the headers, then as many bytes of body as
 /// `content-length` says.
 fn read_request(socket: &mut TcpStream) -> String {
@@ -345,7 +364,7 @@ fn an_empty_question_is_rejected() {
 
 #[test]
 fn help_prints_the_usage_and_exits_with_2() {
-    for args in [&["--help"][..], &[], &["chat"]] {
+    for args in [&["--help"][..], &[], &["chat", "hello"]] {
         let output = karaka(args, &[], "");
 
         assert_eq!(output.status.code(), Some(2), "{args:?}");
@@ -434,6 +453,158 @@ fn a_missing_deepseek_key_fails_before_any_call() {
     let stderr = text(&output.stderr);
     assert!(
         stderr.starts_with("karaka: DEEPSEEK_API_KEY is not set"),
+        "{stderr}"
+    );
+}
+
+/// Anthropic's events for a call to `current_time`, with no arguments.
+const ANTHROPIC_CURRENT_TIME: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"current_time","input":{}}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+/// Anthropic's events for an answer of one piece of text.
+fn anthropic_text(answer: &str) -> String {
+    let text = json_string(answer);
+    [
+        r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":40,"output_tokens":1}}}"#.to_owned(),
+        r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.to_owned(),
+        format!(
+            r#"event: content_block_delta
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{text}}}}}"#
+        ),
+        r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#.to_owned(),
+        r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}"#.to_owned(),
+        r#"event: message_stop
+data: {"type":"message_stop"}"#.to_owned(),
+    ]
+    .map(|event| format!("{event}\n\n"))
+    .concat()
+}
+
+/// `text` as a JSON string. The answers here are plain sentences, so
+/// quoting them is enough.
+fn json_string(text: &str) -> String {
+    assert!(!text.contains(['"', '\\']), "{text}");
+    format!("\"{text}\"")
+}
+
+/// The body of an HTTP request, after its headers.
+fn body(request: &str) -> &str {
+    request
+        .split_once("\r\n\r\n")
+        .expect("headers, then a body")
+        .1
+}
+
+#[test]
+fn chat_runs_the_clock_tool_and_keeps_the_conversation() {
+    let (address, server) = serve(vec![
+        streamed(ANTHROPIC_CURRENT_TIME),
+        streamed(&anthropic_text("It is morning in UTC.")),
+        streamed(&anthropic_text("You asked for the time.")),
+    ]);
+
+    let output = karaka(
+        &["chat"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            ("KARAKA_SYSTEM", "Be brief.".into()),
+        ],
+        "what time is it?\n\nwhat did I ask?\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "");
+    let stdout = text(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{stdout}");
+    let time = lines[0]
+        .strip_prefix("[current_time gave: ")
+        .and_then(|line| line.strip_suffix("]"))
+        .expect("a line for the tool call");
+    assert!(time.ends_with(" GMT"), "{time}");
+    assert_eq!(lines[1], "It is morning in UTC.");
+    assert_eq!(lines[2], "You asked for the time.");
+
+    let sent = server.join().expect("the server ran");
+    // The first request offers the tool.
+    let first = body(&sent[0]);
+    assert!(first.contains(r#""name":"current_time""#), "{first}");
+    assert!(first.contains(r#""Be brief.""#), "{first}");
+    // The second carries the tool's answer back.
+    let second = body(&sent[1]);
+    assert!(second.contains(r#""tool_use_id":"toolu_1""#), "{second}");
+    assert!(second.contains(time), "{second}");
+    // The third holds the whole conversation, the blank line skipped.
+    let third = body(&sent[2]);
+    for said in [
+        "what time is it?",
+        "It is morning in UTC.",
+        "what did I ask?",
+    ] {
+        assert!(third.contains(said), "{said}: {third}");
+    }
+}
+
+#[test]
+fn chat_reports_a_failed_turn_and_carries_on() {
+    let (address, server) = serve(vec![
+        http_response(
+            "429 Too Many Requests",
+            &[("content-type", "application/json")],
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down."}}"#,
+        ),
+        streamed(&anthropic_text("Hello again.")),
+    ]);
+
+    let output = karaka(
+        &["chat"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "hi\nhi again\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "karaka: Slow down. (RATE_LIMIT)\n");
+    assert_eq!(text(&output.stdout), "Hello again.\n");
+    let sent = server.join().expect("the server ran");
+    assert_eq!(sent.len(), 2);
+}
+
+#[test]
+fn chat_needs_the_same_settings_as_ask() {
+    let output = karaka(&["chat"], &[], "hi\n");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("karaka: ANTHROPIC_API_KEY is not set"),
         "{stderr}"
     );
 }

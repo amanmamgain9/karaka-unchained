@@ -37,6 +37,10 @@ httpdate = "1"
 karaka-kernel = { path = "crates/karaka-kernel" }
 karaka-model = { path = "crates/karaka-model" }
 karaka-sse = { path = "crates/karaka-sse" }
+karaka-session = { path = "crates/karaka-session" }
+karaka-tools = { path = "crates/karaka-tools" }
+karaka-agent = { path = "crates/karaka-agent" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }
+karaka-agent-loop = { path = "crates/karaka-agent-loop" }

@@ -1,0 +1,15 @@
+[package]
+name = "karaka-agent"
+description = "The agent seam: the trait a main loop implements, and the port callers find each session's agent through"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Only traits, so this crate has no executor and no runtime of its own.
+[dependencies]
+# An agent drives one session: it is named by the session's id, takes the
+# session's user messages, and ends a cancelled turn with the session's
+# cancel causes.
+karaka-session.workspace = true

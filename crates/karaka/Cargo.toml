@@ -14,6 +14,16 @@ karaka-kernel.workspace = true
 karaka-model.workspace = true
 karaka-anthropic.workspace = true
 karaka-openai.workspace = true
+# `karaka chat`: the agent loop, the seams it is driven through, and the
+# sessions and tools it uses.
+karaka-agent.workspace = true
+karaka-agent-loop.workspace = true
+karaka-session.workspace = true
+karaka-tools.workspace = true
+# The arguments a tool takes.
+serde_json.workspace = true
+# Writes the time `current_time` answers with.
+httpdate.workspace = true
 # `rt-multi-thread` is the executor a server will need, so the binary starts
 # on it now. `macros` is for `#[tokio::main]`.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

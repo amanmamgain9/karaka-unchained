@@ -335,9 +335,119 @@ first:
   complete v4 `replayState`, including the `response` half, and read it
   back with v4's own checks. The DeepSeek envelope string is gone.
 - **Still open:**
-  - The loop must pass the real provider name (`anthropic`, `deepseek`)
-    as `source.provider`. A route name like `anthropic-work` would lose
-    every signature on read, in v4 and in Karaka.
+  - ~~The loop must pass the real provider name (`anthropic`, `deepseek`)
+    as `source.provider`.~~ Done in the agent loop, step one, through
+    `Model::provider`.
   - pi-ai's per-message effort markers aren't ported.
   - Assistant messages that stopped with an error aren't dropped from the
     history.
+
+## Agent loop, step one
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-21.*
+
+Four pieces, one crate each where they are seams:
+
+- **`Model::provider`** in `karaka-model`. Each answer's `source.provider`
+  is the provider's own name (`anthropic`, `deepseek`), the one its
+  signatures' `Origin` names, not the route. `karaka-openai` writes no
+  `Origin` and answers `openai`.
+- **`karaka-tools`** (dsh `packages/core/tools`): the `Tool` trait, the
+  `ToolRegistry` port and `ToolsPlugin`.
+- **`karaka-agent`** (dsh `packages/core/agent`): the `Agent` trait and the
+  `Agents` port, which opens one agent per session.
+- **`karaka-agent-loop`** (dsh `packages/core/agent-loop`): a port of
+  `ReactLoopAgent`, and `AgentLoopPlugin`, which provides `Agents`.
+
+`karaka chat` drives it from stdin, with one tool, `current_time`.
+
+### Left out of step one
+
+Each lives in dsh at the path given, under `packages/`.
+
+- **`request/header` and `request/context` events.** `buildRequest`,
+  `core/agent-loop/src/agent.ts:615-704`. Without them, the developer
+  messages that announce tool changes can't be written either.
+- **`assistant/attempt` events** for failed and cancelled calls.
+  `step`, `core/agent-loop/src/agent.ts:484-510`, with
+  `core/agent-loop/src/assistant-stream.ts`. A failed call logs nothing
+  here, and a cancel with nothing worth keeping logs nothing.
+- **Retry**, through the `agent/request-error` hook
+  (`core/agent-loop/src/agent.ts:511-526`) and `llm/llm-retry`. A failed
+  model call ends the turn.
+- **Parallel tool calls and exclusive barriers.** `runGroup`,
+  `core/agent-loop/src/tool-calls.ts`. Calls run one after another.
+- **Steering, `inject` and the next-step inbox.** `send`, `steer` and
+  `inject` in `core/agent-loop/src/agent.ts:154-173`, and
+  `core/agent-loop/src/inbox.ts`. Also the `agent/turn-stopping` and
+  `agent/pre-step` hooks that feed it (`core/agent/src/runtime-types.ts`).
+- **Tool policies and approvals.** `tools/pre-execute` and
+  `tools/post-execute` in `core/tools/src/index.ts`, and
+  `interaction/user-approval`.
+- **Runtime context.** `RuntimeContextProjection`,
+  `core/agent-loop/src/runtime-context.ts:113-164`.
+- **The system-prompt plugin.** `core/system-prompt`. The prompt is plain
+  loop config, `LoopConfig::system`.
+- **`concludesTurn`.** `ToolRunContext.concludeTurn` in
+  `core/tools/src/index.ts`, read in `core/agent-loop/src/tool-calls.ts:158`.
+- **Developer messages with `tool-addition` and `tool-removal` blocks.**
+  `buildRequest`, `core/agent-loop/src/agent.ts:652-666`. They appear only
+  when the tool set changes mid-session, through deferred tools. The tool
+  set is fixed for now.
+- **Assistant stream frames for a live UI.** `AssistantStreamAttempt`,
+  `core/agent-loop/src/assistant-stream.ts`, sent as `agent/assistant-stream`.
+- **Compaction.** `compaction/compaction` and its siblings.
+
+### A failed turn stops the driver
+
+As in dsh, a turn that ends with an error stops the driver and leaves any
+queued messages where they are (`kick`, `core/agent-loop/src/agent.ts:252-265`).
+The next followup starts a driver that runs them first, oldest first. So
+`when_idle` means no driver is running, as dsh's `whenIdle` does, not that
+the queue is empty.
+
+### Where step one differs from dsh
+
+- **The inbox is in memory.** dsh logs every queue change as an
+  `agent/inbox/spliced` event (`core/agent-loop/src/inbox.ts`), so queued
+  messages survive a restart. Karaka's queue is lost with the process.
+- **Cancelling drops the running work.** dsh aborts an `AbortSignal` and
+  waits for the tool to settle, then logs `Error: tool call aborted`
+  (`ABORTED`), and for calls it never started, a `tool/call` plus `Error:
+  tool call aborted before dispatch` (`ABORTED_BEFORE_DISPATCH`)
+  (`core/agent-loop/src/tool-calls.ts:238-260`). Karaka drops the tool's
+  future, and `ToolCallRecovery` answers every call left without a result:
+  "outcome unknown" (`TOOL_OUTCOME_UNKNOWN`) for the one that started,
+  "not started" (`TOOL_NOT_STARTED`) for the rest, with no `tool/call` for
+  those. The wording is v4's for an interrupted turn.
+- **Message ids name their seq**, such as `assistant-7`. dsh uses random
+  ids. Karaka has no id generator yet, and only the agent writes to its
+  session, so the next seq is known.
+- **The system prompt.** dsh appends a changed prompt in place on routes
+  that declare `in-history`, and replaces node 0 on the rest
+  (`SystemPromptProjection.project`,
+  `core/agent-loop/src/runtime-context.ts:88-103`). Karaka's models
+  declare nothing, so it always takes the `in-history` path, which dsh's
+  DeepSeek and pi-ai adapters both declare, and lets each provider decide
+  how to send it. Clearing the prompt uses dsh's replacement path, as dsh
+  does.
+- **Interrupted reasoning has no signature.** dsh's replay state comes
+  only with the stream's last chunk, so an interrupted message never has
+  one. Karaka gets each signature with its block, and drops it the same.
+- **`Paused` ends the turn as `max-tokens`.** pi-ai calls a paused turn a
+  stop. `karaka-model` asks callers to treat it as unfinished until
+  server-side tools can resume.
+- **Error codes.** A `ModelError`'s kind becomes dsh's code (`AUTH`,
+  `RATE_LIMIT`, `SERVER`, `TRANSPORT`, ...). A refusal becomes
+  `REFUSED`; dsh would file it as `PI_AI_ERROR`. A route with no model is
+  `NO_ADAPTER`, in Karaka's words. No status or request id is kept:
+  `ModelError` doesn't carry them.
+- **Tool results carry no `error` code.** dsh writes `{ name, code }` for an
+  unknown tool (`ToolNotFoundError`, `UNKNOWN_TOOL`) and for bad arguments
+  (`ToolArgsError`, `INVALID_ARGS`). Karaka writes the same text for the
+  model, but `ToolOutput` holds only text and the error flag.
+- **Arguments are checked only for being a JSON object.** dsh's typed tools
+  check them against their schema. Karaka's registry rejects anything that
+  isn't an object, with the text dsh's schema check gives for that case.
+- **One loop config for every session.** dsh gives each agent its own
+  options and lets the `agent/request` hook change the request per step.

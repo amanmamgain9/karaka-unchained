@@ -17,6 +17,19 @@ use crate::{Block, Message, Role};
 ///
 /// [`ModelRegistry`]: crate::ModelRegistry
 pub trait Model: Send + Sync {
+    /// The provider's own name, such as `anthropic` or `deepseek`: the name
+    /// it writes as [`Origin::provider`](crate::Origin::provider) in the
+    /// replay data it attaches.
+    ///
+    /// The loop records it as the provider of each answer, as dsh records
+    /// `request.provider` in an assistant message's `source.provider`
+    /// (`agent-loop/src/agent.ts:529-536`). It isn't the route: a runtime may
+    /// register Anthropic under `anthropic-work`, but a signature's origin
+    /// still says `anthropic`, and a signature is sent back only when the
+    /// message's provider matches its origin. Writing the route there would
+    /// lose every signature when the session is read back.
+    fn provider(&self) -> &str;
+
     /// Starts one model call and returns its events as they arrive.
     ///
     /// Nothing is sent until the stream is first polled, and dropping the
@@ -369,6 +382,10 @@ mod tests {
     struct Scripted(Vec<Result<Event, ModelError>>);
 
     impl Model for Scripted {
+        fn provider(&self) -> &str {
+            "scripted"
+        }
+
         fn stream(&self, _request: Request) -> EventStream {
             Box::pin(Playback(self.0.clone().into()))
         }

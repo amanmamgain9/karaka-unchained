@@ -1,0 +1,21 @@
+[package]
+name = "karaka-tools"
+description = "The tools seam: the trait a tool implements, and the registry the loop runs tools through"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that puts the registry in a runtime.
+karaka-kernel.workspace = true
+# A tool's schema and the call the model made are the model seam's types,
+# so a tool is described once, in the shape every provider sends.
+karaka-model.workspace = true
+# The registry parses the model's arguments before a tool sees them.
+serde_json.workspace = true
+
+# Only for running the async tests.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

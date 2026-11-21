@@ -1,11 +1,15 @@
 //! `karaka`, the Karaka runtime binary.
 //!
-//! For now it does one thing: `karaka ask <question>` starts a runtime with
+//! For now it does two things. `karaka ask <question>` starts a runtime with
 //! the model registry and one model provider, asks the model at the
-//! provider's route, and prints the answer as it arrives.
+//! provider's route, and prints the answer as it arrives. `karaka chat`
+//! adds the agent loop, its sessions and one tool, and holds a conversation
+//! read line by line from stdin.
 
 mod answer;
+mod chat;
 mod config;
+mod current_time;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -21,9 +25,14 @@ use crate::config::Config;
 const USAGE: &str = "\
 Usage: karaka ask <question...>
        karaka ask [-]
+       karaka chat
 
-Asks a model one question and prints the answer as it is written.
+ask asks a model one question and prints the answer as it is written.
 With no question, or with -, the question is read from stdin.
+
+chat reads messages from stdin, one per line, and answers each through
+the agent loop, which can call one tool, current_time. Each tool call is
+printed on a line of its own, then the answer.
 
 Settings come from the environment:
   KARAKA_PROVIDER     anthropic (the default), deepseek or openai. deepseek
@@ -62,6 +71,8 @@ enum Command {
     Ask(String),
     /// Ask a question read from stdin.
     AskFromStdin,
+    /// Hold a conversation read from stdin.
+    Chat,
     /// Print the usage text: for `--help`, or a command line that isn't right.
     Usage,
 }
@@ -74,6 +85,7 @@ fn parse_args(args: &[String]) -> Command {
             [dash] if dash == "-" => Command::AskFromStdin,
             words => Command::Ask(words.join(" ")),
         },
+        [command] if command == "chat" => Command::Chat,
         _ => Command::Usage,
     }
 }
@@ -85,16 +97,20 @@ async fn main() -> ExitCode {
         .skip(1)
         .map(OsString::into_string)
         .collect();
-    let question = match args.map(|args| parse_args(&args)) {
-        Ok(Command::Ask(question)) => Some(question),
-        Ok(Command::AskFromStdin) => None,
+    let result = match args.map(|args| parse_args(&args)) {
+        Ok(Command::Ask(question)) => ask(Some(question)).await,
+        Ok(Command::AskFromStdin) => ask(None).await,
+        Ok(Command::Chat) => match Config::from_env(|name| std::env::var(name).ok()) {
+            Ok(config) => chat::chat(config).await,
+            Err(message) => Err(message),
+        },
         Ok(Command::Usage) | Err(_) => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
     };
 
-    match ask(question).await {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("karaka: {message}");
@@ -188,6 +204,12 @@ mod tests {
     #[test]
     fn a_dash_among_other_words_is_part_of_the_question() {
         assert_eq!(parse(&["ask", "-", "why"]), Command::Ask("- why".into()));
+    }
+
+    #[test]
+    fn chat_takes_no_arguments() {
+        assert_eq!(parse(&["chat"]), Command::Chat);
+        assert_eq!(parse(&["chat", "hello"]), Command::Usage);
     }
 
     #[test]

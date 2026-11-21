@@ -19,7 +19,8 @@ const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5-5";
 /// llm-deepseek's catalog (`models.ts:8`).
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-flash";
 
-/// Everything `karaka ask` needs besides the question.
+/// Everything `karaka ask` needs besides the question, and everything
+/// `karaka chat` needs.
 #[derive(Debug)]
 pub struct Config {
     pub provider: Provider,

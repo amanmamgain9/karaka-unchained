@@ -145,6 +145,13 @@ impl fmt::Debug for OpenAiModel {
 }
 
 impl Model for OpenAiModel {
+    /// This provider attaches no replay data, so it writes no
+    /// [`Origin`](karaka_model::Origin) and has no name to match. `openai`
+    /// names the format it speaks, whichever server answers.
+    fn provider(&self) -> &str {
+        "openai"
+    }
+
     fn stream(&self, request: Request) -> EventStream {
         // The body is written out now, while `request` is still here to
         // borrow. The stream then owns plain bytes, so it can be `'static`.
@@ -319,6 +326,14 @@ mod tests {
     use karaka_model::{ErrorKind, Message, Model, Request};
 
     use super::{OpenAiModel, endpoint};
+
+    #[test]
+    fn the_provider_is_named_after_the_format() {
+        assert_eq!(
+            OpenAiModel::new("http://localhost:11434/v1").provider(),
+            "openai"
+        );
+    }
 
     #[test]
     fn a_trailing_slash_on_the_base_url_is_dropped() {
