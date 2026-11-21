@@ -17,3 +17,4 @@ mod request;
 
 pub use model::OpenAiModel;
 pub use plugin::{OpenAiConfig, OpenAiPlugin};
+pub use request::MaxTokensField;

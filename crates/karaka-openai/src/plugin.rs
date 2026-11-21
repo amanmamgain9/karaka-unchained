@@ -5,10 +5,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::Model;
+use karaka_model::{Effort, Model};
 use serde::Deserialize;
 
-use crate::OpenAiModel;
+use crate::{MaxTokensField, OpenAiModel};
 
 /// How the plugin reaches an OpenAI-compatible server.
 ///
@@ -24,6 +24,16 @@ pub struct OpenAiConfig {
     pub base_url: String,
     /// `None` for a local server that needs no key.
     pub api_key: Option<String>,
+    /// The effort for requests that don't set their own, sent as
+    /// `reasoning_effort`. `None` sends none.
+    pub default_effort: Option<Effort>,
+    /// DeepSeek's thinking switch: `true` sends `{"type": "enabled"}`,
+    /// `false` sends `{"type": "disabled"}`. `None` sends nothing, which is
+    /// right for every other server.
+    pub thinking: Option<bool>,
+    /// The field `max_tokens` goes out as. `max_tokens` unless set.
+    #[serde(default)]
+    pub max_tokens_field: MaxTokensField,
 }
 
 /// Leaves out the API key, so a config can be logged safely.
@@ -32,6 +42,9 @@ impl fmt::Debug for OpenAiConfig {
         f.debug_struct("OpenAiConfig")
             .field("base_url", &self.base_url)
             .field("has_api_key", &self.api_key.is_some())
+            .field("default_effort", &self.default_effort)
+            .field("thinking", &self.thinking)
+            .field("max_tokens_field", &self.max_tokens_field)
             .finish_non_exhaustive()
     }
 }
@@ -68,6 +81,22 @@ impl Plugin for OpenAiPlugin {
         if let Some(key) = &self.config.api_key {
             model = model.with_api_key(key.clone());
         }
+        // DeepSeek has no effort for thinking that is off, so the pair can
+        // never make a request that works. It is caught here, at startup.
+        if self.config.thinking == Some(false)
+            && let Some(effort) = self.config.default_effort
+        {
+            return Err(
+                format!("the default effort is {effort:?}, but thinking is turned off").into(),
+            );
+        }
+        if let Some(effort) = self.config.default_effort {
+            model = model.with_default_effort(effort);
+        }
+        if let Some(on) = self.config.thinking {
+            model = model.with_thinking(on);
+        }
+        model = model.with_max_tokens_field(self.config.max_tokens_field);
         ctx.provide::<dyn Model>(Arc::new(model));
         Ok(())
     }
@@ -75,7 +104,10 @@ impl Plugin for OpenAiPlugin {
 
 #[cfg(test)]
 mod tests {
+    use karaka_model::Effort;
+
     use super::OpenAiConfig;
+    use crate::MaxTokensField;
 
     #[test]
     fn the_config_reads_without_a_key() {
@@ -84,6 +116,20 @@ mod tests {
                 .expect("the config reads");
         assert_eq!(config.base_url, "http://localhost:11434/v1");
         assert_eq!(config.api_key, None);
+        assert_eq!(config.default_effort, None);
+        assert_eq!(config.thinking, None);
+        assert_eq!(config.max_tokens_field, MaxTokensField::MaxTokens);
+    }
+
+    #[test]
+    fn the_config_reads_effort_thinking_and_the_max_tokens_field() {
+        let config: OpenAiConfig = serde_json::from_str(
+            r#"{"base_url": "https://api.deepseek.com", "default_effort": "max", "thinking": true, "max_tokens_field": "max_completion_tokens"}"#,
+        )
+        .expect("the config reads");
+        assert_eq!(config.default_effort, Some(Effort::Max));
+        assert_eq!(config.thinking, Some(true));
+        assert_eq!(config.max_tokens_field, MaxTokensField::MaxCompletionTokens);
     }
 
     #[test]
@@ -99,6 +145,9 @@ mod tests {
         let config = OpenAiConfig {
             base_url: "http://localhost".into(),
             api_key: Some("sk-secret".into()),
+            default_effort: None,
+            thinking: None,
+            max_tokens_field: MaxTokensField::MaxTokens,
         };
         assert!(!format!("{config:?}").contains("sk-secret"));
     }

@@ -9,8 +9,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use karaka_kernel::{Runtime, StartError};
-use karaka_model::{Message, Model, Request, complete};
-use karaka_openai::{OpenAiConfig, OpenAiPlugin};
+use karaka_model::{Effort, Message, Model, Request, complete};
+use karaka_openai::{MaxTokensField, OpenAiConfig, OpenAiPlugin};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -82,6 +83,9 @@ async fn the_plugin_provides_a_model_that_answers() {
     let plugin = OpenAiPlugin::new(OpenAiConfig {
         base_url: format!("http://{address}/v1"),
         api_key: Some("test-key".into()),
+        default_effort: Some(Effort::High),
+        thinking: Some(true),
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     });
 
     let runtime = Runtime::start(vec![Box::new(plugin)])
@@ -90,24 +94,28 @@ async fn the_plugin_provides_a_model_that_answers() {
     assert_eq!(runtime.plugins(), ["openai"]);
     let model: Arc<dyn Model> = runtime.get::<dyn Model>();
 
-    let request = Request::new("gpt-test", vec![Message::user("hi")]);
+    let mut request = Request::new("gpt-test", vec![Message::user("hi")]);
+    request.max_tokens = Some(50);
     let response = complete(model.as_ref(), request)
         .await
         .expect("the call works");
     assert_eq!(response.message.text(), "Hello");
 
-    // The config reached the model: its base URL and its key.
+    // The config reached the model: its base URL, its key, its default
+    // effort, its thinking switch and its choice of max-tokens field.
     let sent = server.await.expect("the server ran");
-    let head = sent
-        .split_once("\r\n\r\n")
-        .expect("headers")
-        .0
-        .to_lowercase();
+    let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    let head = head.to_lowercase();
     assert!(head.starts_with("post /v1/chat/completions "), "{head}");
     assert!(
         head.contains("\r\nauthorization: bearer test-key\r\n"),
         "{head}"
     );
+    let body: Value = serde_json::from_str(body).expect("the body is JSON");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["max_completion_tokens"], 50);
+    assert!(body.get("max_tokens").is_none(), "{body}");
 }
 
 #[tokio::test]
@@ -115,6 +123,9 @@ async fn an_empty_base_url_stops_the_runtime_from_starting() {
     let plugin = OpenAiPlugin::new(OpenAiConfig {
         base_url: String::new(),
         api_key: None,
+        default_effort: None,
+        thinking: None,
+        max_tokens_field: MaxTokensField::MaxTokens,
     });
 
     let Err(StartError::Failed {
@@ -128,5 +139,25 @@ async fn an_empty_base_url_stops_the_runtime_from_starting() {
     assert_eq!(
         source.to_string(),
         "the OpenAI-compatible base URL is empty"
+    );
+}
+
+#[tokio::test]
+async fn a_default_effort_with_thinking_off_stops_the_runtime_from_starting() {
+    let plugin = OpenAiPlugin::new(OpenAiConfig {
+        base_url: "http://127.0.0.1:1".into(),
+        api_key: None,
+        default_effort: Some(Effort::Low),
+        thinking: Some(false),
+        max_tokens_field: MaxTokensField::MaxTokens,
+    });
+
+    let Err(StartError::Failed { source, .. }) = Runtime::start(vec![Box::new(plugin)]).await
+    else {
+        panic!("expected the plugin to fail");
+    };
+    assert_eq!(
+        source.to_string(),
+        "the default effort is Low, but thinking is turned off"
     );
 }

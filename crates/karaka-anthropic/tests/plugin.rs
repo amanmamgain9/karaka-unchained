@@ -8,9 +8,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use karaka_anthropic::{AnthropicConfig, AnthropicPlugin};
+use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
 use karaka_kernel::{Runtime, StartError};
-use karaka_model::{Message, Model, Request, complete};
+use karaka_model::{Effort, Message, Model, Request, complete};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -90,6 +90,9 @@ fn plugin(api_key: &str, address: SocketAddr) -> AnthropicPlugin {
         api_key: api_key.into(),
         base_url: Some(format!("http://{address}")),
         default_max_tokens: Some(100),
+        default_effort: Some(Effort::Low),
+        thinking_display: Some(ThinkingDisplay::Summarized),
+        cache: CacheMode::Off,
     })
 }
 
@@ -109,8 +112,9 @@ async fn the_plugin_provides_a_model_that_answers() {
         .expect("the call works");
     assert_eq!(response.message.text(), "Hello");
 
-    // The config reached the model: its key, and its default `max_tokens`
-    // for a request that sets none.
+    // The config reached the model: its key, its defaults for a request
+    // that sets neither `max_tokens` nor effort, its thinking display, and
+    // its cache mode.
     let sent = server.await.expect("the server ran");
     let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
     assert!(
@@ -119,6 +123,9 @@ async fn the_plugin_provides_a_model_that_answers() {
     );
     let body: Value = serde_json::from_str(body).expect("the body is JSON");
     assert_eq!(body["max_tokens"], 100);
+    assert_eq!(body["output_config"]["effort"], "low");
+    assert_eq!(body["thinking"]["display"], "summarized");
+    assert!(!body.to_string().contains("cache_control"), "{body}");
 }
 
 #[tokio::test]

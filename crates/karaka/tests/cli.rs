@@ -16,8 +16,11 @@ const VARIABLES: &[&str] = &[
     "KARAKA_MODEL",
     "KARAKA_SYSTEM",
     "KARAKA_MAX_TOKENS",
+    "KARAKA_EFFORT",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_THINKING_DISPLAY",
+    "ANTHROPIC_CACHE",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
 ];
@@ -160,6 +163,7 @@ fn asks_anthropic_and_prints_the_answer() {
             ("ANTHROPIC_BASE_URL", format!("http://{address}")),
             ("KARAKA_SYSTEM", "Be brief.".into()),
             ("KARAKA_MAX_TOKENS", "200".into()),
+            ("KARAKA_EFFORT", "medium".into()),
         ],
         "",
     );
@@ -183,6 +187,21 @@ fn asks_anthropic_and_prints_the_answer() {
     assert!(body.contains(r#""say hello""#), "{body}");
     assert!(body.contains(r#""Be brief.""#), "{body}");
     assert!(body.contains(r#""max_tokens":200"#), "{body}");
+    assert!(
+        body.contains(r#""output_config":{"effort":"medium"}"#),
+        "{body}"
+    );
+    // The binary asks for summaries, and caches by default.
+    assert!(body.contains(r#""display":"summarized""#), "{body}");
+    assert!(
+        body.contains(r#""cache_control":{"type":"ephemeral"}"#),
+        "{body}"
+    );
+    assert!(
+        head.to_lowercase()
+            .contains("\r\nanthropic-beta: thinking-binding-controls-2026-08-01\r\n"),
+        "{head}"
+    );
 }
 
 #[test]

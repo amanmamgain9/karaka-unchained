@@ -4,8 +4,9 @@
 //! These variables are a stopgap. They will move to the YAML config file,
 //! whose sections fill the plugins' typed configs directly.
 
-use karaka_anthropic::{AnthropicConfig, AnthropicPlugin};
+use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
 use karaka_kernel::DynPlugin;
+use karaka_model::Effort;
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
 
 /// Used when `KARAKA_MODEL` isn't set and the provider is Anthropic.
@@ -19,6 +20,7 @@ pub struct Config {
     pub model: String,
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
+    pub effort: Option<Effort>,
 }
 
 /// The model provider, with its plugin's config. Kept apart from the plugin
@@ -56,11 +58,41 @@ impl Config {
                 let api_key = var("ANTHROPIC_API_KEY").ok_or(
                     "ANTHROPIC_API_KEY is not set. The anthropic provider needs it to call the API.",
                 )?;
+                let thinking_display = match var("ANTHROPIC_THINKING_DISPLAY") {
+                    Some(value) => choice(
+                        "ANTHROPIC_THINKING_DISPLAY",
+                        &value,
+                        &[
+                            ("summarized", ThinkingDisplay::Summarized),
+                            ("omitted", ThinkingDisplay::Omitted),
+                        ],
+                    )?,
+                    // The answer printer shows reasoning, dimmed, so ask for
+                    // reasoning it can show. Anthropic's own default sends
+                    // it empty.
+                    None => ThinkingDisplay::Summarized,
+                };
+                let cache = match var("ANTHROPIC_CACHE") {
+                    Some(value) => choice(
+                        "ANTHROPIC_CACHE",
+                        &value,
+                        &[
+                            ("short", CacheMode::Short),
+                            ("long", CacheMode::Long),
+                            ("off", CacheMode::Off),
+                        ],
+                    )?,
+                    None => CacheMode::default(),
+                };
                 let config = AnthropicConfig {
                     api_key,
                     base_url: var("ANTHROPIC_BASE_URL"),
-                    // The request carries `KARAKA_MAX_TOKENS` itself.
+                    // The request carries `KARAKA_MAX_TOKENS` and
+                    // `KARAKA_EFFORT` itself.
                     default_max_tokens: None,
+                    default_effort: None,
+                    thinking_display: Some(thinking_display),
+                    cache,
                 };
                 let model = model.unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_owned());
                 (Provider::Anthropic(config), model)
@@ -75,6 +107,9 @@ impl Config {
                 let config = OpenAiConfig {
                     base_url,
                     api_key: var("OPENAI_API_KEY"),
+                    default_effort: None,
+                    thinking: None,
+                    max_tokens_field: Default::default(),
                 };
                 // Each OpenAI-compatible server has its own models, so there
                 // is no default that would work everywhere.
@@ -105,17 +140,54 @@ impl Config {
             ),
         };
 
+        let effort = match var("KARAKA_EFFORT") {
+            None => None,
+            Some(value) => Some(choice(
+                "KARAKA_EFFORT",
+                &value,
+                &[
+                    ("low", Effort::Low),
+                    ("medium", Effort::Medium),
+                    ("high", Effort::High),
+                    ("xhigh", Effort::XHigh),
+                    ("max", Effort::Max),
+                ],
+            )?),
+        };
+
         Ok(Self {
             provider,
             model,
             system: var("KARAKA_SYSTEM"),
             max_tokens,
+            effort,
         })
     }
 }
 
+/// The value matching `text` among `options`, for a variable that takes one
+/// of a few names. The error lists them all.
+fn choice<T: Copy>(variable: &str, text: &str, options: &[(&str, T)]) -> Result<T, String> {
+    let wanted = text.trim();
+    options
+        .iter()
+        .find(|(name, _)| *name == wanted)
+        .map(|&(_, value)| value)
+        .ok_or_else(|| {
+            let names: Vec<&str> = options.iter().map(|&(name, _)| name).collect();
+            let (last, rest) = names.split_last().expect("there is always an option");
+            format!(
+                "{variable} is \"{text}\", but it must be {} or {last}",
+                rest.join(", ")
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
+    use karaka_anthropic::{CacheMode, ThinkingDisplay};
+    use karaka_model::Effort;
+
     use super::{Config, Provider};
 
     /// Reads the config from `vars` alone, as if they were the whole
@@ -139,6 +211,13 @@ mod tests {
         assert_eq!(config.model, "claude-opus-5-5");
         assert_eq!(config.system, None);
         assert_eq!(config.max_tokens, None);
+        assert_eq!(config.effort, None);
+        // Summaries by default, so the dimmed reasoning has text in it.
+        assert_eq!(
+            anthropic.thinking_display,
+            Some(ThinkingDisplay::Summarized)
+        );
+        assert_eq!(anthropic.cache, CacheMode::Short);
     }
 
     #[test]
@@ -150,15 +229,89 @@ mod tests {
             ("KARAKA_MAX_TOKENS", "4096"),
             ("ANTHROPIC_API_KEY", "sk-test"),
             ("ANTHROPIC_BASE_URL", "http://localhost:8080"),
+            ("KARAKA_EFFORT", "xhigh"),
+            ("ANTHROPIC_THINKING_DISPLAY", "omitted"),
+            ("ANTHROPIC_CACHE", "long"),
         ])
         .expect("the config reads");
         let Provider::Anthropic(anthropic) = &config.provider else {
             panic!("expected anthropic, got {config:?}");
         };
         assert_eq!(anthropic.base_url.as_deref(), Some("http://localhost:8080"));
+        assert_eq!(anthropic.thinking_display, Some(ThinkingDisplay::Omitted));
+        assert_eq!(anthropic.cache, CacheMode::Long);
         assert_eq!(config.model, "claude-test");
         assert_eq!(config.system.as_deref(), Some("Be brief."));
         assert_eq!(config.max_tokens, Some(4096));
+        assert_eq!(config.effort, Some(Effort::XHigh));
+    }
+
+    #[test]
+    fn every_effort_level_is_read_by_name() {
+        let levels = [
+            ("low", Effort::Low),
+            ("medium", Effort::Medium),
+            ("high", Effort::High),
+            ("xhigh", Effort::XHigh),
+            ("max", Effort::Max),
+        ];
+        for (name, effort) in levels {
+            let config = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_EFFORT", name)])
+                .expect("the config reads");
+            assert_eq!(config.effort, Some(effort), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_effort_applies_to_openai_too() {
+        let config = config(&[
+            ("KARAKA_PROVIDER", "openai"),
+            ("KARAKA_MODEL", "deepseek-test"),
+            ("OPENAI_BASE_URL", "https://api.deepseek.com"),
+            ("KARAKA_EFFORT", "max"),
+        ])
+        .expect("the config reads");
+        assert_eq!(config.effort, Some(Effort::Max));
+    }
+
+    #[test]
+    fn an_unknown_effort_lists_the_levels() {
+        let error = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_EFFORT", "huge")])
+            .expect_err("the config is rejected");
+        assert_eq!(
+            error,
+            "KARAKA_EFFORT is \"huge\", but it must be low, medium, high, xhigh or max"
+        );
+    }
+
+    #[test]
+    fn caching_can_be_turned_off() {
+        let config = config(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_CACHE", "off")])
+            .expect("the config reads");
+        let Provider::Anthropic(anthropic) = &config.provider else {
+            panic!("expected anthropic, got {config:?}");
+        };
+        assert_eq!(anthropic.cache, CacheMode::Off);
+    }
+
+    #[test]
+    fn unknown_anthropic_choices_are_rejected() {
+        let error = config(&[
+            ("ANTHROPIC_API_KEY", "k"),
+            ("ANTHROPIC_THINKING_DISPLAY", "full"),
+        ])
+        .expect_err("the config is rejected");
+        assert_eq!(
+            error,
+            "ANTHROPIC_THINKING_DISPLAY is \"full\", but it must be summarized or omitted"
+        );
+
+        let error = config(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_CACHE", "forever")])
+            .expect_err("the config is rejected");
+        assert_eq!(
+            error,
+            "ANTHROPIC_CACHE is \"forever\", but it must be short, long or off"
+        );
     }
 
     #[test]

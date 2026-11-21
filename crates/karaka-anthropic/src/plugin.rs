@@ -5,10 +5,10 @@ use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::Model;
+use karaka_model::{Effort, Model};
 use serde::Deserialize;
 
-use crate::AnthropicModel;
+use crate::{AnthropicModel, CacheMode, ThinkingDisplay};
 
 /// How the plugin reaches Anthropic.
 ///
@@ -25,6 +25,18 @@ pub struct AnthropicConfig {
     /// The `max_tokens` for requests that don't set their own. `None` keeps
     /// the model's default.
     pub default_max_tokens: Option<u32>,
+    /// The effort for requests that don't set their own. `None` sends none,
+    /// so Anthropic uses the model's default.
+    pub default_effort: Option<Effort>,
+    /// Turns on adaptive thinking, shown as summaries or not at all. `None`
+    /// sends no thinking setting, which keeps older models such as Haiku 4.5
+    /// working, but leaves current models at their default: thinking with
+    /// empty text.
+    pub thinking_display: Option<ThinkingDisplay>,
+    /// How long Anthropic caches the start of each conversation. Five
+    /// minutes unless set.
+    #[serde(default)]
+    pub cache: CacheMode,
 }
 
 /// Leaves out the API key, so a config can be logged safely.
@@ -33,6 +45,9 @@ impl fmt::Debug for AnthropicConfig {
         f.debug_struct("AnthropicConfig")
             .field("base_url", &self.base_url)
             .field("default_max_tokens", &self.default_max_tokens)
+            .field("default_effort", &self.default_effort)
+            .field("thinking_display", &self.thinking_display)
+            .field("cache", &self.cache)
             .finish_non_exhaustive()
     }
 }
@@ -72,6 +87,13 @@ impl Plugin for AnthropicPlugin {
         if let Some(max_tokens) = self.config.default_max_tokens {
             model = model.with_default_max_tokens(max_tokens);
         }
+        if let Some(effort) = self.config.default_effort {
+            model = model.with_default_effort(effort);
+        }
+        if let Some(display) = self.config.thinking_display {
+            model = model.with_thinking_display(display);
+        }
+        model = model.with_cache(self.config.cache);
         ctx.provide::<dyn Model>(Arc::new(model));
         Ok(())
     }
@@ -79,7 +101,10 @@ impl Plugin for AnthropicPlugin {
 
 #[cfg(test)]
 mod tests {
+    use karaka_model::Effort;
+
     use super::AnthropicConfig;
+    use crate::{CacheMode, ThinkingDisplay};
 
     #[test]
     fn the_config_reads_with_only_the_key_given() {
@@ -88,6 +113,29 @@ mod tests {
         assert_eq!(config.api_key, "sk-secret");
         assert_eq!(config.base_url, None);
         assert_eq!(config.default_max_tokens, None);
+        assert_eq!(config.default_effort, None);
+        assert_eq!(config.thinking_display, None);
+        assert_eq!(config.cache, CacheMode::Short);
+    }
+
+    #[test]
+    fn the_config_reads_effort_thinking_and_cache_by_name() {
+        let config: AnthropicConfig = serde_json::from_str(
+            r#"{"api_key": "k", "default_effort": "xhigh", "thinking_display": "summarized", "cache": "long"}"#,
+        )
+        .expect("the config reads");
+        assert_eq!(config.default_effort, Some(Effort::XHigh));
+        assert_eq!(config.thinking_display, Some(ThinkingDisplay::Summarized));
+        assert_eq!(config.cache, CacheMode::Long);
+    }
+
+    #[test]
+    fn an_unknown_effort_is_rejected() {
+        let error = serde_json::from_str::<AnthropicConfig>(
+            r#"{"api_key": "k", "default_effort": "huge"}"#,
+        )
+        .expect_err("the config is rejected");
+        assert!(error.to_string().contains("huge"), "{error}");
     }
 
     #[test]
@@ -103,6 +151,9 @@ mod tests {
             api_key: "sk-secret".into(),
             base_url: None,
             default_max_tokens: None,
+            default_effort: None,
+            thinking_display: None,
+            cache: CacheMode::Short,
         };
         assert!(!format!("{config:?}").contains("sk-secret"));
     }

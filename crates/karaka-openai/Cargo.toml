@@ -11,7 +11,8 @@ publish.workspace = true
 # For the plugin that puts the model in a runtime. The kernel has no
 # dependencies of its own, so this adds almost nothing to the build.
 karaka-kernel.workspace = true
-karaka-model.workspace = true
+# `serde`, so the config can name a default `Effort`.
+karaka-model = { workspace = true, features = ["serde"] }
 # Splits the HTTP body into server-sent events.
 karaka-sse.workspace = true
 serde.workspace = true

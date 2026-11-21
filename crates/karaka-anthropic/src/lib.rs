@@ -16,3 +16,4 @@ mod request;
 
 pub use model::AnthropicModel;
 pub use plugin::{AnthropicConfig, AnthropicPlugin};
+pub use request::{CacheMode, ThinkingDisplay};

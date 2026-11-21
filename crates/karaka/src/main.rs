@@ -28,8 +28,13 @@ Settings come from the environment:
   KARAKA_MODEL        the model's id; for anthropic, claude-opus-5-5 by default
   KARAKA_SYSTEM       a system prompt (optional)
   KARAKA_MAX_TOKENS   the most the model may write (optional)
+  KARAKA_EFFORT       low, medium, high, xhigh or max (optional; the
+                      provider's default otherwise)
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
+  ANTHROPIC_THINKING_DISPLAY
+                      summarized (the default) or omitted
+  ANTHROPIC_CACHE     short (the default, 5 minutes), long (1 hour) or off
   OPENAI_BASE_URL     needed for openai, such as https://api.openai.com/v1
   OPENAI_API_KEY      for openai (optional)
 ";
@@ -105,6 +110,7 @@ async fn ask(question: Option<String>) -> Result<(), String> {
     let mut request = Request::new(config.model, vec![Message::user(question)]);
     request.system = config.system;
     request.max_tokens = config.max_tokens;
+    request.effort = config.effort;
     print_answer(model.stream(request)).await
 }
 

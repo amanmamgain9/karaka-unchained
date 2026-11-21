@@ -12,6 +12,9 @@ publish.workspace = true
 [dependencies]
 # Only the `Stream` trait, which every async library agrees on. No executor.
 futures-core.workspace = true
+# Off unless a crate asks for the `serde` feature. Providers turn it on so
+# their configs can name an `Effort`; the seam itself never needs it.
+serde = { workspace = true, optional = true }
 
 # Only for running the async tests.
 [dev-dependencies]

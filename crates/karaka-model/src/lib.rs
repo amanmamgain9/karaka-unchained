@@ -9,6 +9,6 @@ mod model;
 
 pub use message::{Block, Message, Role, ToolCall, ToolResult};
 pub use model::{
-    ErrorKind, Event, EventStream, Model, ModelError, Request, Response, StopReason, ToolSchema,
-    Usage, complete,
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, Response, StopReason,
+    ToolSchema, Usage, complete,
 };

@@ -7,14 +7,14 @@ use std::fmt;
 use std::time::Duration;
 
 use futures_util::stream::unfold;
-use karaka_model::{ErrorKind, Event, EventStream, Model, ModelError, Request};
+use karaka_model::{Effort, ErrorKind, Event, EventStream, Model, ModelError, Request};
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 
 use crate::decoder::{Decoder, WireError};
-use crate::request::body;
+use crate::request::{MaxTokensField, Settings, body};
 
 /// A [`Model`] backed by an OpenAI-compatible Chat Completions API.
 ///
@@ -39,6 +39,7 @@ pub struct OpenAiModel {
     endpoint: String,
     /// `None` for a local server that needs no key.
     api_key: Option<String>,
+    settings: Settings,
 }
 
 impl OpenAiModel {
@@ -58,6 +59,7 @@ impl OpenAiModel {
             client,
             endpoint: endpoint(&base_url.into()),
             api_key: None,
+            settings: Settings::default(),
         }
     }
 
@@ -67,9 +69,30 @@ impl OpenAiModel {
         self
     }
 
+    /// Sets the effort used when a request doesn't set its own. Without
+    /// one, such a request sends no `reasoning_effort`.
+    pub fn with_default_effort(mut self, effort: Effort) -> Self {
+        self.settings.default_effort = Some(effort);
+        self
+    }
+
+    /// Sends DeepSeek's `thinking` switch, on or off, with every request.
+    /// Other servers don't know the field, so leave it unset for them.
+    pub fn with_thinking(mut self, on: bool) -> Self {
+        self.settings.thinking = Some(on);
+        self
+    }
+
+    /// Chooses the field a request's `max_tokens` goes out as. The default
+    /// is [`MaxTokensField::MaxTokens`].
+    pub fn with_max_tokens_field(mut self, field: MaxTokensField) -> Self {
+        self.settings.max_tokens_field = field;
+        self
+    }
+
     /// Everything about the HTTP request except sending it.
     fn prepare(&self, request: &Request) -> Result<RequestBuilder, ModelError> {
-        let json = serde_json::to_vec(&body(request)?).map_err(|error| {
+        let json = serde_json::to_vec(&body(request, &self.settings)?).map_err(|error| {
             ModelError::new(
                 ErrorKind::InvalidRequest,
                 format!("the request couldn't be written as JSON: {error}"),
@@ -102,6 +125,7 @@ impl fmt::Debug for OpenAiModel {
         f.debug_struct("OpenAiModel")
             .field("endpoint", &self.endpoint)
             .field("has_api_key", &self.api_key.is_some())
+            .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
 }

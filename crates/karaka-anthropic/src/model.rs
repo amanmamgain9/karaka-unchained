@@ -6,14 +6,14 @@ use std::fmt;
 use std::time::Duration;
 
 use futures_util::stream::unfold;
-use karaka_model::{ErrorKind, Event, EventStream, Model, ModelError, Request};
+use karaka_model::{Effort, ErrorKind, Event, EventStream, Model, ModelError, Request};
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 
 use crate::decoder::{Decoder, WireError, error_kind};
-use crate::request::body;
+use crate::request::{CacheMode, Settings, ThinkingDisplay, body};
 
 const BASE_URL: &str = "https://api.anthropic.com";
 
@@ -36,7 +36,7 @@ pub struct AnthropicModel {
     /// `https://api.anthropic.com/v1/messages`.
     endpoint: String,
     api_key: String,
-    default_max_tokens: u32,
+    settings: Settings,
 }
 
 impl AnthropicModel {
@@ -55,7 +55,12 @@ impl AnthropicModel {
             client,
             endpoint: endpoint(BASE_URL),
             api_key: api_key.into(),
-            default_max_tokens: DEFAULT_MAX_TOKENS,
+            settings: Settings {
+                default_max_tokens: DEFAULT_MAX_TOKENS,
+                default_effort: None,
+                thinking_display: None,
+                cache: CacheMode::default(),
+            },
         }
     }
 
@@ -68,19 +73,41 @@ impl AnthropicModel {
 
     /// Changes the `max_tokens` used when a request doesn't set its own.
     pub fn with_default_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.default_max_tokens = max_tokens;
+        self.settings.default_max_tokens = max_tokens;
+        self
+    }
+
+    /// Sets the effort used when a request doesn't set its own. Without
+    /// one, such a request sends no effort and gets the model's default.
+    pub fn with_default_effort(mut self, effort: Effort) -> Self {
+        self.settings.default_effort = Some(effort);
+        self
+    }
+
+    /// Turns on adaptive thinking, returned as `display` says. Without it no
+    /// thinking setting is sent, and each model does what it does by
+    /// default.
+    pub fn with_thinking_display(mut self, display: ThinkingDisplay) -> Self {
+        self.settings.thinking_display = Some(display);
+        self
+    }
+
+    /// Changes how long the start of a conversation stays cached, or turns
+    /// caching off. The default is [`CacheMode::Short`].
+    pub fn with_cache(mut self, cache: CacheMode) -> Self {
+        self.settings.cache = cache;
         self
     }
 
     /// Everything about the HTTP request except sending it.
     fn prepare(&self, request: &Request) -> Result<RequestBuilder, ModelError> {
-        let json =
-            serde_json::to_vec(&body(request, self.default_max_tokens)?).map_err(|error| {
-                ModelError::new(
-                    ErrorKind::InvalidRequest,
-                    format!("the request couldn't be written as JSON: {error}"),
-                )
-            })?;
+        let body = body(request, &self.settings)?;
+        let json = serde_json::to_vec(&body).map_err(|error| {
+            ModelError::new(
+                ErrorKind::InvalidRequest,
+                format!("the request couldn't be written as JSON: {error}"),
+            )
+        })?;
         let mut api_key = HeaderValue::from_str(&self.api_key).map_err(|_| {
             ModelError::new(
                 ErrorKind::Auth,
@@ -90,14 +117,17 @@ impl AnthropicModel {
         // Keeps the key out of reqwest's debug output.
         api_key.set_sensitive(true);
 
-        Ok(self
+        let mut builder = self
             .client
             .post(&self.endpoint)
             .header("x-api-key", api_key)
             .header("anthropic-version", API_VERSION)
             .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "text/event-stream")
-            .body(json))
+            .header(ACCEPT, "text/event-stream");
+        if let Some(beta) = body.beta() {
+            builder = builder.header("anthropic-beta", beta);
+        }
+        Ok(builder.body(json))
     }
 }
 
@@ -107,7 +137,7 @@ impl fmt::Debug for AnthropicModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnthropicModel")
             .field("endpoint", &self.endpoint)
-            .field("default_max_tokens", &self.default_max_tokens)
+            .field("settings", &self.settings)
             .finish_non_exhaustive()
     }
 }

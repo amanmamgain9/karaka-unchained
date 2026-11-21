@@ -41,10 +41,15 @@ pub struct Request {
     pub tools: Vec<ToolSchema>,
     /// The most the model may write. `None` leaves it to the provider.
     pub max_tokens: Option<u32>,
+    /// How hard the model should work on this request. `None` uses the
+    /// default in the provider's config, and if that is unset too, the
+    /// provider's own default.
+    pub effort: Option<Effort>,
 }
 
 impl Request {
-    /// A request with no system prompt, no tools and no output limit.
+    /// A request with no system prompt, no tools, no output limit and no
+    /// effort of its own.
     pub fn new(model: impl Into<String>, messages: Vec<Message>) -> Self {
         Self {
             model: model.into(),
@@ -52,8 +57,36 @@ impl Request {
             messages,
             tools: Vec::new(),
             max_tokens: None,
+            effort: None,
         }
     }
+}
+
+/// How much thinking and work a model puts into an answer, from the least to
+/// the most. More effort usually means a better answer, more tokens and a
+/// longer wait.
+///
+/// Every provider has a setting like this, but each names its levels
+/// differently and supports only some of them. Each provider maps a level to
+/// the closest value it supports, and documents its mapping.
+///
+/// Whether the model shows its reasoning is a separate question, and it is
+/// not here. Providers answer it in very different ways: Anthropic always
+/// thinks and only chooses whether to return a summary, while DeepSeek turns
+/// thinking itself on or off. So it lives in each provider's config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+    /// Between `High` and `Max`.
+    XHigh,
+    Max,
 }
 
 /// A tool as the model sees it.

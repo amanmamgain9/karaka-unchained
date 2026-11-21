@@ -10,10 +10,43 @@
 //! - The system prompt is a message, the first one.
 //! - Content is one string per message, not a list of blocks.
 //! - Tool results are messages of their own, with the role `tool`.
+//!
+//! Like the Anthropic provider, it leaves out a message whose text is empty
+//! or only whitespace and that has nothing else in it. Some servers refuse
+//! such messages, and a conversation that came from another provider can
+//! hold them.
 
-use karaka_model::{Block, ErrorKind, Message, ModelError, Request, Role, ToolCall, ToolResult};
-use serde::Serialize;
+use karaka_model::{
+    Block, Effort, ErrorKind, Message, ModelError, Request, Role, ToolCall, ToolResult,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+
+/// The settings that come from the provider's config rather than from each
+/// request.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Settings {
+    /// For a request that doesn't set `effort`.
+    pub default_effort: Option<Effort>,
+    /// DeepSeek's switch for thinking. `None` sends no switch.
+    pub thinking: Option<bool>,
+    pub max_tokens_field: MaxTokensField,
+}
+
+/// Which field carries a request's `max_tokens`.
+///
+/// OpenAI renamed it to `max_completion_tokens`, and its reasoning models
+/// refuse the old name. Most other servers, DeepSeek among them, know only
+/// the old one. pi-ai has the same switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// `max_tokens`, which nearly every server accepts.
+    #[default]
+    MaxTokens,
+    /// `max_completion_tokens`, for OpenAI's own newer models.
+    MaxCompletionTokens,
+}
 
 /// The body of `POST /chat/completions`.
 #[derive(Serialize)]
@@ -24,11 +57,27 @@ pub(crate) struct Body<'a> {
     tools: Vec<WireTool<'a>>,
     /// Sent only when the request sets it. Providers' limits and defaults
     /// differ, and a number that suits one model can be refused by another,
-    /// so the server's own default is the safe choice.
+    /// so the server's own default is the safe choice. At most one of this
+    /// and `max_completion_tokens` is sent, as the config chooses.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
+    /// Only DeepSeek knows this field, so it is sent only when the config
+    /// sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingSwitch>,
     stream: bool,
     stream_options: StreamOptions,
+}
+
+/// DeepSeek's `{"type": "enabled"}` or `{"type": "disabled"}`.
+#[derive(Serialize)]
+struct ThinkingSwitch {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -96,9 +145,10 @@ struct WireFunction<'a> {
 
 /// Builds the streaming body for `request`.
 ///
-/// Fails only if a tool's parameters aren't a JSON object, which is a bug in
-/// whoever defined the tool, so it's reported before anything is sent.
-pub(crate) fn body(request: &Request) -> Result<Body<'_>, ModelError> {
+/// Fails before anything is sent if a tool's parameters aren't a JSON
+/// object, which is a bug in whoever defined the tool, or if the request
+/// asks for an effort while the config turns thinking off.
+pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body<'a>, ModelError> {
     let tools = request
         .tools
         .iter()
@@ -123,22 +173,45 @@ pub(crate) fn body(request: &Request) -> Result<Body<'_>, ModelError> {
         })
         .collect::<Result<_, ModelError>>()?;
 
+    let effort = request.effort.or(settings.default_effort);
+    // DeepSeek has no effort for thinking that is off. dsh refuses this pair
+    // before sending, rather than let one setting quietly win.
+    if let (Some(effort), Some(false)) = (effort, settings.thinking) {
+        return Err(ModelError::new(
+            ErrorKind::InvalidRequest,
+            format!("the effort is {effort:?}, but the provider's config turns thinking off"),
+        ));
+    }
+
     let mut messages = Vec::new();
-    if let Some(system) = &request.system {
+    if let Some(system) = request
+        .system
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
         messages.push(WireMessage::System { content: system });
     }
     for message in &request.messages {
         match message.role {
             Role::User => user(message, &mut messages),
-            Role::Assistant => messages.push(assistant(message)),
+            Role::Assistant => messages.extend(assistant(message)),
         }
     }
 
+    let (max_tokens, max_completion_tokens) = match settings.max_tokens_field {
+        MaxTokensField::MaxTokens => (request.max_tokens, None),
+        MaxTokensField::MaxCompletionTokens => (None, request.max_tokens),
+    };
     Ok(Body {
         model: &request.model,
         messages,
         tools,
-        max_tokens: request.max_tokens,
+        max_tokens,
+        max_completion_tokens,
+        reasoning_effort: effort.map(effort_name),
+        thinking: settings.thinking.map(|on| ThinkingSwitch {
+            kind: if on { "enabled" } else { "disabled" },
+        }),
         stream: true,
         stream_options: StreamOptions {
             include_usage: true,
@@ -146,23 +219,48 @@ pub(crate) fn body(request: &Request) -> Result<Body<'_>, ModelError> {
     })
 }
 
+/// The name each server family uses for an effort level, as
+/// `reasoning_effort`.
+///
+/// | Effort   | `reasoning_effort` | OpenAI          | DeepSeek        |
+/// |----------|--------------------|-----------------|-----------------|
+/// | `Low`    | `"low"`            | yes             | some models     |
+/// | `Medium` | `"medium"`         | yes             | no              |
+/// | `High`   | `"high"`           | yes             | yes, default    |
+/// | `XHigh`  | `"xhigh"`          | newer models    | no              |
+/// | `Max`    | `"max"`            | newest models   | yes             |
+///
+/// Each level keeps its own name, with no rounding to a nearby one. This
+/// provider can't tell which server or model it is talking to, and every
+/// rounding rule is wrong for some of them: `Max` becoming `"xhigh"` would
+/// suit older OpenAI models but take `max` away from the newest ones and
+/// from DeepSeek. A server that lacks a level refuses it with a 400, which
+/// names the problem instead of hiding it.
+fn effort_name(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
+
 /// One user message, which can become several wire messages: one `tool`
 /// message per tool result, then a `user` message for the text.
 ///
 /// The tool messages come first because they must directly follow the
 /// assistant message that made the calls. The `user` message is left out
-/// when there is no text beside the results, but kept when there were no
-/// results either, so an empty message never silently disappears.
+/// when its text is empty or only whitespace, with or without results:
+/// there is nothing in it to send.
 fn user<'a>(message: &'a Message, out: &mut Vec<WireMessage<'a>>) {
-    let mut has_results = false;
     for block in &message.content {
         if let Block::ToolResult(result) = block {
-            has_results = true;
             out.push(tool_message(result));
         }
     }
     let text = message.text();
-    if !text.is_empty() || !has_results {
+    if !text.trim().is_empty() {
         out.push(WireMessage::User { content: text });
     }
 }
@@ -198,8 +296,12 @@ fn tool_message(result: &ToolResult) -> WireMessage<'_> {
 ///
 /// `content` is `""` when there's no text, never `null`, even beside tool
 /// calls. DeepSeek's adapter found that some gateways refuse `null`, and
-/// DeepSeek refuses it on a message that has no tool calls either.
-fn assistant(message: &Message) -> WireMessage<'_> {
+/// DeepSeek refuses it on a message that has no tool calls either. Text that
+/// is only whitespace counts as none.
+///
+/// A message left with no text, no reasoning and no tool calls is `None`,
+/// and isn't sent.
+fn assistant(message: &Message) -> Option<WireMessage<'_>> {
     let reasoning: String = message
         .content
         .iter()
@@ -208,7 +310,7 @@ fn assistant(message: &Message) -> WireMessage<'_> {
             _ => None,
         })
         .collect();
-    let tool_calls = message
+    let tool_calls: Vec<_> = message
         .content
         .iter()
         .filter_map(|block| match block {
@@ -216,11 +318,19 @@ fn assistant(message: &Message) -> WireMessage<'_> {
             _ => None,
         })
         .collect();
-    WireMessage::Assistant {
-        content: message.text(),
-        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-        tool_calls,
+    let mut content = message.text();
+    if content.trim().is_empty() {
+        content.clear();
     }
+    let has_reasoning = !reasoning.trim().is_empty();
+    if content.is_empty() && !has_reasoning && tool_calls.is_empty() {
+        return None;
+    }
+    Some(WireMessage::Assistant {
+        content,
+        reasoning_content: has_reasoning.then_some(reasoning),
+        tool_calls,
+    })
 }
 
 fn tool_call(call: &ToolCall) -> WireToolCall<'_> {
@@ -244,14 +354,19 @@ fn json_object(text: &str) -> Option<&RawValue> {
 #[cfg(test)]
 mod tests {
     use karaka_model::{
-        Block, ErrorKind, Message, Request, Role, ToolCall, ToolResult, ToolSchema,
+        Block, Effort, ErrorKind, Message, Request, Role, ToolCall, ToolResult, ToolSchema,
     };
     use serde_json::{Value, json};
 
-    use super::body;
+    use super::{MaxTokensField, Settings, body};
+
+    fn json_with(request: &Request, settings: &Settings) -> Value {
+        serde_json::to_value(body(request, settings).expect("the body builds"))
+            .expect("it serializes")
+    }
 
     fn to_json(request: &Request) -> Value {
-        serde_json::to_value(body(request).expect("the body builds")).expect("it serializes")
+        json_with(request, &Settings::default())
     }
 
     fn result(call_id: &str, content: &str, is_error: bool) -> Block {
@@ -423,10 +538,214 @@ mod tests {
             description: "Tells the time.".into(),
             parameters: "[1, 2]".into(),
         });
-        let Err(error) = body(&request) else {
+        let Err(error) = body(&request, &Settings::default()) else {
             panic!("expected the body to fail");
         };
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
         assert!(error.message.contains("\"clock\""), "{error}");
+    }
+
+    // Effort, thinking and the max-tokens field.
+
+    #[test]
+    fn every_effort_level_keeps_its_name_as_reasoning_effort() {
+        let levels = [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::XHigh, "xhigh"),
+            (Effort::Max, "max"),
+        ];
+        for (effort, name) in levels {
+            let mut request = Request::new("gpt-test", vec![Message::user("hi")]);
+            request.effort = Some(effort);
+            assert_eq!(to_json(&request)["reasoning_effort"], name);
+        }
+    }
+
+    #[test]
+    fn the_configs_effort_applies_when_the_request_sets_none() {
+        let settings = Settings {
+            default_effort: Some(Effort::High),
+            ..Settings::default()
+        };
+        let mut request = Request::new("gpt-test", vec![Message::user("hi")]);
+        assert_eq!(json_with(&request, &settings)["reasoning_effort"], "high");
+
+        request.effort = Some(Effort::Low);
+        assert_eq!(json_with(&request, &settings)["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn with_no_settings_there_is_no_effort_and_no_thinking_switch() {
+        let sent = to_json(&Request::new("gpt-test", vec![Message::user("hi")]));
+        assert!(sent.get("reasoning_effort").is_none(), "{sent}");
+        assert!(sent.get("thinking").is_none(), "{sent}");
+    }
+
+    #[test]
+    fn deepseek_thinking_with_an_effort() {
+        let settings = Settings {
+            thinking: Some(true),
+            ..Settings::default()
+        };
+        let mut request = Request::new("deepseek-test", vec![Message::user("hi")]);
+        request.effort = Some(Effort::Max);
+
+        assert_eq!(
+            json_with(&request, &settings),
+            json!({
+                "model": "deepseek-test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "max",
+                "thinking": {"type": "enabled"},
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
+        );
+    }
+
+    #[test]
+    fn deepseek_thinking_turned_off() {
+        let settings = Settings {
+            thinking: Some(false),
+            ..Settings::default()
+        };
+        let request = Request::new("deepseek-test", vec![Message::user("hi")]);
+        assert_eq!(
+            json_with(&request, &settings)["thinking"],
+            json!({"type": "disabled"})
+        );
+    }
+
+    #[test]
+    fn an_effort_with_thinking_turned_off_is_rejected_before_sending() {
+        let settings = Settings {
+            thinking: Some(false),
+            ..Settings::default()
+        };
+        let mut request = Request::new("deepseek-test", vec![Message::user("hi")]);
+        request.effort = Some(Effort::High);
+        let Err(error) = body(&request, &settings) else {
+            panic!("expected the body to fail");
+        };
+        assert_eq!(error.kind, ErrorKind::InvalidRequest);
+        assert!(error.message.contains("thinking off"), "{error}");
+    }
+
+    #[test]
+    fn max_tokens_can_go_out_as_max_completion_tokens() {
+        let settings = Settings {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..Settings::default()
+        };
+        let mut request = Request::new("gpt-test", vec![Message::user("hi")]);
+        request.max_tokens = Some(500);
+
+        assert_eq!(
+            json_with(&request, &settings),
+            json!({
+                "model": "gpt-test",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 500,
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
+        );
+        assert_eq!(to_json(&request)["max_tokens"], 500);
+        assert!(to_json(&request).get("max_completion_tokens").is_none());
+    }
+
+    // Empty text.
+
+    #[test]
+    fn a_user_message_with_only_blank_text_is_left_out() {
+        let request = Request::new(
+            "gpt-test",
+            vec![
+                Message::user("  \n"),
+                Message {
+                    role: Role::User,
+                    content: vec![Block::Text(" ".into()), result("call_1", "12:00", false)],
+                },
+            ],
+        );
+        assert_eq!(
+            to_json(&request)["messages"],
+            json!([{"role": "tool", "tool_call_id": "call_1", "content": "12:00"}])
+        );
+    }
+
+    #[test]
+    fn an_assistant_message_with_nothing_but_blanks_is_left_out() {
+        let request = Request::new(
+            "gpt-test",
+            vec![
+                Message::user("hi"),
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        Block::Text(" ".into()),
+                        Block::Reasoning {
+                            text: "\n".into(),
+                            replay: None,
+                        },
+                    ],
+                },
+                Message::user("still there?"),
+            ],
+        );
+        assert_eq!(
+            to_json(&request)["messages"],
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": "still there?"}
+            ])
+        );
+    }
+
+    #[test]
+    fn blank_text_beside_a_tool_call_becomes_empty_content() {
+        let request = Request::new(
+            "gpt-test",
+            vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    Block::Text("  ".into()),
+                    Block::ToolCall(ToolCall {
+                        id: "call_1".into(),
+                        name: "clock".into(),
+                        arguments: "{}".into(),
+                    }),
+                ],
+            }],
+        );
+        assert_eq!(to_json(&request)["messages"][0]["content"], "");
+    }
+
+    #[test]
+    fn whitespace_between_text_blocks_is_kept() {
+        let request = Request::new(
+            "gpt-test",
+            vec![Message {
+                role: Role::User,
+                content: vec![
+                    Block::Text("Hello".into()),
+                    Block::Text(" ".into()),
+                    Block::Text("world".into()),
+                ],
+            }],
+        );
+        assert_eq!(to_json(&request)["messages"][0]["content"], "Hello world");
+    }
+
+    #[test]
+    fn a_blank_system_prompt_is_left_out() {
+        let mut request = Request::new("gpt-test", vec![Message::user("hi")]);
+        request.system = Some(" ".into());
+        assert_eq!(
+            to_json(&request)["messages"],
+            json!([{"role": "user", "content": "hi"}])
+        );
     }
 }

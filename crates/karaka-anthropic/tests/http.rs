@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use karaka_anthropic::AnthropicModel;
+use karaka_anthropic::{AnthropicModel, ThinkingDisplay};
 use karaka_model::{ErrorKind, Message, Model, Request, StopReason, ToolSchema, complete};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -138,9 +138,45 @@ async fn a_streamed_text_answer() {
         "{head}"
     );
     assert!(head.contains("\r\naccept: text/event-stream\r\n"), "{head}");
+    // No thinking setting, so no beta either.
+    assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
     let body: Value = serde_json::from_str(body).expect("the body is JSON");
     assert_eq!(body["stream"], true);
     assert_eq!(body["model"], "claude-opus-5-5");
+}
+
+#[tokio::test]
+async fn thinking_sends_the_beta_its_block_binding_needs() {
+    let body = sse(&[
+        START,
+        TEXT_START,
+        HEL,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+    let (address, server) = serve_once(http_response(
+        "200 OK",
+        &[("content-type", "text/event-stream")],
+        &body,
+    ))
+    .await;
+
+    let model = model(address).with_thinking_display(ThinkingDisplay::Summarized);
+    complete(&model, request()).await.expect("the call works");
+
+    let sent = server.await.expect("the server ran");
+    let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    assert!(
+        head.to_lowercase()
+            .contains("\r\nanthropic-beta: thinking-binding-controls-2026-08-01\r\n"),
+        "{head}"
+    );
+    let body: Value = serde_json::from_str(body).expect("the body is JSON");
+    assert_eq!(
+        body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+        "drop_block"
+    );
 }
 
 #[tokio::test]
