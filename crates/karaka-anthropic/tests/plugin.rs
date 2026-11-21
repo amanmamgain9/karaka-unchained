@@ -1,4 +1,4 @@
-//! `AnthropicPlugin` started in a Karaka runtime, and the model it provides
+//! `AnthropicPlugin` started in a Karaka runtime, and the model it registers
 //! called against a fake server on localhost.
 //!
 //! The server helpers are copied from `http.rs`: each file under `tests/` is
@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
-use karaka_kernel::{Runtime, StartError};
-use karaka_model::{Effort, Message, Model, Request, complete};
+use karaka_kernel::{DynPlugin, Runtime, StartError};
+use karaka_model::{Effort, Message, Model, ModelRegistry, ModelsPlugin, Request, complete};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -85,8 +85,9 @@ const HELLO: &[&str] = &[
     r#"{"type":"message_stop"}"#,
 ];
 
-fn plugin(api_key: &str, address: SocketAddr) -> AnthropicPlugin {
+fn plugin(route: &str, api_key: &str, address: SocketAddr) -> AnthropicPlugin {
     AnthropicPlugin::new(AnthropicConfig {
+        route: route.into(),
         api_key: api_key.into(),
         base_url: Some(format!("http://{address}")),
         default_max_tokens: Some(100),
@@ -96,15 +97,22 @@ fn plugin(api_key: &str, address: SocketAddr) -> AnthropicPlugin {
     })
 }
 
+/// The registry's plugin, then `provider`.
+fn with_registry(provider: AnthropicPlugin) -> Vec<Box<dyn DynPlugin>> {
+    vec![Box::new(ModelsPlugin), Box::new(provider)]
+}
+
 #[tokio::test]
-async fn the_plugin_provides_a_model_that_answers() {
+async fn the_plugin_registers_a_model_that_answers() {
     let (address, server) = serve_once(streamed(HELLO)).await;
 
-    let runtime = Runtime::start(vec![Box::new(plugin("test-key", address))])
+    let runtime = Runtime::start(with_registry(plugin("anthropic", "test-key", address)))
         .await
         .expect("the runtime starts");
-    assert_eq!(runtime.plugins(), ["anthropic"]);
-    let model: Arc<dyn Model> = runtime.get::<dyn Model>();
+    assert_eq!(runtime.plugins(), ["models", "anthropic"]);
+    let registry = runtime.get::<ModelRegistry>();
+    assert_eq!(registry.routes(), ["anthropic"]);
+    let model: Arc<dyn Model> = registry.get("anthropic").expect("the route is registered");
 
     let request = Request::new("claude-opus-5-5", vec![Message::user("hi")]);
     let response = complete(model.as_ref(), request)
@@ -136,10 +144,36 @@ async fn an_empty_api_key_stops_the_runtime_from_starting() {
     let Err(StartError::Failed {
         plugin: name,
         source,
-    }) = Runtime::start(vec![Box::new(plugin("", address))]).await
+    }) = Runtime::start(with_registry(plugin("anthropic", "", address))).await
     else {
         panic!("expected the plugin to fail");
     };
     assert_eq!(name, "anthropic");
     assert_eq!(source.to_string(), "the Anthropic API key is empty");
+}
+
+#[tokio::test]
+async fn the_plugin_is_named_after_its_route() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+
+    let runtime = Runtime::start(with_registry(plugin("anthropic-team", "k", address)))
+        .await
+        .expect("the runtime starts");
+    assert_eq!(runtime.plugins(), ["models", "anthropic-team"]);
+    assert_eq!(runtime.get::<ModelRegistry>().routes(), ["anthropic-team"]);
+}
+
+#[tokio::test]
+async fn an_empty_route_stops_the_runtime_from_starting() {
+    let address = SocketAddr::from(([127, 0, 0, 1], 1));
+
+    let Err(StartError::Failed { source, .. }) =
+        Runtime::start(with_registry(plugin("", "k", address))).await
+    else {
+        panic!("expected the plugin to fail");
+    };
+    assert!(
+        source.to_string().starts_with("the model route is empty"),
+        "{source}"
+    );
 }

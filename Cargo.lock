@@ -607,6 +607,7 @@ name = "karaka-model"
 version = "0.1.0"
 dependencies = [
  "futures-core",
+ "karaka-kernel",
  "serde",
  "tokio",
 ]

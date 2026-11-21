@@ -8,11 +8,14 @@ use futures_core::Stream;
 
 use crate::{Block, Message, Role};
 
-/// The port a model provider implements.
+/// What a model provider implements.
 ///
-/// Plugins share it as `Arc<dyn Model>`. Choosing between several providers
-/// is not this trait's job: a router is just another `Model` that hands each
-/// request to one of the models it wraps.
+/// Plugins share it as `Arc<dyn Model>`. It isn't a port of its own: the
+/// kernel allows one provider per port, and a runtime may hold several
+/// providers. Each one registers its model in the [`ModelRegistry`] under a
+/// route, and callers pick a model by route there.
+///
+/// [`ModelRegistry`]: crate::ModelRegistry
 pub trait Model: Send + Sync {
     /// Starts one model call and returns its events as they arrive.
     ///

@@ -1,11 +1,11 @@
-//! [`OpenAiPlugin`], which puts an [`OpenAiModel`] in a Karaka runtime as
-//! its `dyn Model` port.
+//! [`OpenAiPlugin`], which registers an [`OpenAiModel`] in a Karaka
+//! runtime's [`ModelRegistry`].
 
 use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::{Effort, Model};
+use karaka_model::{Effort, ModelRegistry};
 use serde::Deserialize;
 
 use crate::{MaxTokensField, OpenAiModel};
@@ -19,6 +19,10 @@ use crate::{MaxTokensField, OpenAiModel};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiConfig {
+    /// The name the model is registered under, and the plugin's name, such
+    /// as "openai", "deepseek" or "ollama". Required: this one crate serves
+    /// all of those servers, so no single default would fit.
+    pub route: String,
     /// The part before `/chat/completions`, such as
     /// `https://api.openai.com/v1`. See [`OpenAiModel`] for more.
     pub base_url: String,
@@ -40,6 +44,7 @@ pub struct OpenAiConfig {
 impl fmt::Debug for OpenAiConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenAiConfig")
+            .field("route", &self.route)
             .field("base_url", &self.base_url)
             .field("has_api_key", &self.api_key.is_some())
             .field("default_effort", &self.default_effort)
@@ -49,7 +54,12 @@ impl fmt::Debug for OpenAiConfig {
     }
 }
 
-/// Provides the `dyn Model` port, backed by an OpenAI-compatible server.
+/// Registers a model backed by an OpenAI-compatible server in the
+/// [`ModelRegistry`], under the config's route.
+///
+/// The plugin is named after its route, so DeepSeek and Ollama can each have
+/// one in the same runtime. Two with the same route are stopped by the
+/// kernel before either starts, because their names clash.
 #[derive(Debug)]
 pub struct OpenAiPlugin {
     config: OpenAiConfig,
@@ -63,11 +73,11 @@ impl OpenAiPlugin {
 
 impl Plugin for OpenAiPlugin {
     fn name(&self) -> &str {
-        "openai"
+        &self.config.route
     }
 
-    fn provides(&self) -> Vec<PortId> {
-        vec![PortId::of::<dyn Model>()]
+    fn requires(&self) -> Vec<PortId> {
+        vec![PortId::of::<ModelRegistry>()]
     }
 
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
@@ -97,7 +107,10 @@ impl Plugin for OpenAiPlugin {
             model = model.with_thinking(on);
         }
         model = model.with_max_tokens_field(self.config.max_tokens_field);
-        ctx.provide::<dyn Model>(Arc::new(model));
+        // An empty or taken route fails here. Its error becomes this
+        // plugin's setup error, which the runtime reports by plugin name.
+        ctx.get::<ModelRegistry>()
+            .register(self.config.route.clone(), Arc::new(model))?;
         Ok(())
     }
 }
@@ -112,8 +125,9 @@ mod tests {
     #[test]
     fn the_config_reads_without_a_key() {
         let config: OpenAiConfig =
-            serde_json::from_str(r#"{"base_url": "http://localhost:11434/v1"}"#)
+            serde_json::from_str(r#"{"route": "ollama", "base_url": "http://localhost:11434/v1"}"#)
                 .expect("the config reads");
+        assert_eq!(config.route, "ollama");
         assert_eq!(config.base_url, "http://localhost:11434/v1");
         assert_eq!(config.api_key, None);
         assert_eq!(config.default_effort, None);
@@ -124,7 +138,7 @@ mod tests {
     #[test]
     fn the_config_reads_effort_thinking_and_the_max_tokens_field() {
         let config: OpenAiConfig = serde_json::from_str(
-            r#"{"base_url": "https://api.deepseek.com", "default_effort": "max", "thinking": true, "max_tokens_field": "max_completion_tokens"}"#,
+            r#"{"route": "deepseek", "base_url": "https://api.deepseek.com", "default_effort": "max", "thinking": true, "max_tokens_field": "max_completion_tokens"}"#,
         )
         .expect("the config reads");
         assert_eq!(config.default_effort, Some(Effort::Max));
@@ -133,16 +147,25 @@ mod tests {
     }
 
     #[test]
+    fn the_config_needs_a_route() {
+        let error = serde_json::from_str::<OpenAiConfig>(r#"{"base_url": "http://x"}"#)
+            .expect_err("the config is rejected");
+        assert!(error.to_string().contains("route"), "{error}");
+    }
+
+    #[test]
     fn a_misspelled_field_is_rejected() {
-        let error =
-            serde_json::from_str::<OpenAiConfig>(r#"{"base_url": "http://x", "apikey": "k"}"#)
-                .expect_err("the config is rejected");
+        let error = serde_json::from_str::<OpenAiConfig>(
+            r#"{"route": "x", "base_url": "http://x", "apikey": "k"}"#,
+        )
+        .expect_err("the config is rejected");
         assert!(error.to_string().contains("apikey"), "{error}");
     }
 
     #[test]
     fn debug_output_leaves_out_the_api_key() {
         let config = OpenAiConfig {
+            route: "openai".into(),
             base_url: "http://localhost".into(),
             api_key: Some("sk-secret".into()),
             default_effort: None,

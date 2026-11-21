@@ -1,11 +1,11 @@
-//! [`AnthropicPlugin`], which puts an [`AnthropicModel`] in a Karaka runtime
-//! as its `dyn Model` port.
+//! [`AnthropicPlugin`], which registers an [`AnthropicModel`] in a Karaka
+//! runtime's [`ModelRegistry`].
 
 use std::fmt;
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_model::{Effort, Model};
+use karaka_model::{Effort, ModelRegistry};
 use serde::Deserialize;
 
 use crate::{AnthropicModel, CacheMode, ThinkingDisplay};
@@ -19,6 +19,11 @@ use crate::{AnthropicModel, CacheMode, ThinkingDisplay};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnthropicConfig {
+    /// The name the model is registered under, and the plugin's name.
+    /// "anthropic" unless set; a second Anthropic account in one runtime
+    /// needs a route of its own.
+    #[serde(default = "default_route")]
+    pub route: String,
     pub api_key: String,
     /// Another server, such as a proxy. `None` means Anthropic's own.
     pub base_url: Option<String>,
@@ -39,10 +44,16 @@ pub struct AnthropicConfig {
     pub cache: CacheMode,
 }
 
+/// The route when the config doesn't name one.
+fn default_route() -> String {
+    "anthropic".to_owned()
+}
+
 /// Leaves out the API key, so a config can be logged safely.
 impl fmt::Debug for AnthropicConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AnthropicConfig")
+            .field("route", &self.route)
             .field("base_url", &self.base_url)
             .field("default_max_tokens", &self.default_max_tokens)
             .field("default_effort", &self.default_effort)
@@ -52,7 +63,12 @@ impl fmt::Debug for AnthropicConfig {
     }
 }
 
-/// Provides the `dyn Model` port, backed by Anthropic's Messages API.
+/// Registers a model backed by Anthropic's Messages API in the
+/// [`ModelRegistry`], under the config's route.
+///
+/// The plugin is named after its route, so two Anthropic plugins with
+/// different routes can run in one runtime. Two with the same route are
+/// stopped by the kernel before either starts, because their names clash.
 #[derive(Debug)]
 pub struct AnthropicPlugin {
     config: AnthropicConfig,
@@ -66,11 +82,11 @@ impl AnthropicPlugin {
 
 impl Plugin for AnthropicPlugin {
     fn name(&self) -> &str {
-        "anthropic"
+        &self.config.route
     }
 
-    fn provides(&self) -> Vec<PortId> {
-        vec![PortId::of::<dyn Model>()]
+    fn requires(&self) -> Vec<PortId> {
+        vec![PortId::of::<ModelRegistry>()]
     }
 
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
@@ -94,7 +110,10 @@ impl Plugin for AnthropicPlugin {
             model = model.with_thinking_display(display);
         }
         model = model.with_cache(self.config.cache);
-        ctx.provide::<dyn Model>(Arc::new(model));
+        // An empty or taken route fails here. Its error becomes this
+        // plugin's setup error, which the runtime reports by plugin name.
+        ctx.get::<ModelRegistry>()
+            .register(self.config.route.clone(), Arc::new(model))?;
         Ok(())
     }
 }
@@ -111,6 +130,7 @@ mod tests {
         let config: AnthropicConfig =
             serde_json::from_str(r#"{"api_key": "sk-secret"}"#).expect("the config reads");
         assert_eq!(config.api_key, "sk-secret");
+        assert_eq!(config.route, "anthropic");
         assert_eq!(config.base_url, None);
         assert_eq!(config.default_max_tokens, None);
         assert_eq!(config.default_effort, None);
@@ -127,6 +147,14 @@ mod tests {
         assert_eq!(config.default_effort, Some(Effort::XHigh));
         assert_eq!(config.thinking_display, Some(ThinkingDisplay::Summarized));
         assert_eq!(config.cache, CacheMode::Long);
+    }
+
+    #[test]
+    fn the_config_reads_a_route_of_its_own() {
+        let config: AnthropicConfig =
+            serde_json::from_str(r#"{"route": "anthropic-team", "api_key": "k"}"#)
+                .expect("the config reads");
+        assert_eq!(config.route, "anthropic-team");
     }
 
     #[test]
@@ -148,6 +176,7 @@ mod tests {
     #[test]
     fn debug_output_leaves_out_the_api_key() {
         let config = AnthropicConfig {
+            route: "anthropic".into(),
             api_key: "sk-secret".into(),
             base_url: None,
             default_max_tokens: None,

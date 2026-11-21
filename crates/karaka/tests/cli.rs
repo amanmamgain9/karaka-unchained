@@ -13,6 +13,7 @@ use std::thread::{self, JoinHandle};
 /// Every variable the binary reads. Each test starts with none of them set.
 const VARIABLES: &[&str] = &[
     "KARAKA_PROVIDER",
+    "KARAKA_ROUTE",
     "KARAKA_MODEL",
     "KARAKA_SYSTEM",
     "KARAKA_MAX_TOKENS",
@@ -231,6 +232,28 @@ fn asks_an_openai_server_a_question_read_from_stdin() {
     assert!(body.contains(r#""model":"llama-test""#), "{body}");
     // The newline that ended the input is trimmed off.
     assert!(body.contains(r#""say hello""#), "{body}");
+}
+
+#[test]
+fn asks_an_openai_server_under_a_route_of_its_own() {
+    let (address, server) = serve_once(streamed(OPENAI_HELLO));
+
+    let output = karaka(
+        &["ask", "hi"],
+        &[
+            ("KARAKA_PROVIDER", "openai".into()),
+            ("KARAKA_ROUTE", "deepseek".into()),
+            ("KARAKA_MODEL", "deepseek-chat".into()),
+            ("OPENAI_BASE_URL", format!("http://{address}")),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Hello, world\n");
+    let sent = server.join().expect("the server ran");
+    assert!(sent.contains(r#""model":"deepseek-chat""#), "{sent}");
 }
 
 #[test]

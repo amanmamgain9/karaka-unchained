@@ -1,7 +1,8 @@
 //! `karaka`, the Karaka runtime binary.
 //!
 //! For now it does one thing: `karaka ask <question>` starts a runtime with
-//! one model provider, asks the model, and prints the answer as it arrives.
+//! the model registry and one model provider, asks the model at the
+//! provider's route, and prints the answer as it arrives.
 
 mod answer;
 mod config;
@@ -9,9 +10,10 @@ mod config;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use karaka_kernel::Runtime;
-use karaka_model::{Message, Model, Request};
+use karaka_model::{Message, Model, ModelRegistry, Request};
 
 use crate::answer::print_answer;
 use crate::config::Config;
@@ -25,6 +27,9 @@ With no question, or with -, the question is read from stdin.
 
 Settings come from the environment:
   KARAKA_PROVIDER     anthropic (the default) or openai
+  KARAKA_ROUTE        the name the provider's model is registered under,
+                      such as deepseek or ollama (optional; the provider's
+                      name otherwise)
   KARAKA_MODEL        the model's id; for anthropic, claude-opus-5-5 by default
   KARAKA_SYSTEM       a system prompt (optional)
   KARAKA_MAX_TOKENS   the most the model may write (optional)
@@ -102,16 +107,33 @@ async fn ask(question: Option<String>) -> Result<(), String> {
         return Err("the question is empty".into());
     }
 
+    let route = config.provider.route().to_owned();
     let runtime = Runtime::start(config.provider.plugins())
         .await
         .map_err(|error| error.to_string())?;
-    let model = runtime.get::<dyn Model>();
+    let model = model_at(&runtime.get::<ModelRegistry>(), &route)?;
 
     let mut request = Request::new(config.model, vec![Message::user(question)]);
     request.system = config.system;
     request.max_tokens = config.max_tokens;
     request.effort = config.effort;
     print_answer(model.stream(request)).await
+}
+
+/// The model registered under `route`, or an error that lists the routes
+/// there are.
+fn model_at(registry: &ModelRegistry, route: &str) -> Result<Arc<dyn Model>, String> {
+    registry.get(route).ok_or_else(|| {
+        let routes = registry.routes();
+        if routes.is_empty() {
+            format!("no model is registered under the route \"{route}\"; no routes are registered")
+        } else {
+            format!(
+                "no model is registered under the route \"{route}\"; the routes are: {}",
+                routes.join(", ")
+            )
+        }
+    })
 }
 
 /// All of stdin, as the question.
@@ -126,7 +148,12 @@ fn read_stdin() -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse_args};
+    use std::sync::Arc;
+
+    use karaka_model::ModelRegistry;
+    use karaka_openai::OpenAiModel;
+
+    use super::{Command, model_at, parse_args};
 
     fn parse(args: &[&str]) -> Command {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
@@ -158,5 +185,30 @@ mod tests {
         assert_eq!(parse(&["--help"]), Command::Usage);
         assert_eq!(parse(&["-h"]), Command::Usage);
         assert_eq!(parse(&["chat", "hello"]), Command::Usage);
+    }
+
+    #[test]
+    fn an_unknown_route_is_an_error_that_lists_the_routes() {
+        let registry = ModelRegistry::new();
+        let Err(error) = model_at(&registry, "deepseek") else {
+            panic!("expected no model");
+        };
+        assert_eq!(
+            error,
+            "no model is registered under the route \"deepseek\"; no routes are registered"
+        );
+
+        for route in ["anthropic", "ollama"] {
+            let model = OpenAiModel::new("http://127.0.0.1:1");
+            registry.register(route, Arc::new(model)).unwrap();
+        }
+        let Err(error) = model_at(&registry, "deepseek") else {
+            panic!("expected no model");
+        };
+        assert_eq!(
+            error,
+            "no model is registered under the route \"deepseek\"; the routes are: anthropic, ollama"
+        );
+        assert!(model_at(&registry, "ollama").is_ok());
     }
 }

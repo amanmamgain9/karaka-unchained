@@ -6,7 +6,7 @@
 
 use karaka_anthropic::{AnthropicConfig, AnthropicPlugin, CacheMode, ThinkingDisplay};
 use karaka_kernel::DynPlugin;
-use karaka_model::Effort;
+use karaka_model::{Effort, ModelsPlugin};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
 
 /// Used when `KARAKA_MODEL` isn't set and the provider is Anthropic.
@@ -32,12 +32,22 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// The plugins to start: for now, just the provider's.
-    pub fn plugins(self) -> Vec<Box<dyn DynPlugin>> {
+    /// The route the provider's model is registered under.
+    pub fn route(&self) -> &str {
         match self {
-            Self::Anthropic(config) => vec![Box::new(AnthropicPlugin::new(config))],
-            Self::OpenAi(config) => vec![Box::new(OpenAiPlugin::new(config))],
+            Self::Anthropic(config) => &config.route,
+            Self::OpenAi(config) => &config.route,
         }
+    }
+
+    /// The plugins to start: the model registry, and the provider's plugin,
+    /// which registers its model there.
+    pub fn plugins(self) -> Vec<Box<dyn DynPlugin>> {
+        let provider: Box<dyn DynPlugin> = match self {
+            Self::Anthropic(config) => Box::new(AnthropicPlugin::new(config)),
+            Self::OpenAi(config) => Box::new(OpenAiPlugin::new(config)),
+        };
+        vec![Box::new(ModelsPlugin), provider]
     }
 }
 
@@ -53,7 +63,11 @@ impl Config {
 
         let model = var("KARAKA_MODEL");
         let provider = var("KARAKA_PROVIDER");
-        let (provider, model) = match provider.as_deref().unwrap_or("anthropic") {
+        let provider = provider.as_deref().unwrap_or("anthropic");
+        // The provider's own name unless set, so `KARAKA_ROUTE=deepseek`
+        // only needs saying when it helps someone read the setup.
+        let route = var("KARAKA_ROUTE").unwrap_or_else(|| provider.to_owned());
+        let (provider, model) = match provider {
             "anthropic" => {
                 let api_key = var("ANTHROPIC_API_KEY").ok_or(
                     "ANTHROPIC_API_KEY is not set. The anthropic provider needs it to call the API.",
@@ -85,6 +99,7 @@ impl Config {
                     None => CacheMode::default(),
                 };
                 let config = AnthropicConfig {
+                    route,
                     api_key,
                     base_url: var("ANTHROPIC_BASE_URL"),
                     // The request carries `KARAKA_MAX_TOKENS` and
@@ -105,6 +120,7 @@ impl Config {
                      Ollama:   http://localhost:11434/v1",
                 )?;
                 let config = OpenAiConfig {
+                    route,
                     base_url,
                     api_key: var("OPENAI_API_KEY"),
                     default_effort: None,
@@ -208,6 +224,7 @@ mod tests {
         };
         assert_eq!(anthropic.api_key, "sk-test");
         assert_eq!(anthropic.base_url, None);
+        assert_eq!(config.provider.route(), "anthropic");
         assert_eq!(config.model, "claude-opus-5-5");
         assert_eq!(config.system, None);
         assert_eq!(config.max_tokens, None);
@@ -340,6 +357,37 @@ mod tests {
         assert_eq!(openai.base_url, "http://localhost:11434/v1");
         assert_eq!(openai.api_key, None);
         assert_eq!(config.model, "llama3");
+        // With no route set, the route is the provider's name.
+        assert_eq!(config.provider.route(), "openai");
+    }
+
+    #[test]
+    fn a_route_names_the_provider_it_is_set_for() {
+        let deepseek = config(&[
+            ("KARAKA_PROVIDER", "openai"),
+            ("KARAKA_ROUTE", "deepseek"),
+            ("KARAKA_MODEL", "deepseek-chat"),
+            ("OPENAI_BASE_URL", "https://api.deepseek.com"),
+        ])
+        .expect("the config reads");
+        assert_eq!(deepseek.provider.route(), "deepseek");
+
+        let team = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_ROUTE", "team")])
+            .expect("the config reads");
+        assert_eq!(team.provider.route(), "team");
+    }
+
+    #[test]
+    fn the_plugins_are_the_registry_and_the_provider() {
+        let config = config(&[("ANTHROPIC_API_KEY", "k"), ("KARAKA_ROUTE", "team")])
+            .expect("the config reads");
+        let names: Vec<String> = config
+            .provider
+            .plugins()
+            .iter()
+            .map(|plugin| plugin.name().to_owned())
+            .collect();
+        assert_eq!(names, ["models", "team"]);
     }
 
     #[test]
