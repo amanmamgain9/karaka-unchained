@@ -95,3 +95,76 @@ A cheaper halfway step is moving the file into its own package that declares
 The review proposed changing `@karaka-ai/server-auth`, the SDK and
 `delegated-access`. Under founder-game-todo's `AGENTS.md`, each of those needs
 explicit approval first. Nothing has been changed.
+
+## Audit against dsh, 2026-11-21
+
+Three read-only audits compared the kernel, the binary, the model seam,
+both providers and the session log with dsh and with what Play This Life
+actually runs. The overall verdict was that nothing is wildly off, but
+several gaps must close before Play This Life can run on the port.
+
+### The reference was the wrong dsh version
+
+The local `aug-finalizations/deepseek-harness` checkout is dsh
+**0.1.2-alpha.2** (commit `0a53fb55be`, 2026-08-30), and its session
+format is version 0. Play This Life runs the copy bundled in
+`founder-game-todo/karaka/node_modules/@karaka-ai/agent/node_modules/@deepseek-ai/`,
+which is dsh-session **0.2.1-rc.2**, with session format **v4**.
+`session-postgres` stores v4 events verbatim as JSON. From now on, check
+the bundled v4 code, or a fetched newer dsh, before porting anything that
+touches stored data.
+
+What changes in v4:
+
+- **Surface events:** there are five (system, developer, user,
+  assistant, tool result), not three.
+- **System prompt:** it is logged as surface node 0.
+- **Tool results:** they have role `tool`, with `toolCallId`, `isError`
+  and `content` at the top level.
+- **Assistant messages:** failed attempts are `assistant/attempt` events,
+  and `assistant/message` embeds the stream.
+
+### What Play This Life reads that Karaka doesn't keep yet
+
+- **Original seqs.** `agentUsage` is unique on `(playerKey, chatId,
+  eventSequence)`, and follow rejects gaps in seq. Migration needs a
+  passthrough event that keeps every original seq, so other event types
+  can't be dropped.
+- **User message `source`** (`kind`, `rpcId`). The chat client shows
+  only `kind: user`, prompt idempotency uses `rpcId`, and the tool guard
+  allows write tools only when `batchId == rpcId`.
+- **Turn, step and `tool/call` events.** The tool guard, run limits
+  (`maxSteps`, the time budget), approvals, questions, usage records, and
+  the client's `assistant:${turn}:${step}` bubble ids all depend on them.
+- **Tool result `error { name, code, reason }`.** The client shows its
+  upgrade prompt on `pro_required`.
+
+### Model seam gaps
+
+- **No thinking or effort settings on the Anthropic request.** Play
+  This Life's `pi-ai` sends `thinking: { type: adaptive, display:
+  summarized, block_binding: { prefix_mismatch_behavior: drop_block } }`
+  and the configured effort (`medium`).
+- **No prompt-cache markers.** `pi-ai` marks the system prompt, the last
+  tool and the last user block `ephemeral`.
+- **Empty blocks are not filtered** on the Anthropic request. Unsigned
+  reasoning should become text, not be dropped.
+- **Refusals and content filters count as a normal stop.** dsh treats
+  `refusal`, `sensitive` and `content_filter` as errors, and turns a stop
+  with no content into `EMPTY_RESPONSE`, which it retries.
+- **No error kind for context-window overflow.** Compaction will need it.
+
+### Kernel gaps
+
+- **Hooks.** Every Play This Life plugin wraps an ordered hook with
+  `ctx.on(event, (payload, next) => …)`: `tools/execute`,
+  `approval/request`, `agent/pre-step`, and others. They can be built as
+  typed hook-registry ports beside the kernel.
+- **Per-agent composition.** The three agent presets each get their own
+  tools, prompt and skills. main-agent's approval gate must fire only for
+  main-agent.
+- **Cleanup.** There is no `stop()`, and a failed start doesn't roll back
+  the plugins that already started. session-postgres drains its buffer on
+  dispose.
+- **A model registry.** Play This Life loads two providers at once, but
+  `dyn Model` takes only one.
