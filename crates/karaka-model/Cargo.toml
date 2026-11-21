@@ -7,8 +7,8 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# Kept tiny. Provider crates such as Anthropic's depend on this one and bring
-# their own HTTP and JSON libraries.
+# Kept small. Provider crates such as Anthropic's depend on this one and
+# bring their own HTTP and JSON libraries.
 [dependencies]
 # For the plugin that puts the model registry in a runtime. The kernel has
 # no dependencies of its own, so this adds almost nothing to the build.
@@ -18,6 +18,12 @@ futures-core.workspace = true
 # Off unless a crate asks for the `serde` feature. Providers turn it on so
 # their configs can name an `Effort`; the seam itself never needs it.
 serde = { workspace = true, optional = true }
+# Every provider needs to tell a full context window or an empty account
+# from its error message, so that reading lives here, in one place, as dsh
+# keeps it in its own model package. These two are small and have no
+# dependencies outside `regex`'s own.
+regex.workspace = true
+httpdate.workspace = true
 
 # Only for running the async tests.
 [dev-dependencies]

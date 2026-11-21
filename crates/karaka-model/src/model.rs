@@ -23,6 +23,11 @@ pub trait Model: Send + Sync {
     /// stream cancels the call. A successful stream ends with
     /// [`Event::Done`]; a failed one ends with an `Err`.
     ///
+    /// A call can fail after part of the answer has arrived. A refusal, for
+    /// one, can come after some text has streamed, and the stream then ends
+    /// in an `Err` after those deltas and blocks. They belong to a failed
+    /// call: show them if you like, but don't save them as the model's turn.
+    ///
     /// Not `async`: the stream is the asynchronous part. It owns everything
     /// it needs (`'static`), so it can outlive the borrow of `self` and move
     /// between threads.
@@ -107,6 +112,15 @@ pub struct ToolSchema {
 /// Deltas are for showing the answer as it is written. Each block also
 /// arrives whole as [`Event::Block`] once it is finished, so a caller that
 /// only wants the result can ignore the deltas.
+///
+/// A call that finishes with [`StopReason::MaxTokens`] never yields a
+/// [`ToolCall`](crate::ToolCall) block. The limit can cut a call off partway, and running a
+/// tool on arguments that may be incomplete isn't safe, so providers drop
+/// such calls, as dsh does (`llm/src/assembler.ts:131-141`). A provider
+/// that learns why the model stopped only after a call's block is finished
+/// holds that block back until it knows. It holds back the blocks after it
+/// too, so the blocks still arrive in message order. Deltas are never held
+/// back.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// More of the text block being written.
@@ -119,17 +133,31 @@ pub enum Event {
     Done { stop: StopReason, usage: Usage },
 }
 
-/// Why the model stopped writing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Why the model stopped writing, when it stopped without failing.
+///
+/// Some reasons a provider gives are failures, even when they arrive in a
+/// successful response: a refusal, a content filter, a full context window,
+/// or a reason the provider has added since this was written. Those end the
+/// call with a [`ModelError`] instead, so none of them can pass for an
+/// answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
-    /// It finished its answer.
+    /// It finished its answer, or reached a stop sequence.
     EndTurn,
     /// It wants tools to run; the results go back in the next request.
     ToolCalls,
-    /// It reached `max_tokens` before finishing.
+    /// It reached `max_tokens` before finishing. Any tool call it had
+    /// started is dropped (see [`Event`]).
     MaxTokens,
-    /// A reason only this provider has, such as a refusal, by its own name.
-    Other(String),
+    /// The provider paused a long turn of its own server-side tools, such as
+    /// Anthropic's web search, and the turn isn't over. Anthropic resumes it
+    /// when the conversation is sent back as it is.
+    ///
+    /// Karaka sends no server tools yet, so this shouldn't happen. It also
+    /// doesn't keep those tools' blocks, which resuming would need. Until it
+    /// does, treat a paused answer as unfinished, like
+    /// [`StopReason::MaxTokens`].
+    Paused,
 }
 
 /// Tokens counted for one call.
@@ -165,6 +193,12 @@ pub async fn complete(model: &dyn Model, request: Request) -> Result<Response, M
             Event::TextDelta(_) | Event::ReasoningDelta(_) => {}
             Event::Block(block) => content.push(block),
             Event::Done { stop, usage } => {
+                // Providers already drop these (see `Event`). Doing it here
+                // as well keeps the rule for any `Model`, including one
+                // written without it in mind.
+                if stop == StopReason::MaxTokens {
+                    content.retain(|block| !matches!(block, Block::ToolCall(_)));
+                }
                 return Ok(Response {
                     message: Message {
                         role: Role::Assistant,
@@ -190,6 +224,9 @@ pub struct ModelError {
     pub message: String,
     /// How long the provider asked us to wait before trying again.
     pub retry_after: Option<Duration>,
+    /// What the provider said about a refusal. Only ever set with
+    /// [`ErrorKind::Refused`], and only when the provider said anything.
+    pub refusal: Option<Refusal>,
 }
 
 impl ModelError {
@@ -198,25 +235,89 @@ impl ModelError {
             kind,
             message: message.into(),
             retry_after: None,
+            refusal: None,
         }
     }
 }
 
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind.describe(), self.message)
+        write!(f, "{}: {}", self.kind.describe(), self.message)?;
+        if let Some(category) = self.refusal.as_ref().and_then(|r| r.category.as_ref()) {
+            write!(f, " (category: {category})")?;
+        }
+        Ok(())
     }
 }
 
 impl Error for ModelError {}
 
+/// What a provider said about a refusal: why it declined, as far as it
+/// says.
+///
+/// Anthropic sends this as `stop_details`. It is for showing and logging,
+/// not for deciding what to do: Anthropic says to branch on the refusal
+/// itself, because the details can be missing even on a real refusal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Refusal {
+    /// The policy area, in the provider's words, such as `cyber` or `bio`.
+    pub category: Option<String>,
+    /// A sentence explaining the refusal, when the provider gives one.
+    pub explanation: Option<String>,
+}
+
 /// The kind of failure, which decides whether trying again can help.
+///
+/// dsh names failures with string codes. Each kind stands for these codes,
+/// and is retried as dsh's default policy retries them
+/// (`llm/src/retry-policy.ts:193-199`):
+///
+/// | Kind                    | dsh code                                       | Retryable |
+/// |-------------------------|------------------------------------------------|-----------|
+/// | `Auth`                  | `AUTH`, `INVALID_CREDENTIAL`                   | no        |
+/// | `Quota`                 | `QUOTA`                                        | no        |
+/// | `InvalidRequest`        | `INVALID_REQUEST`, `HTTP_<status>` such as 404 | no        |
+/// | `ContextWindowExceeded` | `CONTEXT_WINDOW_EXCEEDED`                      | no        |
+/// | `Refused`               | none; see below                                | no        |
+/// | `Malformed`             | `MALFORMED_RESPONSE`, `UNSUPPORTED_CONTENT`    | no        |
+/// | `EmptyResponse`         | `EMPTY_RESPONSE`                               | yes       |
+/// | `RateLimited`           | `RATE_LIMIT`                                   | yes       |
+/// | `Unavailable`           | `SERVER`                                       | yes       |
+/// | `Network`               | `TRANSPORT`, `TIMEOUT`, `STREAM_CLOSED`        | yes       |
+///
+/// Two places differ from dsh:
+///
+/// - **Refusals** have no dsh code. pi-ai reports one as a plain error, and
+///   dsh files that as `PI_AI_ERROR`, which it doesn't retry either. Karaka
+///   names it, because the loop has to keep a refused turn out of the
+///   history, and a user should hear that the model declined rather than
+///   that something broke.
+/// - **A body that ends early but cleanly** is `STREAM_CLOSED` in dsh, which
+///   it doesn't retry (`llm-retry/tests/transport-recovery.spec.ts:192`).
+///   Karaka calls it `Network`, like a dropped connection, and so retries
+///   it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     /// The credentials were missing or refused.
     Auth,
-    /// The provider rejected the request itself, for example as too long.
+    /// The account has run out of quota, balance or credit. Someone has to
+    /// pay or raise a limit before it works again.
+    Quota,
+    /// The provider rejected the request itself.
     InvalidRequest,
+    /// The conversation is too long for the model's context window. The
+    /// same request will fail again, but a shorter one may not, so whoever
+    /// compacts the conversation watches for this.
+    ContextWindowExceeded,
+    /// The model, or a filter in front of it, declined to answer. Any
+    /// [`Refusal`] details are on the error.
+    Refused,
+    /// The provider's answer couldn't be read: it broke the protocol, or
+    /// used something this version doesn't know, such as a new stop reason.
+    Malformed,
+    /// The model finished normally but wrote nothing at all. That says
+    /// nothing about the request, so trying again usually works.
+    EmptyResponse,
     /// Too many requests for now.
     RateLimited,
     /// The provider is overloaded or failed on its side.
@@ -228,13 +329,21 @@ pub enum ErrorKind {
 impl ErrorKind {
     /// Whether the same request might succeed later.
     pub fn is_retryable(self) -> bool {
-        matches!(self, Self::RateLimited | Self::Unavailable | Self::Network)
+        matches!(
+            self,
+            Self::EmptyResponse | Self::RateLimited | Self::Unavailable | Self::Network
+        )
     }
 
     fn describe(self) -> &'static str {
         match self {
             Self::Auth => "the provider refused the credentials",
+            Self::Quota => "the account is out of quota or credit",
             Self::InvalidRequest => "the provider rejected the request",
+            Self::ContextWindowExceeded => "the conversation is too long for the model",
+            Self::Refused => "the model declined to answer",
+            Self::Malformed => "the provider's answer couldn't be read",
+            Self::EmptyResponse => "the model answered with nothing",
             Self::RateLimited => "rate limited",
             Self::Unavailable => "the provider is unavailable",
             Self::Network => "the connection failed",
@@ -251,9 +360,10 @@ mod tests {
     use futures_core::Stream;
 
     use super::{
-        ErrorKind, Event, EventStream, Model, ModelError, Request, StopReason, Usage, complete,
+        ErrorKind, Event, EventStream, Model, ModelError, Refusal, Request, StopReason, Usage,
+        complete,
     };
-    use crate::{Block, Message, Role};
+    use crate::{Block, Message, Role, ToolCall};
 
     /// A model that plays back the same events on every call.
     struct Scripted(Vec<Result<Event, ModelError>>);
@@ -328,6 +438,79 @@ mod tests {
             .await
             .expect_err("the call fails");
         assert_eq!(error.kind, ErrorKind::Network);
+    }
+
+    #[tokio::test]
+    async fn complete_drops_tool_calls_from_a_max_tokens_finish() {
+        let model = Scripted(vec![
+            Ok(Event::Block(Block::Reasoning {
+                text: "look it up".into(),
+                replay: None,
+            })),
+            Ok(Event::Block(Block::Text("Let me check.".into()))),
+            Ok(Event::Block(Block::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "search".into(),
+                arguments: r#"{"query": "wea"#.into(),
+            }))),
+            Ok(Event::Done {
+                stop: StopReason::MaxTokens,
+                usage: Usage::default(),
+            }),
+        ]);
+        let response = complete(&model, request()).await.expect("the call works");
+        assert_eq!(response.stop, StopReason::MaxTokens);
+        assert_eq!(
+            response.message.content,
+            [
+                Block::Reasoning {
+                    text: "look it up".into(),
+                    replay: None,
+                },
+                Block::Text("Let me check.".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_its_category() {
+        let mut error =
+            ModelError::new(ErrorKind::Refused, "That's not something I can help with.");
+        error.refusal = Some(Refusal {
+            category: Some("cyber".into()),
+            explanation: Some("That's not something I can help with.".into()),
+        });
+        assert_eq!(
+            error.to_string(),
+            "the model declined to answer: That's not something I can help with. (category: cyber)"
+        );
+    }
+
+    /// The table on `ErrorKind`, checked: dsh's default policy retries
+    /// exactly `EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`, `TIMEOUT` and
+    /// `TRANSPORT`.
+    #[test]
+    fn only_the_kinds_dsh_retries_are_retryable() {
+        let retryable = [
+            ErrorKind::EmptyResponse,
+            ErrorKind::RateLimited,
+            ErrorKind::Unavailable,
+            ErrorKind::Network,
+        ];
+        let not_retryable = [
+            ErrorKind::Auth,
+            ErrorKind::Quota,
+            ErrorKind::InvalidRequest,
+            ErrorKind::ContextWindowExceeded,
+            ErrorKind::Refused,
+            ErrorKind::Malformed,
+        ];
+        for kind in retryable {
+            assert!(kind.is_retryable(), "{kind:?}");
+        }
+        for kind in not_retryable {
+            assert!(!kind.is_retryable(), "{kind:?}");
+        }
     }
 
     /// Compiles only if a call can move between threads, as it must on a

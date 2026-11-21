@@ -1,18 +1,21 @@
 //! [`AnthropicModel`], which sends requests to Anthropic over HTTP and reads
 //! back the streamed answer.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::stream::unfold;
-use karaka_model::{Effort, ErrorKind, Event, EventStream, Model, ModelError, Request};
+use karaka_model::{
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, parse_retry_after,
+};
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 
-use crate::decoder::{Decoder, WireError, error_kind};
+use crate::decoder::{Decoder, WireError, classify};
 use crate::request::{CacheMode, Settings, ThinkingDisplay, body};
 
 const BASE_URL: &str = "https://api.anthropic.com";
@@ -171,12 +174,15 @@ enum State {
     Finished,
 }
 
-/// An answer being read: the HTTP response, and the two stages that turn
-/// its bytes into events.
+/// An answer being read: the HTTP response, the two stages that turn its
+/// bytes into events, and the events decoded but not yet yielded.
 struct Reading {
     response: Response,
     sse: Sse,
     decoder: Decoder,
+    /// One event can decode into several, when held blocks are released at
+    /// the end, and the stream yields one at a time, so the rest wait here.
+    pending: VecDeque<Event>,
 }
 
 /// One item out of the stream, and the state to carry on from.
@@ -197,6 +203,7 @@ async fn step(state: State) -> Step {
                 response,
                 sse: Sse::default(),
                 decoder: Decoder::default(),
+                pending: VecDeque::new(),
             })
             .await
         }
@@ -205,26 +212,27 @@ async fn step(state: State) -> Step {
     }
 }
 
-/// Reads until the next event, pulling more of the body only when no
-/// complete event is waiting.
+/// Reads until the next event: first any already decoded, then any complete
+/// event waiting in the buffer, and only then more of the body.
 async fn read(mut reading: Reading) -> Step {
     loop {
-        while let Some(data) = reading.sse.next_event() {
+        if let Some(event) = reading.pending.pop_front() {
+            // `Done` is always last, so anything the server sends after it
+            // is never read.
+            let next = if matches!(event, Event::Done { .. }) {
+                State::Finished
+            } else {
+                State::Reading(reading)
+            };
+            return Some((Ok(event), next));
+        }
+        if let Some(data) = reading.sse.next_event() {
+            // Pings and the like decode into no events, and the loop goes on.
             match reading.decoder.feed(&data) {
-                // Pings and the like make no event of their own.
-                Ok(None) => {}
-                Ok(Some(event)) => {
-                    // `Done` is always last, so anything the server sends
-                    // after it is never read.
-                    let next = if matches!(event, Event::Done { .. }) {
-                        State::Finished
-                    } else {
-                        State::Reading(reading)
-                    };
-                    return Some((Ok(event), next));
-                }
+                Ok(events) => reading.pending.extend(events),
                 Err(error) => return Some((Err(error), State::Finished)),
             }
+            continue;
         }
         match reading.response.chunk().await {
             Ok(Some(chunk)) => reading.sse.push(&chunk),
@@ -243,24 +251,24 @@ async fn read(mut reading: Reading) -> Step {
 /// The error behind a response that isn't a success.
 async fn http_error(response: Response) -> ModelError {
     let status = response.status();
-    // Anthropic gives a whole number of seconds. The header may also hold a
-    // date, which isn't worth parsing here.
+    // Anthropic gives a whole number of seconds, but the header may also
+    // hold a decimal or a date.
     let retry_after = response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
-        .map(Duration::from_secs);
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
     let text = response.text().await.unwrap_or_default();
 
     // Anthropic explains a failure as `{"type": "error", "error": {...}}`.
-    // Anything else, such as a proxy's HTML page, gets the status code.
+    // Anything else, such as a proxy's HTML page, goes by the status code
+    // and the page's text.
     #[derive(Deserialize)]
     struct ErrorBody {
         error: WireError,
     }
     let mut error = match serde_json::from_str::<ErrorBody>(&text) {
-        Ok(body) => ModelError::new(error_kind(&body.error.kind), body.error.message),
+        Ok(body) => body.error.into_model_error(Some(status.as_u16())),
         Err(_) => {
             let text = text.trim();
             let message = if text.is_empty() {
@@ -268,21 +276,11 @@ async fn http_error(response: Response) -> ModelError {
             } else {
                 format!("HTTP {status}: {text}")
             };
-            ModelError::new(status_kind(status), message)
+            ModelError::new(classify(None, &message, Some(status.as_u16())), message)
         }
     };
     error.retry_after = retry_after;
     error
-}
-
-/// The kind of failure a status code means, for responses that don't say.
-fn status_kind(status: StatusCode) -> ErrorKind {
-    match status.as_u16() {
-        401..=403 => ErrorKind::Auth,
-        400 | 404 | 413 => ErrorKind::InvalidRequest,
-        429 => ErrorKind::RateLimited,
-        _ => ErrorKind::Unavailable,
-    }
 }
 
 /// An error from reqwest itself, rather than from Anthropic.

@@ -71,7 +71,7 @@ fn summary(stop: &StopReason, usage: &Usage) -> String {
         StopReason::EndTurn => "finished",
         StopReason::ToolCalls => "asked to call tools",
         StopReason::MaxTokens => "reached the token limit",
-        StopReason::Other(reason) => reason,
+        StopReason::Paused => "paused before finishing",
     };
     let mut cache = Vec::new();
     if usage.cache_read_tokens > 0 {
@@ -127,15 +127,24 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_leaves_out_an_unused_cache_and_keeps_unknown_reasons() {
+    fn the_summary_leaves_out_an_unused_cache() {
         let usage = Usage {
             input_tokens: 5,
             output_tokens: 0,
             ..Usage::default()
         };
         assert_eq!(
-            summary(&StopReason::Other("refusal".into()), &usage),
-            "stop: refusal · in 5 · out 0 tokens"
+            summary(&StopReason::MaxTokens, &usage),
+            "stop: reached the token limit · in 5 · out 0 tokens"
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_an_error_that_trying_again_wont_fix() {
+        let error = ModelError::new(ErrorKind::Refused, "Anthropic gave no explanation");
+        assert_eq!(
+            describe(&error),
+            "the model declined to answer: Anthropic gave no explanation (trying again won't help)"
         );
     }
 

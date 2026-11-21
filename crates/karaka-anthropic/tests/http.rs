@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use karaka_anthropic::{AnthropicModel, ThinkingDisplay};
-use karaka_model::{ErrorKind, Message, Model, Request, StopReason, ToolSchema, complete};
+use karaka_model::{
+    ErrorKind, Event, Message, Model, ModelError, Request, StopReason, ToolSchema, complete,
+};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -267,4 +269,113 @@ async fn nothing_is_sent_until_the_stream_is_polled() {
         item.expect_err("the server hung up").kind,
         ErrorKind::Network
     );
+}
+
+/// The error a failed response with `status`, `body` and `headers` comes
+/// back as.
+async fn failure(status: &str, headers: &[(&str, &str)], body: &str) -> ModelError {
+    let (address, _server) = serve_once(http_response(status, headers, body)).await;
+    complete(&model(address), request())
+        .await
+        .expect_err("the call fails")
+}
+
+#[tokio::test]
+async fn a_prompt_that_is_too_long_is_a_context_overflow() {
+    let error = failure(
+        "400 Bad Request",
+        &[("content-type", "application/json")],
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::ContextWindowExceeded);
+    assert_eq!(
+        error.message,
+        "prompt is too long: 213462 tokens > 200000 maximum"
+    );
+}
+
+#[tokio::test]
+async fn another_invalid_request_is_not_a_context_overflow() {
+    let error = failure(
+        "400 Bad Request",
+        &[("content-type", "application/json")],
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 200000 > 128000, which is the maximum allowed number of output tokens for claude-opus-5-5"}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
+async fn a_402_is_out_of_quota() {
+    let error = failure("402 Payment Required", &[], "").await;
+    assert_eq!(error.kind, ErrorKind::Quota);
+    assert!(!error.kind.is_retryable());
+    assert_eq!(error.message, "HTTP 402 Payment Required");
+}
+
+#[tokio::test]
+async fn a_billing_error_is_out_of_quota() {
+    let error = failure(
+        "400 Bad Request",
+        &[("content-type", "application/json")],
+        r#"{"type":"error","error":{"type":"billing_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::Quota);
+}
+
+#[tokio::test]
+async fn retry_after_can_have_a_decimal_part() {
+    let error = failure(
+        "529 Overloaded",
+        &[("content-type", "application/json"), ("retry-after", "1.5")],
+        r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::Unavailable);
+    assert_eq!(error.retry_after, Some(Duration::from_millis(1500)));
+}
+
+#[tokio::test]
+async fn a_retry_after_of_zero_asks_for_no_wait() {
+    let error = failure(
+        "429 Too Many Requests",
+        &[("content-type", "application/json"), ("retry-after", "0")],
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down."}}"#,
+    )
+    .await;
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
+async fn a_refusal_after_some_text_ends_the_stream_in_an_error() {
+    let body = sse(&[
+        START,
+        TEXT_START,
+        HEL,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"bio","explanation":null}},"usage":{"output_tokens":5}}"#,
+        r#"{"type":"message_stop"}"#,
+    ]);
+    let (address, _server) = serve_once(http_response(
+        "200 OK",
+        &[("content-type", "text/event-stream")],
+        &body,
+    ))
+    .await;
+
+    let mut stream = model(address).stream(request());
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+    }
+    // The delta and the text block went out before the refusal arrived.
+    assert_eq!(items.len(), 3, "{items:?}");
+    assert!(matches!(items[0], Ok(Event::TextDelta(_))));
+    assert!(matches!(items[1], Ok(Event::Block(_))));
+    let error = items[2].clone().expect_err("the last item is the refusal");
+    assert_eq!(error.kind, ErrorKind::Refused);
+    let category = error.refusal.and_then(|refusal| refusal.category);
+    assert_eq!(category.as_deref(), Some("bio"));
 }

@@ -192,7 +192,7 @@ async fn running_out_of_quota_is_not_a_rate_limit() {
     let error = complete(&model(address), request())
         .await
         .expect_err("the call fails");
-    assert_eq!(error.kind, ErrorKind::Auth);
+    assert_eq!(error.kind, ErrorKind::Quota);
     assert!(!error.kind.is_retryable());
     assert_eq!(error.message, "You exceeded your current quota.");
 }
@@ -271,4 +271,93 @@ async fn nothing_is_sent_until_the_stream_is_polled() {
         item.expect_err("the server hung up").kind,
         ErrorKind::Network
     );
+}
+
+/// The error a failed response with `status`, `body` and `headers` comes
+/// back as.
+async fn failure(status: &str, headers: &[(&str, &str)], body: &str) -> ModelError {
+    let (address, _server) = serve_once(http_response(status, headers, body)).await;
+    complete(&model(address), request())
+        .await
+        .expect_err("the call fails")
+}
+
+#[tokio::test]
+async fn deepseeks_insufficient_balance_is_out_of_quota() {
+    let error = failure(
+        "402 Payment Required",
+        &[("content-type", "application/json")],
+        r#"{"error":{"message":"Insufficient Balance","type":"unknown_error","param":null,"code":"invalid_request_error"}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::Quota);
+    assert!(!error.kind.is_retryable());
+    assert_eq!(error.message, "Insufficient Balance");
+}
+
+#[tokio::test]
+async fn a_context_length_error_is_a_context_overflow() {
+    let error = failure(
+        "400 Bad Request",
+        &[("content-type", "application/json")],
+        r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70000 tokens.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::ContextWindowExceeded);
+    assert!(!error.kind.is_retryable());
+}
+
+#[tokio::test]
+async fn another_bad_request_is_not_a_context_overflow() {
+    let error = failure(
+        "400 Bad Request",
+        &[("content-type", "application/json")],
+        r#"{"error":{"message":"invalid input: temperature exceeds maximum allowed value","type":"invalid_request_error","code":null}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+}
+
+#[tokio::test]
+async fn a_404_is_not_retried() {
+    let error = failure("404 Not Found", &[], "").await;
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    assert!(!error.kind.is_retryable());
+    assert_eq!(error.message, "HTTP 404 Not Found");
+}
+
+#[tokio::test]
+async fn retry_after_can_have_a_decimal_part() {
+    let error = failure(
+        "503 Service Unavailable",
+        &[("retry-after", "0.25")],
+        "busy",
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::Unavailable);
+    assert_eq!(error.retry_after, Some(Duration::from_millis(250)));
+}
+
+#[tokio::test]
+async fn a_retry_after_that_isnt_a_wait_is_ignored() {
+    let error = failure(
+        "429 Too Many Requests",
+        &[("retry-after", "soon")],
+        r#"{"error":{"message":"Slow down."}}"#,
+    )
+    .await;
+    assert_eq!(error.kind, ErrorKind::RateLimited);
+    assert_eq!(error.retry_after, None);
+}
+
+#[tokio::test]
+async fn a_content_filter_ends_the_stream_in_a_refusal() {
+    let filter = r#"{"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}"#;
+    let (address, _server) = serve_once(streamed(&[HEL, filter, "[DONE]"])).await;
+
+    let items = drain(&model(address)).await;
+    // The delta that arrived is passed on, then the refusal ends the stream.
+    assert_eq!(items.len(), 2, "{items:?}");
+    let error = items[1].clone().expect_err("the last item is the refusal");
+    assert_eq!(error.kind, ErrorKind::Refused);
 }

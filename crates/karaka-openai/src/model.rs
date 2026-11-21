@@ -4,16 +4,18 @@
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures_util::stream::unfold;
-use karaka_model::{Effort, ErrorKind, Event, EventStream, Model, ModelError, Request};
+use karaka_model::{
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, parse_retry_after,
+};
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
-use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Response};
 use serde::Deserialize;
 
-use crate::decoder::{Decoder, WireError};
+use crate::decoder::{Decoder, WireError, classify};
 use crate::request::{MaxTokensField, Settings, body};
 
 /// A [`Model`] backed by an OpenAI-compatible Chat Completions API.
@@ -235,14 +237,12 @@ async fn read(mut reading: Reading) -> Step {
 /// The error behind a response that isn't a success.
 async fn http_error(response: Response) -> ModelError {
     let status = response.status();
-    // A whole number of seconds. The header may also hold a date, which
-    // isn't worth parsing here.
+    // Seconds, perhaps with a decimal part, or a date.
     let retry_after = response
         .headers()
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse().ok())
-        .map(Duration::from_secs);
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
     let text = response.text().await.unwrap_or_default();
 
     // OpenAI-style servers explain a failure as `{"error": {...}}`. Anything
@@ -255,13 +255,11 @@ async fn http_error(response: Response) -> ModelError {
         .ok()
         .map(|body| body.error);
 
-    // An account out of credit often comes back as 429, but waiting won't
-    // fix it, so it isn't a rate limit.
-    let kind = if wire.as_ref().is_some_and(WireError::is_out_of_quota) {
-        ErrorKind::Auth
-    } else {
-        status_kind(status)
-    };
+    // Without the error JSON, the body's text is all there is to read.
+    let detail = wire
+        .as_ref()
+        .map_or_else(|| text.clone(), WireError::detail);
+    let kind = classify(&detail, Some(status.as_u16()));
     let message = match wire.and_then(|wire| wire.message) {
         Some(message) => message,
         None => {
@@ -276,19 +274,6 @@ async fn http_error(response: Response) -> ModelError {
     let mut error = ModelError::new(kind, message);
     error.retry_after = retry_after;
     error
-}
-
-/// The kind of failure a status code means. The body's error types differ
-/// from server to server, so the status is what decides.
-fn status_kind(status: StatusCode) -> ErrorKind {
-    match status.as_u16() {
-        // 402 is DeepSeek's "insufficient balance": like a missing key,
-        // nothing changes until someone acts.
-        401..=403 => ErrorKind::Auth,
-        400 | 404 | 413 | 422 => ErrorKind::InvalidRequest,
-        429 => ErrorKind::RateLimited,
-        _ => ErrorKind::Unavailable,
-    }
 }
 
 /// An error from reqwest itself, rather than from the server.

@@ -27,6 +27,11 @@ futures-util = { version = "0.3", default-features = false }
 # servers prefer. The body is read with `Response::chunk`, so the `stream`
 # feature isn't needed.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# For reading providers' error messages. No `perf` feature: it speeds up
+# large searches with two more crates, and these messages are a line long.
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+# Reads the HTTP date a `Retry-After` header can hold. No dependencies.
+httpdate = "1"
 
 # The workspace's own crates, so each one names its siblings the same way.
 karaka-kernel = { path = "crates/karaka-kernel" }

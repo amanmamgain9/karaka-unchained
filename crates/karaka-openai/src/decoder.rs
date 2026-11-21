@@ -6,7 +6,10 @@
 
 use std::collections::BTreeMap;
 
-use karaka_model::{Block, ErrorKind, Event, ModelError, StopReason, ToolCall, Usage};
+use karaka_model::{
+    Block, ErrorKind, Event, ModelError, StopReason, ToolCall, Usage, is_context_overflow,
+    is_out_of_quota,
+};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -46,22 +49,28 @@ impl Decoder {
     /// finished block and then [`Event::Done`] at once. Most chunks give one
     /// event or none, and an empty `Vec` costs no allocation.
     ///
-    /// An error payload, or JSON that doesn't fit, ends the call with an
-    /// `Err`.
+    /// An error payload, a finish reason that isn't a finished answer, or
+    /// JSON that doesn't fit ends the call with an `Err`.
     pub(crate) fn feed(&mut self, data: &str) -> Result<Vec<Event>, ModelError> {
         if data == DONE {
+            // pi-ai fails a stream that ends without a finish reason
+            // (`api/openai-completions.js:484-486`), and dsh counts that
+            // as a connection failure (`llm-pi-ai/src/stream.ts:58`), as
+            // `end_of_body` does.
             let stop = self.stop.take().ok_or_else(|| {
                 ModelError::new(
-                    ErrorKind::Unavailable,
+                    ErrorKind::Network,
                     "the server finished without saying why the model stopped",
                 )
             })?;
-            return Ok(self.finish(stop));
+            return self.finish(stop);
         }
 
+        // A chunk that can't be read is malformed, as llm-deepseek calls it
+        // (`sse.ts:18-19`).
         let chunk: WireChunk = serde_json::from_str(data).map_err(|error| {
             ModelError::new(
-                ErrorKind::Unavailable,
+                ErrorKind::Malformed,
                 format!("the server sent a chunk that couldn't be read: {error}"),
             )
         })?;
@@ -76,7 +85,7 @@ impl Decoder {
             }
             // Some servers send `""` rather than `null` until the end.
             if let Some(reason) = choice.finish_reason.filter(|reason| !reason.is_empty()) {
-                self.stop = Some(stop_reason(reason));
+                self.stop = Some(stop_reason(&reason)?);
             }
         }
         // Usage usually comes in a last chunk of its own, with no choices.
@@ -100,7 +109,7 @@ impl Decoder {
                 "the stream ended before the model finished",
             )
         })?;
-        Ok(self.finish(stop))
+        self.finish(stop)
     }
 
     fn delta(&mut self, delta: Delta, events: &mut Vec<Event>) {
@@ -148,7 +157,10 @@ impl Decoder {
 
     /// The finished blocks, then [`Event::Done`]. Reasoning comes before the
     /// text it led to, and tool calls come last, in index order.
-    fn finish(&mut self, stop: StopReason) -> Vec<Event> {
+    ///
+    /// Fails with [`ErrorKind::EmptyResponse`] on a normal stop with no
+    /// blocks at all.
+    fn finish(&mut self, stop: StopReason) -> Result<Vec<Event>, ModelError> {
         let mut events = Vec::new();
         let reasoning = std::mem::take(&mut self.reasoning);
         if !reasoning.is_empty() {
@@ -163,7 +175,15 @@ impl Decoder {
         if !text.is_empty() {
             events.push(Event::Block(Block::Text(text)));
         }
-        for (index, call) in std::mem::take(&mut self.tool_calls) {
+        let mut tool_calls = std::mem::take(&mut self.tool_calls);
+        // The limit can cut a call's arguments off partway, so a call from a
+        // `length` finish never goes out, as dsh drops it
+        // (`llm/src/assembler.ts:137-141`). Everything arrives only now, so
+        // nothing has to be held back to do this.
+        if stop == StopReason::MaxTokens {
+            tool_calls.clear();
+        }
+        for (index, call) in tool_calls {
             events.push(Event::Block(Block::ToolCall(ToolCall {
                 // The result has to name the call it answers, so a call the
                 // server gave no id gets one that is unique in this answer.
@@ -181,40 +201,105 @@ impl Decoder {
                 },
             })));
         }
+        // A finished answer with nothing in it would end the turn with
+        // nothing to show or act on, so dsh retries it instead
+        // (`llm-pi-ai/src/stream.ts:96-107`). Any block counts, so an
+        // answer that is only reasoning is kept.
+        if stop == StopReason::EndTurn && events.is_empty() {
+            return Err(ModelError::new(
+                ErrorKind::EmptyResponse,
+                "the server finished an answer with no content",
+            ));
+        }
         events.push(Event::Done {
             stop,
             usage: self.usage,
         });
-        events
+        Ok(events)
     }
 }
 
-fn stop_reason(reason: String) -> StopReason {
-    match reason.as_str() {
-        "stop" => StopReason::EndTurn,
+/// What a finish reason means, mapped as pi-ai maps it
+/// (`api/openai-completions.js:1192-1214`). Only some reasons are an answer.
+/// The others fail the call.
+fn stop_reason(reason: &str) -> Result<StopReason, ModelError> {
+    match reason {
+        // `end` is what some servers send for `stop`.
+        "stop" | "end" => Ok(StopReason::EndTurn),
         // `function_call` is the name from before parallel tool calls.
-        "tool_calls" | "function_call" => StopReason::ToolCalls,
-        "length" => StopReason::MaxTokens,
-        // `content_filter`, DeepSeek's `insufficient_system_resource`, and
-        // whatever comes next keep their own name. The loop runs tools only
-        // on `ToolCalls`, which matters: a filter can cut a call off halfway.
-        _ => StopReason::Other(reason),
+        "tool_calls" | "function_call" => Ok(StopReason::ToolCalls),
+        "length" => Ok(StopReason::MaxTokens),
+        "content_filter" => Err(ModelError::new(
+            ErrorKind::Refused,
+            "the server's content filter stopped the answer",
+        )),
+        // pi-ai fails the call, and dsh files its message as a connection
+        // failure (`llm-pi-ai/src/stream.ts:59`).
+        "network_error" => Err(ModelError::new(
+            ErrorKind::Network,
+            "the server lost its connection to the model",
+        )),
+        // DeepSeek's documented reason for running out of capacity partway.
+        // pi-ai would fail it as unknown, which dsh doesn't retry; Karaka
+        // calls it what it is, a failure on the server's side.
+        "insufficient_system_resource" => Err(ModelError::new(
+            ErrorKind::Unavailable,
+            "the server ran out of capacity before the model finished",
+        )),
+        // z.ai's `model_context_window_exceeded`, which pi-ai's overflow
+        // patterns know (`utils/overflow.js:55`).
+        _ if is_context_overflow(reason) => Err(ModelError::new(
+            ErrorKind::ContextWindowExceeded,
+            format!("the server stopped with `{reason}`"),
+        )),
+        // Unknown reasons used to keep their name, as a normal stop, so a
+        // new one wouldn't break anything. But then a new kind of failure
+        // would pass for an answer. pi-ai fails the call instead, and so
+        // does Karaka now.
+        _ => Err(ModelError::new(
+            ErrorKind::Malformed,
+            format!("the server stopped for a reason Karaka doesn't know: {reason}"),
+        )),
     }
 }
 
-/// An error sent in place of a chunk. The server had already accepted the
-/// request, so the failure is on its side, unless the account has run out
-/// of credit, which waiting won't fix.
+/// An error sent in place of a chunk.
 fn stream_error(error: WireError) -> ModelError {
-    let kind = if error.is_out_of_quota() {
-        ErrorKind::Auth
-    } else {
-        ErrorKind::Unavailable
-    };
+    let kind = classify(&error.detail(), None);
     let message = error
         .message
         .unwrap_or_else(|| "the server sent an error with no message".into());
     ModelError::new(kind, message)
+}
+
+/// The kind of failure behind an error: from what the server said, and the
+/// HTTP status when it came as a failed response (`None` when it came in
+/// the stream).
+///
+/// Servers differ in their error types, so the status decides. The text is
+/// read only for what no status says: an account out of credit, which can
+/// come back as 429 but isn't a rate limit, and a conversation too long for
+/// the model, which comes back as a plain 400. The checks run in
+/// llm-deepseek's order (`transport.ts:28-35`).
+pub(crate) fn classify(detail: &str, status: Option<u16>) -> ErrorKind {
+    if matches!(status, Some(401 | 403)) {
+        ErrorKind::Auth
+    } else if status == Some(402) || is_out_of_quota(detail) {
+        // 402 is DeepSeek's "Insufficient Balance".
+        ErrorKind::Quota
+    } else if status == Some(429) {
+        ErrorKind::RateLimited
+    } else if is_context_overflow(detail) {
+        ErrorKind::ContextWindowExceeded
+    } else if status.is_none_or(|status| status >= 500) {
+        // A 5xx, or an error in the stream after the server had accepted
+        // the request.
+        ErrorKind::Unavailable
+    } else {
+        // 400, 404, 413, 422 and every other status. dsh calls the ones it
+        // doesn't name `HTTP_<status>`, and doesn't retry them.
+        ErrorKind::InvalidRequest
+    }
 }
 
 // What the server sends. Only the fields Karaka reads are declared; serde
@@ -309,11 +394,15 @@ pub(crate) struct WireError {
 }
 
 impl WireError {
-    /// Whether the account is out of credit. OpenAI says so in both `type`
-    /// and `code`.
-    pub(crate) fn is_out_of_quota(&self) -> bool {
+    /// The code, type and message joined, which is all the text that
+    /// [`classify`] reads, as llm-deepseek joins them (`transport.ts:27`).
+    pub(crate) fn detail(&self) -> String {
         let code = self.code.as_ref().and_then(Value::as_str);
-        [self.kind.as_deref(), code].contains(&Some("insufficient_quota"))
+        [code, self.kind.as_deref(), self.message.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -330,7 +419,7 @@ where
 mod tests {
     use karaka_model::{Block, ErrorKind, Event, ModelError, StopReason, ToolCall, Usage};
 
-    use super::Decoder;
+    use super::{Decoder, classify};
 
     /// Feeds every chunk and keeps what comes out.
     fn decode(chunks: &[&str]) -> Result<Vec<Event>, ModelError> {
@@ -341,6 +430,27 @@ mod tests {
         }
         Ok(out)
     }
+
+    /// Feeds chunks until one fails, and gives back what came out before
+    /// the failure, and the failure. As a stream does, a caller sees both.
+    fn decode_until_error(chunks: &[&str]) -> (Vec<Event>, ModelError) {
+        let mut decoder = Decoder::default();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            match decoder.feed(chunk) {
+                Ok(more) => out.extend(more),
+                Err(error) => return (out, error),
+            }
+        }
+        panic!("expected a failure, got {out:?}");
+    }
+
+    /// A chunk that finishes with `reason` and carries nothing else.
+    fn finish(reason: &str) -> String {
+        format!(r#"{{"choices":[{{"index":0,"delta":{{}},"finish_reason":"{reason}"}}]}}"#)
+    }
+
+    const HI: &str = r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
 
     /// The `Done` at the end of `events`, which must be there.
     fn done(events: &[Event]) -> (&StopReason, &Usage) {
@@ -510,14 +620,13 @@ mod tests {
         assert_eq!(error.kind, ErrorKind::Network);
     }
 
+    /// pi-ai fails a stream that ends with no finish reason, and dsh files
+    /// that as a connection failure. Its test "maps pi-ai transport wording"
+    /// (`llm-pi-ai/tests/convert.spec.ts`) has a case for it.
     #[test]
     fn done_without_a_finish_reason_is_an_error() {
-        let error = decode(&[
-            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
-            "[DONE]",
-        ])
-        .expect_err("the call fails");
-        assert_eq!(error.kind, ErrorKind::Unavailable);
+        let error = decode(&[HI, "[DONE]"]).expect_err("the call fails");
+        assert_eq!(error.kind, ErrorKind::Network);
     }
 
     #[test]
@@ -533,17 +642,164 @@ mod tests {
     }
 
     #[test]
-    fn unknown_reasons_keep_their_name() {
+    fn an_unknown_finish_reason_is_malformed() {
+        let (_, error) = decode_until_error(&[HI, &finish("mystery"), "[DONE]"]);
+        assert_eq!(error.kind, ErrorKind::Malformed);
+        assert!(!error.kind.is_retryable());
+        assert!(error.message.contains("mystery"), "{error}");
+    }
+
+    #[test]
+    fn deepseek_running_out_of_capacity_is_unavailable() {
+        let (_, error) =
+            decode_until_error(&[HI, &finish("insufficient_system_resource"), "[DONE]"]);
+        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert!(error.kind.is_retryable());
+    }
+
+    /// The text that streamed before the filter stopped the answer has gone
+    /// out, but the call ends in an `Err`, so nothing takes it for the
+    /// answer.
+    #[test]
+    fn a_content_filter_is_a_refusal() {
+        let (events, error) = decode_until_error(&[HI, &finish("content_filter"), "[DONE]"]);
+        assert_eq!(events, [Event::TextDelta("hi".into())]);
+        assert_eq!(error.kind, ErrorKind::Refused);
+        assert!(!error.kind.is_retryable());
+    }
+
+    #[test]
+    fn a_full_context_window_as_a_finish_reason_is_an_overflow() {
+        let (_, error) =
+            decode_until_error(&[HI, &finish("model_context_window_exceeded"), "[DONE]"]);
+        assert_eq!(error.kind, ErrorKind::ContextWindowExceeded);
+    }
+
+    #[test]
+    fn end_is_a_normal_stop() {
+        let events = decode(&[HI, &finish("end"), "[DONE]"]).expect("the stream decodes");
+        assert_eq!(done(&events).0, &StopReason::EndTurn);
+    }
+
+    /// dsh's "classifies a completed stop with no content as an
+    /// EMPTY_RESPONSE error" (`llm-pi-ai/tests/convert.spec.ts`).
+    #[test]
+    fn a_completed_stop_with_no_content_is_an_empty_response() {
+        let (_, error) = decode_until_error(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+            &finish("stop"),
+            "[DONE]",
+        ]);
+        assert_eq!(error.kind, ErrorKind::EmptyResponse);
+        assert!(error.kind.is_retryable());
+    }
+
+    /// dsh's "keeps a thinking-only stop successful (any block counts as
+    /// content)" (`llm-pi-ai/tests/convert.spec.ts`).
+    #[test]
+    fn a_thinking_only_stop_stays_successful() {
         let events = decode(&[
-            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"insufficient_system_resource"}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"mull"},"finish_reason":null}]}"#,
+            &finish("stop"),
+            "[DONE]",
+        ])
+        .expect("the stream decodes");
+        assert_eq!(
+            events[1],
+            Event::Block(Block::Reasoning {
+                text: "mull".into(),
+                replay: None,
+            })
+        );
+        assert_eq!(done(&events).0, &StopReason::EndTurn);
+    }
+
+    /// dsh's assembler drops "the tool calls a max-tokens finish drops"
+    /// (`llm/tests/assembler.spec.ts`), and keeps what came before them.
+    #[test]
+    fn a_max_tokens_finish_drops_a_cut_off_tool_call() {
+        let events = decode(&[
+            r#"{"choices":[{"index":0,"delta":{"reasoning_content":"search"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"Looking."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"search","arguments":"{\"query\": \"wea"}}]},"finish_reason":null}]}"#,
+            &finish("length"),
             "[DONE]",
         ])
         .expect("the stream decodes");
 
         assert_eq!(
-            done(&events).0,
-            &StopReason::Other("insufficient_system_resource".into())
+            events[2..4],
+            [
+                Event::Block(Block::Reasoning {
+                    text: "search".into(),
+                    replay: None,
+                }),
+                Event::Block(Block::Text("Looking.".into())),
+            ]
         );
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(done(&events).0, &StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn a_mid_stream_quota_error_is_out_of_quota() {
+        let (_, error) = decode_until_error(&[
+            HI,
+            r#"{"error":{"message":"You exceeded your current quota.","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+        ]);
+        assert_eq!(error.kind, ErrorKind::Quota);
+    }
+
+    /// dsh's "recognizes context-capacity details independently of the HTTP
+    /// status" (`llm-deepseek/tests/runtime.spec.ts`), and the statuses in
+    /// its "classifies status ... and error ..." (`stream.spec.ts`).
+    #[test]
+    fn only_context_capacity_details_are_an_overflow() {
+        assert_eq!(
+            classify("request too large for model context", Some(400)),
+            ErrorKind::ContextWindowExceeded
+        );
+        assert_eq!(
+            classify("context_length_exceeded", Some(413)),
+            ErrorKind::ContextWindowExceeded
+        );
+        assert_eq!(
+            classify("maximum context length exceeded", Some(400)),
+            ErrorKind::ContextWindowExceeded
+        );
+        assert_eq!(
+            classify(
+                "invalid input: temperature exceeds maximum allowed value",
+                Some(400)
+            ),
+            ErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn statuses_map_as_in_dsh() {
+        let cases = [
+            (401, ErrorKind::Auth),
+            (403, ErrorKind::Auth),
+            (402, ErrorKind::Quota),
+            (429, ErrorKind::RateLimited),
+            (400, ErrorKind::InvalidRequest),
+            (413, ErrorKind::InvalidRequest),
+            (422, ErrorKind::InvalidRequest),
+            // dsh's `HTTP_404` and `HTTP_418`, which it doesn't retry.
+            (404, ErrorKind::InvalidRequest),
+            (418, ErrorKind::InvalidRequest),
+            (500, ErrorKind::Unavailable),
+            (503, ErrorKind::Unavailable),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(classify("", Some(status)), expected, "{status}");
+        }
+        assert_eq!(
+            classify("insufficient balance", Some(400)),
+            ErrorKind::Quota
+        );
+        assert_eq!(classify("", None), ErrorKind::Unavailable);
     }
 
     #[test]
@@ -567,7 +823,7 @@ mod tests {
     #[test]
     fn json_that_doesnt_fit_is_an_error() {
         let error = decode(&[r#"{"choices": "nope"}"#]).expect_err("the call fails");
-        assert_eq!(error.kind, ErrorKind::Unavailable);
+        assert_eq!(error.kind, ErrorKind::Malformed);
         assert!(error.message.contains("couldn't be read"), "{error}");
     }
 }

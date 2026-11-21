@@ -9,11 +9,16 @@ mod message;
 mod model;
 mod plugin;
 mod registry;
+mod retry_after;
+mod wording;
 
 pub use message::{Block, Message, Role, ToolCall, ToolResult};
 pub use model::{
-    Effort, ErrorKind, Event, EventStream, Model, ModelError, Request, Response, StopReason,
-    ToolSchema, Usage, complete,
+    Effort, ErrorKind, Event, EventStream, Model, ModelError, Refusal, Request, Response,
+    StopReason, ToolSchema, Usage, complete,
 };
 pub use plugin::ModelsPlugin;
 pub use registry::{ModelRegistry, RegistryError};
+// Helpers for provider crates, which all read failures the same way.
+pub use retry_after::parse_retry_after;
+pub use wording::{is_context_overflow, is_out_of_quota};
