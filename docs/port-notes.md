@@ -168,3 +168,29 @@ What changes in v4:
   dispose.
 - **A model registry.** Play This Life loads two providers at once, but
   `dyn Model` takes only one.
+
+### Fixed since the audit
+
+- Fixed in `f4afc9e`:
+  - **Effort, thinking and prompt caching.** Effort is a neutral
+    `Request.effort`. Anthropic sends adaptive thinking with `display` and
+    `block_binding` (behind the `thinking-binding-controls-2026-08-01`
+    beta header) and cache markers where pi-ai puts them.
+  - **Empty blocks.** They are filtered on the Anthropic request.
+- **Several providers at once.** Fixed in `71f4977`: the `ModelRegistry`
+  port holds one model per route, so two providers, or two
+  OpenAI-compatible servers, can run side by side. Two plugins with the
+  same route are caught by the kernel's duplicate-name check before
+  either starts.
+- **Real calls work.** Made 2026-11-21: Anthropic `claude-opus-5-5` with
+  every new setting on; DeepSeek `deepseek-chat` and `deepseek-reasoner`
+  through the OpenAI-compatible provider.
+
+Still open from the audit:
+
+- **Errors that look like success.** Refusals, content filters and
+  empty responses still count as a normal stop.
+- **Context-window overflow.** It has no error kind of its own.
+- **Kernel gaps.** Hooks, per-agent composition and cleanup.
+- **The session v4 work.** Everything listed above under session
+  format v4.
