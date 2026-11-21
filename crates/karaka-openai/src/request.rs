@@ -11,10 +11,17 @@
 //! - Content is one string per message, not a list of blocks.
 //! - Tool results are messages of their own, with the role `tool`.
 //!
+//! System and developer messages from later in the history are folded into
+//! the system prompt, unless the config says the model takes them in place.
+//! pi-ai does the same (`api/openai-completions.js:868-869,910-921`), and it
+//! too folds them unless it knows the model takes them.
+//!
 //! Like the Anthropic provider, it leaves out a message whose text is empty
 //! or only whitespace and that has nothing else in it. Some servers refuse
 //! such messages, and a conversation that came from another provider can
 //! hold them.
+
+use std::borrow::Cow;
 
 use karaka_model::{
     Block, Effort, ErrorKind, Message, ModelError, Request, Role, ToolCall, ToolResult,
@@ -31,6 +38,8 @@ pub(crate) struct Settings {
     /// DeepSeek's switch for thinking. `None` sends no switch.
     pub thinking: Option<bool>,
     pub max_tokens_field: MaxTokensField,
+    /// Whether later system and developer messages go out in place.
+    pub system_messages_in_history: bool,
 }
 
 /// Which field carries a request's `max_tokens`.
@@ -92,7 +101,8 @@ struct StreamOptions {
 #[serde(tag = "role", rename_all = "snake_case")]
 enum WireMessage<'a> {
     System {
-        content: &'a str,
+        /// Owned when several texts were joined into it.
+        content: Cow<'a, str>,
     },
     User {
         content: String,
@@ -183,20 +193,35 @@ pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body
         ));
     }
 
+    let mut history = Vec::new();
+    // System and developer messages folded into the system prompt.
+    let mut folded = Vec::new();
+    for message in &request.messages {
+        match message.role {
+            Role::User => user(message, &mut history),
+            Role::Assistant => history.extend(assistant(message)),
+            Role::System | Role::Developer => {
+                let text = instruction_text(message);
+                // pi-ai skips only empty text; text that is only whitespace
+                // is skipped here too, as it is everywhere in this module.
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if settings.system_messages_in_history {
+                    history.push(WireMessage::System { content: text });
+                } else {
+                    folded.push(text);
+                }
+            }
+        }
+    }
     let mut messages = Vec::new();
-    if let Some(system) = request
-        .system
-        .as_deref()
-        .filter(|text| !text.trim().is_empty())
+    if let Some(system) =
+        system_prompt(request.system.as_deref(), folded).filter(|text| !text.trim().is_empty())
     {
         messages.push(WireMessage::System { content: system });
     }
-    for message in &request.messages {
-        match message.role {
-            Role::User => user(message, &mut messages),
-            Role::Assistant => messages.extend(assistant(message)),
-        }
-    }
+    messages.append(&mut history);
 
     let (max_tokens, max_completion_tokens) = match settings.max_tokens_field {
         MaxTokensField::MaxTokens => (request.max_tokens, None),
@@ -217,6 +242,39 @@ pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body
             include_usage: true,
         },
     })
+}
+
+/// The text of a system or developer message: its text blocks joined with
+/// a newline, as pi-ai's `contentText` joins them (`utils/text.js:2-9`).
+fn instruction_text(message: &Message) -> Cow<'_, str> {
+    let texts: Vec<&str> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    match texts.as_slice() {
+        [one] => Cow::Borrowed(one),
+        _ => Cow::Owned(texts.join("\n")),
+    }
+}
+
+/// The system prompt: the request's own, then each folded instruction, the
+/// non-empty ones joined with a blank line, as pi-ai folds them
+/// (`utils/transcript.js:58-86`).
+fn system_prompt<'a>(system: Option<&'a str>, folded: Vec<Cow<'a, str>>) -> Option<Cow<'a, str>> {
+    if folded.is_empty() {
+        return system.map(Cow::Borrowed);
+    }
+    let parts: Vec<Cow<'a, str>> = system
+        .map(Cow::Borrowed)
+        .into_iter()
+        .chain(folded)
+        .filter(|part| !part.is_empty())
+        .collect();
+    Some(Cow::Owned(parts.join("\n\n")))
 }
 
 /// The name each server family uses for an effort level, as
@@ -298,6 +356,13 @@ fn tool_message(result: &ToolResult) -> WireMessage<'_> {
 /// format, where reasoning goes back as thinking blocks (see
 /// `karaka-anthropic`'s DeepSeek profile). A message with no reasoning gets
 /// no field.
+///
+/// Where the reasoning came from doesn't matter here, and any replay data
+/// on it is never sent: Chat Completions has no signatures. pi-ai differs.
+/// It sends reasoning from another model as plain text in `content`
+/// (`transform-messages.js:82-90`), and puts an empty `reasoning_content`
+/// on DeepSeek's messages instead (`openai-completions.js:1044-1048`).
+/// Karaka keeps the text where the model can read it as reasoning.
 ///
 /// `content` is `""` when there's no text, never `null`, even beside tool
 /// calls: some gateways refuse `null`, and DeepSeek refuses it on a message
@@ -751,6 +816,123 @@ mod tests {
         assert_eq!(
             to_json(&request)["messages"],
             json!([{"role": "user", "content": "hi"}])
+        );
+    }
+
+    // System and developer messages.
+
+    fn developer(texts: &[&str]) -> Message {
+        Message {
+            role: Role::Developer,
+            content: texts
+                .iter()
+                .map(|text| Block::Text((*text).into()))
+                .collect(),
+        }
+    }
+
+    fn answer(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![Block::Text(text.into())],
+        }
+    }
+
+    /// The test the brief asks for: system "A", user, assistant, system
+    /// "B", user. Unless the config says otherwise, "B" is folded into the
+    /// prompt after "A", as pi-ai folds it for a model it doesn't know
+    /// takes system messages (`utils/transcript.js:96-104`).
+    #[test]
+    fn a_later_system_message_is_folded_into_the_prompt_by_default() {
+        let mut request = Request::new(
+            "gpt-test",
+            vec![
+                Message::user("first"),
+                answer("one"),
+                Message::system("B"),
+                Message::user("second"),
+            ],
+        );
+        request.system = Some("A".into());
+        assert_eq!(
+            to_json(&request),
+            json!({
+                "model": "gpt-test",
+                "messages": [
+                    {"role": "system", "content": "A\n\nB"},
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one"},
+                    {"role": "user", "content": "second"}
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
+        );
+    }
+
+    /// With the setting on, "B" keeps its place, as pi-ai sends a later
+    /// system message for a model that takes them
+    /// (`openai-completions.js:910-921`).
+    #[test]
+    fn a_later_system_message_goes_in_place_when_the_config_says_so() {
+        let settings = Settings {
+            system_messages_in_history: true,
+            ..Settings::default()
+        };
+        let mut request = Request::new(
+            "gpt-test",
+            vec![
+                Message::user("first"),
+                answer("one"),
+                Message::system("B"),
+                Message::user("second"),
+            ],
+        );
+        request.system = Some("A".into());
+        assert_eq!(
+            json_with(&request, &settings),
+            json!({
+                "model": "gpt-test",
+                "messages": [
+                    {"role": "system", "content": "A"},
+                    {"role": "user", "content": "first"},
+                    {"role": "assistant", "content": "one"},
+                    {"role": "system", "content": "B"},
+                    {"role": "user", "content": "second"}
+                ],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            })
+        );
+    }
+
+    /// Developer messages go the same way, their text blocks joined with a
+    /// newline. Blank ones are left out.
+    #[test]
+    fn developer_messages_go_in_place_or_into_the_prompt() {
+        let history = vec![
+            Message::user("hi"),
+            developer(&["first", "second"]),
+            developer(&[" "]),
+            Message::system(""),
+        ];
+        assert_eq!(
+            to_json(&Request::new("gpt-test", history.clone()))["messages"],
+            json!([
+                {"role": "system", "content": "first\nsecond"},
+                {"role": "user", "content": "hi"}
+            ])
+        );
+        let settings = Settings {
+            system_messages_in_history: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            json_with(&Request::new("gpt-test", history), &settings)["messages"],
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "first\nsecond"}
+            ])
         );
     }
 }

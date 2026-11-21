@@ -12,7 +12,7 @@ mod registry;
 mod retry_after;
 mod wording;
 
-pub use message::{Block, Message, Role, ToolCall, ToolResult};
+pub use message::{Block, Message, Origin, Replay, Role, ToolCall, ToolResult};
 pub use model::{
     Effort, ErrorKind, Event, EventStream, Model, ModelError, Refusal, Request, Response,
     StopReason, ToolSchema, Usage, complete,

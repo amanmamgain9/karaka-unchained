@@ -220,7 +220,7 @@ impl AnthropicModel {
     /// A decoder for the answer to `request`.
     fn decoder(&self, request: &Request) -> Decoder {
         match self.settings {
-            ProfileSettings::Anthropic(_) => Decoder::default(),
+            ProfileSettings::Anthropic(_) => Decoder::anthropic(request.model.clone()),
             ProfileSettings::DeepSeek(_) => Decoder::deepseek(request.model.clone()),
         }
     }

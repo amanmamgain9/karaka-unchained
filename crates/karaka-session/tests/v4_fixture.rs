@@ -10,10 +10,10 @@
 //! finished (one failed with `pro_required`), the final answer, and an
 //! ignorable plugin record.
 
-use karaka_model::{Block, Message, Role, ToolCall, ToolResult};
+use karaka_model::{Block, Message, Origin, Replay, Role, ToolCall, ToolResult};
 use karaka_session::{
-    ContextSection, Entry, Seq, SessionEvent, SessionId, SessionLog, SessionStore, TurnEndReason,
-    UserSource,
+    AssistantMessage, ContextSection, Entry, Seq, SessionEvent, SessionId, SessionLog,
+    SessionStore, TurnEndReason, UserSource,
 };
 use serde_json::Value;
 
@@ -184,7 +184,12 @@ fn the_log_derives_the_expected_history() {
                 content: vec![
                     Block::Reasoning {
                         text: "Two zones, two calls.".into(),
-                        replay: Some("sig-fixture-1".into()),
+                        // The origin comes from the replay state's
+                        // `response` half.
+                        replay: Some(Replay::new(
+                            Origin::new("mock-api", "mock", "mock-1"),
+                            "sig-fixture-1"
+                        )),
                     },
                     Block::Text("Let me check both.".into()),
                     call("call-a", "UTC"),
@@ -215,6 +220,25 @@ fn the_log_derives_the_expected_history() {
             },
         ]
     );
+}
+
+/// The first answer, read into Karaka and written again as a new v4
+/// message, gets the same replay state the fixture holds.
+#[test]
+fn an_answer_read_and_written_again_keeps_its_replay_state() {
+    let entries = entries();
+    let SessionEvent::AssistantMessage { data, .. } = &entries[7].event else {
+        panic!("seq 7 is the first answer");
+    };
+    let source = &data.message.source;
+    let written = AssistantMessage::from_model(
+        "again",
+        &source.provider,
+        &source.model,
+        &data.message.blocks(),
+    );
+    assert_eq!(written.source.replay_state, source.replay_state);
+    assert_eq!(written.blocks(), data.message.blocks());
 }
 
 #[test]

@@ -127,6 +127,7 @@ async fn anthropic_and_deepseek_answer_side_by_side() {
         default_effort: None,
         thinking: None,
         max_tokens_field: Default::default(),
+        system_messages_in_history: false,
     });
 
     let runtime = Runtime::start(vec![

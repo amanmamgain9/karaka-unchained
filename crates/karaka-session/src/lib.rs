@@ -17,7 +17,7 @@
 //! - `event.rs`, `data.rs`, `message.rs`: the event vocabulary.
 //! - `json.rs`: the JSON envelope.
 //! - `surface.rs`: which events the model sees, in what order.
-//! - `derive.rs`: the history, and how system messages become the prompt.
+//! - `derive.rs`: the history, and which system messages become the prompt.
 //! - `convert.rs`: between v4's messages and `karaka-model`'s.
 //! - `repair.rs`: the events that close a turn a crash left open.
 //!

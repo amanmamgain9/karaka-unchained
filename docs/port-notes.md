@@ -316,3 +316,28 @@ first:
   model, so they go back only to the model that made them. That isn't
   v4's on-disk `replayState` shape yet, and the gap stays open with the
   signature-origin work.
+
+### Fixed: in-history system messages and signature origin
+
+- **System messages later in the history.** They now stay in place, as
+  in dsh v4's `splitSystemPrompt`. Only the leading run becomes the
+  request's system prompt. `Role` gains `System` and `Developer`.
+  - Anthropic sends them in place on models that accept mid-conversation
+    system messages, and folds them into `system` on the others.
+  - The DeepSeek profile follows `llm-deepseek`.
+  - OpenAI-compatible servers send them in place only with
+    `system_messages_in_history`.
+  - Developer tool additions and removals are still left out.
+    `Request.tools` already carries the current tool set.
+- **Reasoning signatures.** They carry a typed `Origin` (api, provider,
+  model). A signature goes back only to the origin that made it, and is
+  otherwise degraded as pi-ai and `llm-deepseek` do. Sessions write a
+  complete v4 `replayState`, including the `response` half, and read it
+  back with v4's own checks. The DeepSeek envelope string is gone.
+- **Still open:**
+  - The loop must pass the real provider name (`anthropic`, `deepseek`)
+    as `source.provider`. A route name like `anthropic-work` would lose
+    every signature on read, in v4 and in Karaka.
+  - pi-ai's per-message effort markers aren't ported.
+  - Assistant messages that stopped with an error aren't dropped from the
+    history.

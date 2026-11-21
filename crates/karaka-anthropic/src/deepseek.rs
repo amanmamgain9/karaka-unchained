@@ -12,6 +12,10 @@
 //! - No cache markers. DeepSeek caches without being asked.
 //! - Reasoning always goes back as thinking, never as text. Its signature
 //!   goes back only to the model that wrote it.
+//! - Developer messages always go out as `{"role": "system"}` messages.
+//!   A system message does too where the model takes that; for other
+//!   models the newest one replaces the system prompt. Either way each one
+//!   waits for the next assistant message, and must follow a user turn.
 //! - A tool result's content is a list of text blocks, and an empty result
 //!   is an empty list. `is_error` is always sent.
 //! - Two messages next to each other with the same role are joined.
@@ -19,12 +23,17 @@
 //!   before anything is sent.
 //! - Text is left out only when it is empty, not when it is whitespace.
 //! - The system prompt is always a plain string.
+//!
+//! dsh's developer messages can also add and remove tools, sent as
+//! `tool_addition` and `tool_removal` blocks (`serialize.ts:95-96`).
+//! Karaka's history has nothing to hold those, so they aren't sent; the
+//! request's tools are the ones in effect.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::time::Duration;
 
-use karaka_model::{Block, Effort, ErrorKind, Message, ModelError, Request, Role};
+use karaka_model::{Block, Effort, ErrorKind, Message, ModelError, Replay, Request, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -48,9 +57,16 @@ pub(crate) const DEFAULT_MAX_TOKENS: u32 = 256_000;
 /// at high effort DeepSeek can think for a while without sending anything.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The name dsh gives its own replay data (`replay.ts:30`), so the profile
-/// can tell its own signatures from anyone else's.
-const REPLAY_KIND: &str = "deepseek-messages";
+/// The name dsh gives its own replay data (`replay.ts:30`). It is the API
+/// in the [`Origin`] of every signature this profile receives, so the
+/// profile can tell its own signatures from anyone else's.
+///
+/// [`Origin`]: karaka_model::Origin
+pub(crate) const API: &str = "deepseek-messages";
+
+/// The provider in that origin. dsh doesn't check it (`replay.ts:53-54`),
+/// and neither does this profile; it says who answered.
+pub(crate) const PROVIDER: &str = "deepseek";
 
 /// DeepSeek's switch for thinking. dsh's `thinking` setting has the same
 /// two values (`config.ts:93`).
@@ -113,7 +129,7 @@ pub(crate) struct Body<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<OutputConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<WireTool<'a>>,
 }
@@ -132,6 +148,7 @@ struct OutputConfig {
 
 #[derive(Serialize)]
 struct WireMessage<'a> {
+    /// `"user"`, `"assistant"` or `"system"`.
     role: &'static str,
     content: Vec<WireBlock<'a>>,
 }
@@ -140,15 +157,14 @@ struct WireMessage<'a> {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireBlock<'a> {
     Text {
-        text: &'a str,
+        /// Owned only for a system message whose text blocks are joined.
+        text: Cow<'a, str>,
     },
     Thinking {
         thinking: &'a str,
-        /// Left out when there is none to send. A `Cow` because it is read
-        /// out of the replay data, and only borrows when nothing in it was
-        /// escaped.
+        /// Left out when there is none to send.
         #[serde(skip_serializing_if = "Option::is_none")]
-        signature: Option<Cow<'a, str>>,
+        signature: Option<&'a str>,
     },
     ToolUse {
         id: &'a str,
@@ -203,15 +219,57 @@ pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body
         })
         .collect::<Result<_, ModelError>>()?;
 
+    let in_history = takes_system_messages(&request.model);
     let mut messages: Vec<WireMessage<'a>> = Vec::new();
+    // The request's system prompt counts as the first system message: a
+    // later one that can't go in place replaces it, as dsh's
+    // `historySystem` is replaced (`serialize.ts:110-115`).
+    let mut system = request.system.as_deref().map(Cow::Borrowed);
+    // System messages waiting for the next assistant message. dsh admits an
+    // update before the user's input, and the Messages format wants it after
+    // that turn (`serialize.ts:83-89`).
+    let mut updates: Vec<WireMessage<'a>> = Vec::new();
     for message in &request.messages {
         let (role, content) = match message.role {
             Role::User => ("user", user(message)),
             Role::Assistant => ("assistant", assistant(message, &request.model)?),
+            // Always in place, whatever the model (`serialize.ts:91-101`).
+            Role::Developer => {
+                let content = developer(message);
+                if !content.is_empty() {
+                    updates.push(WireMessage {
+                        role: "system",
+                        content,
+                    });
+                }
+                continue;
+            }
+            Role::System => {
+                // dsh joins a system message's blocks with nothing between
+                // them (`serialize.ts:109`).
+                let text = joined_text(message);
+                // The first message can't be a system update, so a system
+                // message before anything else replaces the prompt too.
+                if in_history && !messages.is_empty() {
+                    if text.is_empty() {
+                        return Err(invalid("a system message in the history is empty"));
+                    }
+                    updates.push(WireMessage {
+                        role: "system",
+                        content: vec![WireBlock::Text { text }],
+                    });
+                } else {
+                    system = Some(text);
+                }
+                continue;
+            }
         };
         // A message with nothing left in it is skipped (`serialize.ts:123`).
         if content.is_empty() {
             continue;
+        }
+        if role == "assistant" {
+            release(&mut updates, &mut messages)?;
         }
         // One next to a message with the same role joins it
         // (`serialize.ts:126-128`). Skipping a message can bring two
@@ -221,6 +279,7 @@ pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body
             _ => messages.push(WireMessage { role, content }),
         }
     }
+    release(&mut updates, &mut messages)?;
     check_tool_history(&mut messages)?;
     let (thinking, output_config) = thinking_and_effort(request, settings)?;
 
@@ -234,9 +293,68 @@ pub(crate) fn body<'a>(request: &'a Request, settings: &Settings) -> Result<Body
         output_config,
         // Only an empty prompt is left out; dsh keeps one that is only
         // whitespace (`serialize.ts:151`).
-        system: request.system.as_deref().filter(|text| !text.is_empty()),
+        system: system.filter(|text| !text.is_empty()),
         tools,
     })
+}
+
+/// Whether `model` takes system messages in place. dsh's default catalog
+/// says so only for `deepseek-flash` (`models.ts:7-14`). dsh lets a
+/// deployment say so for other models in its config (`config.ts:80`);
+/// Karaka has no setting for that yet.
+fn takes_system_messages(model: &str) -> bool {
+    model == "deepseek-flash"
+}
+
+/// Moves the waiting system messages onto the end of `messages`. They must
+/// follow a user turn, which here includes tool results
+/// (`serialize.ts:85-89`).
+fn release<'a>(
+    updates: &mut Vec<WireMessage<'a>>,
+    messages: &mut Vec<WireMessage<'a>>,
+) -> Result<(), ModelError> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    if messages.last().map(|message| message.role) != Some("user") {
+        return Err(invalid(
+            "a system message must come after a user turn or tool results",
+        ));
+    }
+    messages.append(updates);
+    Ok(())
+}
+
+/// The text blocks of `message` joined with nothing between them, borrowed
+/// when there is only one.
+fn joined_text(message: &Message) -> Cow<'_, str> {
+    let texts: Vec<&str> = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    match texts.as_slice() {
+        [one] => Cow::Borrowed(one),
+        _ => Cow::Owned(texts.concat()),
+    }
+}
+
+/// A developer message's text blocks, leaving out empty ones
+/// (`serialize.ts:94`).
+fn developer(message: &Message) -> Vec<WireBlock<'_>> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            Block::Text(text) if !text.is_empty() => Some(WireBlock::Text {
+                text: Cow::Borrowed(text),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A user message's blocks. Reasoning and tool calls belong to the model,
@@ -247,7 +365,9 @@ fn user(message: &Message) -> Vec<WireBlock<'_>> {
         .iter()
         .filter_map(|block| match block {
             Block::Text(text) if text.is_empty() => None,
-            Block::Text(text) => Some(WireBlock::Text { text }),
+            Block::Text(text) => Some(WireBlock::Text {
+                text: Cow::Borrowed(text),
+            }),
             Block::ToolResult(result) => Some(WireBlock::ToolResult {
                 tool_use_id: &result.call_id,
                 // An empty result stays empty, rather than gaining text the
@@ -274,15 +394,18 @@ fn assistant<'a>(message: &'a Message, model: &str) -> Result<Vec<WireBlock<'a>>
     for block in &message.content {
         blocks.push(match block {
             Block::Text(text) if text.is_empty() => continue,
-            Block::Text(text) => WireBlock::Text { text },
+            Block::Text(text) => WireBlock::Text {
+                text: Cow::Borrowed(text),
+            },
             // Always thinking, even from another provider or with no text,
             // because DeepSeek reads thinking it didn't sign. Only the
             // signature depends on where the reasoning came from.
             Block::Reasoning { text, replay } => WireBlock::Thinking {
                 thinking: text,
                 signature: replay
-                    .as_deref()
-                    .and_then(|replay| replayed_signature(replay, model)),
+                    .as_ref()
+                    .filter(|replay| is_own(replay, model))
+                    .map(|replay| replay.signature.as_str()),
             },
             // Arguments that aren't a JSON object go back as an empty one
             // (`serialize.ts:16-24`).
@@ -313,6 +436,10 @@ fn check_tool_history<'a>(messages: &mut [WireMessage<'a>]) -> Result<(), ModelE
     // The calls still waiting for a result.
     let mut waiting: HashSet<&'a str> = HashSet::new();
     for message in messages.iter_mut() {
+        // System messages take no part in pairing calls with results.
+        if message.role == "system" {
+            continue;
+        }
         if message.role == "assistant" {
             waiting.clear();
             for block in &message.content {
@@ -428,54 +555,14 @@ fn invalid(message: impl Into<String>) -> ModelError {
 }
 
 // Reasoning replay.
-//
-// dsh keeps, with each answer, which model wrote it, and sends a thinking
-// block's signature back only to that model (`replay.ts:63`). Karaka keeps
-// only the opaque `replay` string beside each reasoning block, so this
-// profile writes the model into that string. It is a small JSON object:
-//
-//     {"kind":"deepseek-messages","version":1,"model":"deepseek-flash","signature":"..."}
-//
-// The kind and version are dsh's own (`replay.ts:30`). Anything else in
-// `replay`, such as an Anthropic signature, isn't this profile's, and its
-// reasoning goes back unsigned.
 
-#[derive(Serialize, Deserialize)]
-struct Replay<'a> {
-    #[serde(borrow)]
-    kind: Cow<'a, str>,
-    version: u32,
-    #[serde(borrow)]
-    model: Cow<'a, str>,
-    #[serde(borrow)]
-    signature: Cow<'a, str>,
-}
-
-/// The `replay` string for a thinking block that `model` signed.
-pub(crate) fn replay(model: &str, signature: &str) -> String {
-    let replay = Replay {
-        kind: REPLAY_KIND.into(),
-        version: 1,
-        model: model.into(),
-        signature: signature.into(),
-    };
-    serde_json::to_string(&replay).expect("strings always serialize")
-}
-
-/// Whether `replay` was written by this profile. The Anthropic profile uses
-/// it to keep DeepSeek's signatures away from Anthropic.
-pub(crate) fn is_replay(replay: &str) -> bool {
-    serde_json::from_str::<Replay<'_>>(replay).is_ok_and(|replay| replay.kind == REPLAY_KIND)
-}
-
-/// The signature in `replay`, if this profile wrote it for `model`. An
-/// empty signature still counts: dsh sends one back as it got it
-/// (`serialize.spec.ts`, "keeps valid cross-model and foreign history
-/// quiet").
-fn replayed_signature<'a>(replay: &'a str, model: &str) -> Option<Cow<'a, str>> {
-    let replay: Replay<'a> = serde_json::from_str(replay).ok()?;
-    (replay.kind == REPLAY_KIND && replay.version == 1 && replay.model == model)
-        .then_some(replay.signature)
+/// Whether this profile can send `replay`'s signature with a request to
+/// `model`. dsh checks only its own kind of replay data and the model
+/// (`replay.ts:53-54,63`). An empty signature still counts: dsh sends one
+/// back as it got it (`serialize.spec.ts`, "keeps valid cross-model and
+/// foreign history quiet").
+fn is_own(replay: &Replay, model: &str) -> bool {
+    replay.origin.api == API && replay.origin.model == model
 }
 
 // Errors.
@@ -527,13 +614,13 @@ pub(crate) struct ErrorEvent {
 #[cfg(test)]
 mod tests {
     use karaka_model::{
-        Block, Effort, ErrorKind, Message, Request, Role, ToolCall, ToolResult, ToolSchema,
+        Block, Effort, ErrorKind, Message, Origin, Replay, Request, Role, ToolCall, ToolResult,
+        ToolSchema,
     };
     use serde_json::{Value, json};
 
     use super::{
         DEFAULT_MAX_TOKENS, DeepSeekThinking, ErrorEvent, Settings, WireError, body, endpoint,
-        is_replay, replay,
     };
 
     /// dsh's test model (`tests/helpers.ts:21`).
@@ -579,11 +666,48 @@ mod tests {
         Block::Text(text.into())
     }
 
-    fn reasoning(text: &str, replay: Option<String>) -> Block {
+    fn reasoning(text: &str, replay: Option<Replay>) -> Block {
         Block::Reasoning {
             text: text.into(),
             replay,
         }
+    }
+
+    /// A signature this profile received from `model`.
+    fn signed(model: &str, signature: &str) -> Option<Replay> {
+        Some(Replay::new(
+            Origin::new("deepseek-messages", "deepseek", model),
+            signature,
+        ))
+    }
+
+    /// A signature Anthropic's profile received from `model`.
+    fn anthropic_signed(model: &str, signature: &str) -> Option<Replay> {
+        Some(Replay::new(
+            Origin::new("anthropic-messages", "anthropic", model),
+            signature,
+        ))
+    }
+
+    /// The model dsh's default catalog lets take system messages in place
+    /// (`models.ts:12`).
+    const IN_HISTORY: &str = "deepseek-flash";
+
+    /// Messages for a model that takes system messages in place, as dsh's
+    /// `nativeBody` builds them (`serialize.spec.ts:23-24`).
+    fn native(history: Vec<Message>) -> Value {
+        to_json(&Request::new(IN_HISTORY, history))["messages"].clone()
+    }
+
+    fn developer(texts: &[&str]) -> Message {
+        Message {
+            role: Role::Developer,
+            content: texts.iter().map(|t| text(t)).collect(),
+        }
+    }
+
+    fn answer(text_: &str) -> Message {
+        assistant(vec![text(text_)])
     }
 
     /// dsh's `call` (`serialize.spec.ts:16`).
@@ -867,10 +991,7 @@ mod tests {
     fn its_own_signature_goes_back_only_to_the_model_that_wrote_it() {
         let history = vec![
             Message::user("hello"),
-            assistant(vec![
-                reasoning("", Some(replay(MODEL, "signed"))),
-                text("answer"),
-            ]),
+            assistant(vec![reasoning("", signed(MODEL, "signed")), text("answer")]),
             Message::user("hello"),
         ];
         assert_eq!(
@@ -891,13 +1012,16 @@ mod tests {
 
     /// Reasoning from another provider stays thinking, not text, unlike in
     /// the Anthropic profile. An Anthropic signature isn't DeepSeek's, so it
-    /// isn't sent.
+    /// isn't sent, even when the model's name is the same.
     #[test]
     fn foreign_reasoning_goes_back_as_unsigned_thinking() {
         assert_eq!(
             messages(vec![assistant(vec![
                 reasoning("foreign thought", None),
-                reasoning("Anthropic thought", Some("EqQBCkgIAhABGAIiQL".into())),
+                reasoning(
+                    "Anthropic thought",
+                    anthropic_signed(MODEL, "EqQBCkgIAhABGAIiQL")
+                ),
                 reasoning("", None),
             ])])[0]["content"],
             json!([
@@ -913,27 +1037,21 @@ mod tests {
     #[test]
     fn an_empty_signature_of_its_own_goes_back() {
         assert_eq!(
-            messages(vec![assistant(vec![reasoning(
-                "think",
-                Some(replay(MODEL, ""))
-            )])])[0]["content"],
+            messages(vec![assistant(vec![reasoning("think", signed(MODEL, ""))])])[0]["content"],
             json!([{"type": "thinking", "thinking": "think", "signature": ""}])
         );
     }
 
     /// dsh's "keeps durable content when replay degrades", checked against
-    /// its snapshot `tests/expected/degraded-replay.json`. Here the replay
-    /// data is unreadable, which is how Karaka's history can degrade.
+    /// its snapshot `tests/expected/degraded-replay.json`, for its second
+    /// case: the request names a different model than the signature's.
     #[test]
-    fn unreadable_replay_data_degrades_to_unsigned_thinking() {
+    fn a_signature_from_another_deepseek_model_degrades_to_unsigned_thinking() {
         assert_eq!(
             messages(vec![
                 Message::user("hello"),
                 assistant(vec![
-                    reasoning(
-                        "Read the file.",
-                        Some("{\"kind\":\"deepseek-messages\"".into())
-                    ),
+                    reasoning("Read the file.", signed("different-model", "do-not-send")),
                     text("Checking a."),
                     call("a"),
                 ]),
@@ -954,18 +1072,268 @@ mod tests {
         );
     }
 
+    // System and developer messages.
+
+    /// dsh's "collects leading system text", second half: for a model that
+    /// doesn't take them in place, a later system message replaces the
+    /// prompt.
     #[test]
-    fn a_replay_is_recognised_as_this_profiles_own() {
-        let written = replay(MODEL, "sig");
-        assert_eq!(
-            written,
-            r#"{"kind":"deepseek-messages","version":1,"model":"deepseek-v4-flash","signature":"sig"}"#
+    fn a_later_system_message_replaces_the_prompt_where_it_cant_go_in_place() {
+        let mut request = Request::new(
+            MODEL,
+            vec![
+                Message::user("first"),
+                answer("one"),
+                Message::system("B"),
+                Message::user("second"),
+            ],
         );
-        assert!(is_replay(&written));
-        assert!(!is_replay("EqQBCkgIAhABGAIiQL"));
-        assert!(!is_replay(
-            r#"{"kind":"other","version":1,"model":"m","signature":"s"}"#
-        ));
+        request.system = Some("A".into());
+        assert_eq!(
+            to_json(&request),
+            json!({
+                "model": MODEL,
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "first"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "second"}]}
+                ],
+                "max_tokens": 256000,
+                "thinking": {"type": "enabled"},
+                "output_config": {"effort": "high"},
+                "system": "B"
+            })
+        );
+    }
+
+    /// dsh's "uses the latest complete system snapshot without changing
+    /// tool history": every system message replaces the one before.
+    #[test]
+    fn the_newest_system_message_is_the_prompt_where_it_cant_go_in_place() {
+        let conversation = vec![
+            Message::user("hello"),
+            assistant(vec![call("a")]),
+            user(vec![result("a", "result", false)]),
+            answer("done"),
+            Message::user("continue"),
+        ];
+        let mut history = conversation.clone();
+        history.insert(2, Message::system("intermediate"));
+        history.insert(5, Message::system("current"));
+        let mut request = Request::new(MODEL, history);
+        request.system = Some("obsolete".into());
+
+        let mut expected = to_json(&Request::new(MODEL, conversation));
+        expected["system"] = json!("current");
+        assert_eq!(to_json(&request), expected);
+    }
+
+    /// dsh's "clears earlier prompt snapshots with empty content".
+    #[test]
+    fn an_empty_system_message_clears_the_prompt_where_it_cant_go_in_place() {
+        let mut request = Request::new(MODEL, vec![Message::user("hello"), Message::system("")]);
+        request.system = Some("old".into());
+        assert!(to_json(&request).get("system").is_none());
+    }
+
+    /// The test the brief asks for: system "A", user, assistant, system
+    /// "B", user, for a model that takes system messages in place. "A"
+    /// stays the prompt, and "B" goes out after the user turn that follows
+    /// it, as dsh's "keeps the original top-level prompt and cached prefix
+    /// while appending native system updates" expects.
+    #[test]
+    fn a_later_system_message_goes_in_place_where_the_model_takes_it() {
+        let mut request = Request::new(
+            IN_HISTORY,
+            vec![
+                Message::user("first"),
+                answer("one"),
+                Message::system("B"),
+                Message::user("second"),
+            ],
+        );
+        request.system = Some("A".into());
+        assert_eq!(
+            to_json(&request),
+            json!({
+                "model": IN_HISTORY,
+                "stream": true,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "first"}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": "one"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "second"}]},
+                    {"role": "system", "content": [{"type": "text", "text": "B"}]}
+                ],
+                "max_tokens": 256000,
+                "thinking": {"type": "enabled"},
+                "output_config": {"effort": "high"},
+                "system": "A"
+            })
+        );
+    }
+
+    /// dsh's "places system updates after all parallel tool results and
+    /// before the next assistant". Derivation has already put the two
+    /// updates after the results, where pi-ai's transform puts them.
+    #[test]
+    fn system_messages_wait_for_the_next_assistant_message() {
+        assert_eq!(
+            native(vec![
+                Message::user("hello"),
+                assistant(vec![call("a"), call("b")]),
+                user(vec![
+                    result("a", "result", false),
+                    result("b", "result", false)
+                ]),
+                Message::system("first update"),
+                Message::system("second update"),
+                Message::user("more input"),
+                answer("done"),
+            ]),
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "a", "name": "read", "input": {"path": "a"}},
+                    {"type": "tool_use", "id": "b", "name": "read", "input": {"path": "a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a",
+                     "content": [{"type": "text", "text": "result"}], "is_error": false},
+                    {"type": "tool_result", "tool_use_id": "b",
+                     "content": [{"type": "text", "text": "result"}], "is_error": false},
+                    {"type": "text", "text": "more input"}
+                ]},
+                {"role": "system", "content": [{"type": "text", "text": "first update"}]},
+                {"role": "system", "content": [{"type": "text", "text": "second update"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+            ])
+        );
+    }
+
+    /// dsh's "does not flush a system update at an omitted empty assistant
+    /// message".
+    #[test]
+    fn an_empty_assistant_message_doesnt_release_a_system_message() {
+        assert_eq!(
+            native(vec![
+                Message::user("hello"),
+                Message::system("updated"),
+                answer(""),
+                Message::user("hello"),
+                answer("answer"),
+            ]),
+            json!([
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "text", "text": "hello"}
+                ]},
+                {"role": "system", "content": [{"type": "text", "text": "updated"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]}
+            ])
+        );
+    }
+
+    /// dsh's "accepts native trailing updates without a top-level prompt and
+    /// rejects unrepresentable positions", and "rejects native system
+    /// updates when their user input is omitted".
+    #[test]
+    fn a_system_message_must_follow_a_user_turn() {
+        assert_eq!(
+            native(vec![Message::user("hello"), Message::system("update")]),
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "system", "content": [{"type": "text", "text": "update"}]}
+            ])
+        );
+        let after_an_answer = [
+            vec![
+                Message::user("hello"),
+                answer("done"),
+                Message::system("update"),
+            ],
+            // The user turn after it has nothing left in it.
+            vec![
+                Message::user("hello"),
+                answer("answer"),
+                Message::system("updated"),
+                user(vec![reasoning("child reasoning", None)]),
+                answer("next answer"),
+            ],
+        ];
+        for history in after_an_answer {
+            assert_eq!(
+                refusal(&Request::new(IN_HISTORY, history), &Settings::default()),
+                "a system message must come after a user turn or tool results"
+            );
+        }
+        assert_eq!(
+            refusal(
+                &Request::new(
+                    IN_HISTORY,
+                    vec![Message::user("hello"), Message::system("")]
+                ),
+                &Settings::default()
+            ),
+            "a system message in the history is empty"
+        );
+    }
+
+    /// dsh's "places developer tool changes as a system update after the
+    /// preceding user turn", for the text: Karaka has no tool changes to
+    /// send. A developer message goes in place for any model.
+    #[test]
+    fn a_developer_message_goes_in_place_after_the_user_turn() {
+        assert_eq!(
+            messages(vec![
+                Message::user("hello"),
+                developer(&["", "search replaces fetch"]),
+                answer("ok"),
+            ]),
+            json!([
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "system", "content": [{"type": "text", "text": "search replaces fetch"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+            ])
+        );
+        assert_eq!(
+            messages(vec![Message::user("hello"), developer(&[""])]),
+            json!([{"role": "user", "content": [{"type": "text", "text": "hello"}]}])
+        );
+        let roles = messages(vec![developer(&["note"]), Message::user("hello")]);
+        assert_eq!(roles[0]["role"], "user");
+        assert_eq!(roles[1]["role"], "system");
+        assert_eq!(
+            refusal(
+                &Request::new(MODEL, vec![developer(&["note"])]),
+                &Settings::default()
+            ),
+            "a system message must come after a user turn or tool results"
+        );
+    }
+
+    /// Reasoning that went to Anthropic and back keeps DeepSeek's own
+    /// signature for DeepSeek, and Anthropic's goes as unsigned thinking.
+    #[test]
+    fn signatures_survive_a_trip_through_anthropic() {
+        let sent = messages(vec![
+            Message::user("hello"),
+            assistant(vec![reasoning("DeepSeek thought", signed(MODEL, "ds-sig"))]),
+            Message::user("again"),
+            assistant(vec![reasoning(
+                "Claude thought",
+                anthropic_signed("claude-opus-5-5", "claude-sig"),
+            )]),
+            Message::user("once more"),
+        ]);
+        assert_eq!(
+            sent[1]["content"],
+            json!([{"type": "thinking", "thinking": "DeepSeek thought", "signature": "ds-sig"}])
+        );
+        assert_eq!(
+            sent[3]["content"],
+            json!([{"type": "thinking", "thinking": "Claude thought"}])
+        );
     }
 
     // How history translates.
@@ -1060,7 +1428,7 @@ mod tests {
             vec![
                 Message::user("what is in a?"),
                 assistant(vec![
-                    reasoning("Read the file.", Some(replay(MODEL, "sig"))),
+                    reasoning("Read the file.", signed(MODEL, "sig")),
                     call("a"),
                 ]),
                 user(vec![result("a", "hello", false)]),

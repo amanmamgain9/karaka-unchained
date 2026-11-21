@@ -95,6 +95,15 @@ impl OpenAiModel {
         self
     }
 
+    /// Sends system and developer messages from later in the history in
+    /// place, as `{"role": "system"}` messages, instead of folding them
+    /// into the system prompt. Only for a server whose model accepts them;
+    /// off unless set, as in pi-ai.
+    pub fn with_system_messages_in_history(mut self, on: bool) -> Self {
+        self.settings.system_messages_in_history = on;
+        self
+    }
+
     /// Everything about the HTTP request except sending it.
     fn prepare(&self, request: &Request) -> Result<RequestBuilder, ModelError> {
         let json = serde_json::to_vec(&body(request, &self.settings)?).map_err(|error| {

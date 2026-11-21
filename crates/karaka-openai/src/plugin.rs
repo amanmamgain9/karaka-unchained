@@ -38,6 +38,11 @@ pub struct OpenAiConfig {
     /// The field `max_tokens` goes out as. `max_tokens` unless set.
     #[serde(default)]
     pub max_tokens_field: MaxTokensField,
+    /// Whether the server's model takes system messages in the middle of a
+    /// conversation. `false` unless set, which folds them into the system
+    /// prompt, as pi-ai does for a server it knows nothing about.
+    #[serde(default)]
+    pub system_messages_in_history: bool,
 }
 
 /// Leaves out the API key, so a config can be logged safely.
@@ -50,6 +55,10 @@ impl fmt::Debug for OpenAiConfig {
             .field("default_effort", &self.default_effort)
             .field("thinking", &self.thinking)
             .field("max_tokens_field", &self.max_tokens_field)
+            .field(
+                "system_messages_in_history",
+                &self.system_messages_in_history,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -106,7 +115,9 @@ impl Plugin for OpenAiPlugin {
         if let Some(on) = self.config.thinking {
             model = model.with_thinking(on);
         }
-        model = model.with_max_tokens_field(self.config.max_tokens_field);
+        model = model
+            .with_max_tokens_field(self.config.max_tokens_field)
+            .with_system_messages_in_history(self.config.system_messages_in_history);
         // An empty or taken route fails here. Its error becomes this
         // plugin's setup error, which the runtime reports by plugin name.
         ctx.get::<ModelRegistry>()
@@ -171,6 +182,7 @@ mod tests {
             default_effort: None,
             thinking: None,
             max_tokens_field: MaxTokensField::MaxTokens,
+            system_messages_in_history: false,
         };
         assert!(!format!("{config:?}").contains("sk-secret"));
     }

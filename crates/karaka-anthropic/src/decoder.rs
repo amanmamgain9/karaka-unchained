@@ -11,28 +11,28 @@
 //! JSON object.
 
 use karaka_model::{
-    Block, ErrorKind, Event, ModelError, Refusal, StopReason, ToolCall, Usage, is_context_overflow,
-    is_out_of_quota,
+    Block, ErrorKind, Event, ModelError, Origin, Refusal, Replay, StopReason, ToolCall, Usage,
+    is_context_overflow, is_out_of_quota,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::Profile;
 use crate::deepseek;
-use crate::request::json_object;
+use crate::request::{self, json_object};
 
 /// Assembles one streamed response.
 ///
 /// Anthropic sends one content block at a time: start, deltas, stop. So the
 /// decoder holds the block being written, and only the finished blocks that
 /// must wait for the stop reason.
-#[derive(Default)]
 pub(crate) struct Decoder {
     profile: Profile,
-    /// The model the request asked for. The DeepSeek profile records it
-    /// beside each signature, so the signature goes back only to that model
-    /// (`translate.ts:161`, `replay.ts:63`).
-    model: String,
+    /// Where each signature in this answer comes from: the profile's API
+    /// and provider, and the model the request asked for. Signatures go
+    /// back only to that same model, as pi-ai and dsh's DeepSeek adapter
+    /// send them (`llm-pi-ai/src/replay.ts:77-83`, `llm-deepseek/src/translate.ts:161`).
+    origin: Origin,
     /// Whether `message_start` has arrived. Only the DeepSeek profile
     /// checks the order of events.
     started: bool,
@@ -78,12 +78,32 @@ enum Open {
 }
 
 impl Decoder {
+    /// A decoder for the Anthropic profile, for an answer from `model`.
+    pub(crate) fn anthropic(model: impl Into<String>) -> Self {
+        Self::new(
+            Profile::Anthropic,
+            Origin::new(request::API, request::PROVIDER, model),
+        )
+    }
+
     /// A decoder for the DeepSeek profile, for an answer from `model`.
     pub(crate) fn deepseek(model: impl Into<String>) -> Self {
+        Self::new(
+            Profile::DeepSeek,
+            Origin::new(deepseek::API, deepseek::PROVIDER, model),
+        )
+    }
+
+    fn new(profile: Profile, origin: Origin) -> Self {
         Self {
-            profile: Profile::DeepSeek,
-            model: model.into(),
-            ..Self::default()
+            profile,
+            origin,
+            started: false,
+            open: None,
+            held: Vec::new(),
+            any_block: false,
+            usage: Usage::default(),
+            stop: None,
         }
     }
 
@@ -377,11 +397,10 @@ impl Decoder {
                 replay: match self.profile {
                     Profile::Anthropic => Some(signature.unwrap_or_default()),
                     // With no signature there's nothing to send back, so
-                    // no model to record either (`translate.ts:53`).
-                    Profile::DeepSeek => {
-                        signature.map(|signature| deepseek::replay(&self.model, &signature))
-                    }
-                },
+                    // no origin to record either (`translate.ts:53`).
+                    Profile::DeepSeek => signature,
+                }
+                .map(|signature| Replay::new(self.origin.clone(), signature)),
             },
             Open::ToolUse {
                 id,
@@ -658,13 +677,26 @@ impl WireError {
 
 #[cfg(test)]
 mod tests {
-    use karaka_model::{Block, ErrorKind, Event, ModelError, Refusal, StopReason, ToolCall, Usage};
+    use karaka_model::{
+        Block, ErrorKind, Event, ModelError, Origin, Refusal, Replay, StopReason, ToolCall, Usage,
+    };
 
     use super::{Decoder, classify};
 
+    /// The model every Anthropic test asks for.
+    const MODEL: &str = "claude-opus-5-5";
+
+    /// The replay a signature from Anthropic's `MODEL` gets.
+    fn signed(signature: &str) -> Option<Replay> {
+        Some(Replay::new(
+            Origin::new("anthropic-messages", "anthropic", MODEL),
+            signature,
+        ))
+    }
+
     /// Feeds every event and keeps what comes out.
     fn decode(events: &[&str]) -> Result<Vec<Event>, ModelError> {
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::anthropic(MODEL);
         let mut out = Vec::new();
         for event in events {
             out.extend(decoder.feed(event)?);
@@ -675,7 +707,7 @@ mod tests {
     /// Feeds events until one fails, and gives back what came out before
     /// the failure, and the failure. As a stream does, a caller sees both.
     fn decode_until_error(events: &[&str]) -> (Vec<Event>, ModelError) {
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::anthropic(MODEL);
         let mut out = Vec::new();
         for event in events {
             match decoder.feed(event) {
@@ -756,7 +788,7 @@ mod tests {
             events[1],
             Event::Block(Block::Reasoning {
                 text: "check the clock".into(),
-                replay: Some("sig".into()),
+                replay: signed("sig"),
             })
         );
         assert_eq!(
@@ -947,7 +979,7 @@ mod tests {
             events[0],
             Event::Block(Block::Reasoning {
                 text: String::new(),
-                replay: Some("sig".into()),
+                replay: signed("sig"),
             })
         );
         assert!(matches!(
@@ -984,7 +1016,7 @@ mod tests {
                 Event::ReasoningDelta("search".into()),
                 Event::Block(Block::Reasoning {
                     text: "search".into(),
-                    replay: Some(String::new()),
+                    replay: signed(""),
                 }),
                 Event::Block(Block::Text("Looking.".into())),
                 Event::Done {
@@ -1004,7 +1036,7 @@ mod tests {
     /// both come out in order.
     #[test]
     fn tool_calls_and_what_follows_them_wait_for_the_stop_reason() {
-        let mut decoder = Decoder::default();
+        let mut decoder = Decoder::anthropic(MODEL);
         let mut feed = |data: &str| decoder.feed(data).expect("the event decodes");
 
         feed(START);
@@ -1153,6 +1185,14 @@ mod tests {
         Ok(out)
     }
 
+    /// The replay a signature from DeepSeek's `DS_MODEL` gets.
+    fn ds_signed(signature: &str) -> Option<Replay> {
+        Some(Replay::new(
+            Origin::new("deepseek-messages", "deepseek", DS_MODEL),
+            signature,
+        ))
+    }
+
     fn deepseek_error(events: &[&str]) -> ModelError {
         deepseek_decode(events).expect_err("the call fails")
     }
@@ -1197,7 +1237,7 @@ mod tests {
                 Event::ReasoningDelta(" thought".into()),
                 Event::Block(Block::Reasoning {
                     text: "first thought".into(),
-                    replay: Some(crate::deepseek::replay(DS_MODEL, "signature")),
+                    replay: ds_signed("signature"),
                 }),
                 Event::Block(Block::ToolCall(ToolCall {
                     id: "call_1".into(),
@@ -1279,7 +1319,7 @@ mod tests {
             [
                 Block::Reasoning {
                     text: String::new(),
-                    replay: Some(crate::deepseek::replay(DS_MODEL, "opaque")),
+                    replay: ds_signed("opaque"),
                 },
                 Block::Reasoning {
                     text: "unsigned".into(),

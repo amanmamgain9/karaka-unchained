@@ -174,6 +174,7 @@ impl Config {
                     default_effort: None,
                     thinking: None,
                     max_tokens_field: Default::default(),
+                    system_messages_in_history: false,
                 };
                 // Each OpenAI-compatible server has its own models, so there
                 // is no default that would work everywhere.

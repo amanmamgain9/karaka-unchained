@@ -13,24 +13,37 @@
 //! # System and developer messages
 //!
 //! v4 logs the system prompt as surface node 0, and both system and
-//! developer messages are messages in its history. Karaka's
-//! [`Request`](karaka_model::Request) has the system prompt as a field, and
-//! its `Role` has only user and assistant. So both become the
-//! [`History::system`] text, the way pi-ai builds a request for a model that
-//! doesn't read system messages mid-conversation (`collapseSystemMessages`
-//! in pi-ai's `utils/transcript.js`):
+//! developer messages are messages in its history. Its pi-ai adapter folds
+//! only the *leading* run of system messages into the request's system
+//! prompt (`splitSystemPrompt`, `llm-pi-ai/src/context.ts:148-158`). Every
+//! system or developer message after that keeps its place
+//! (`context.ts:224-231`). Derivation does the same:
 //!
-//! - Each system message gives its text blocks joined with nothing between
-//!   them (dsh's `flattenText`).
-//! - Each developer message gives its non-empty text blocks joined with a
-//!   newline (pi-ai's `contentText`). Its tool additions and removals are
-//!   not text, and Karaka's request lists its tools itself, so they add
-//!   nothing.
-//! - The non-empty parts, in surface order, are joined with a blank line.
-//!   No parts at all means no system prompt.
+//! - The leading run is every system message before the first message of
+//!   any other role. Their text, each one's blocks joined with nothing
+//!   between them (dsh's `flattenText`), becomes [`History::system`], the
+//!   non-empty parts joined with a blank line. No parts means no system
+//!   prompt.
+//! - A later system message becomes a [`Role::System`] message holding that
+//!   text, even when it is empty. Which providers can take it in place,
+//!   and what to send the others, is each provider's call.
+//! - A developer message becomes a [`Role::Developer`] message holding its
+//!   non-empty text blocks (pi-ai's `appendDeveloper`). It also ends the
+//!   leading run.
 //!
-//! An empty system or developer message adds nothing, as in v4, where it
-//! derives to no message.
+//! A system or developer message with no content at all derives to nothing,
+//! as in v4 (`surface.ts:135-143`), and doesn't end the leading run.
+//!
+//! A developer message can also add and remove tools. v4 sends those changes
+//! where they happened (`context.ts:171-201`), but Karaka's history has no
+//! block for them, and its request lists the tools in effect itself. So
+//! they add nothing here. A developer message with only tool changes still
+//! ends the leading run, as in v4, but leaves no message.
+//!
+//! A system or developer message logged while a tool round is open, after
+//! the calls and before the next user or assistant message, comes after that
+//! round's results. pi-ai moves it there too (`transform-messages.js:130-
+//! 183`): providers want a tool's results right after its call.
 //!
 //! # User, assistant and tool messages
 //!
@@ -43,9 +56,10 @@
 //! - Tool results in a row become one user message, in surface order. v4
 //!   keeps one message per result and its adapters group them on the wire;
 //!   Karaka groups them here, so every provider gets a round's results
-//!   together, as Anthropic wants. Since only messages that reach the
-//!   history count, a system or developer message, or an empty assistant
-//!   message, between two results doesn't split them.
+//!   together, as Anthropic wants. An empty assistant message between two
+//!   results doesn't split them, since it reaches no history, and neither
+//!   does a system or developer message, which waits until after them (see
+//!   above).
 
 use std::mem;
 
@@ -59,8 +73,11 @@ use crate::message::ContentBlock;
 /// conversation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct History {
-    /// Goes in [`Request::system`](karaka_model::Request::system).
+    /// The system prompt the conversation starts with. Goes in
+    /// [`Request::system`](karaka_model::Request::system).
     pub system: Option<String>,
+    /// The conversation, with any later system and developer messages in
+    /// their places.
     pub messages: Vec<Message>,
 }
 
@@ -71,11 +88,14 @@ pub(crate) fn history(entries: &[Entry], nodes: &[Seq]) -> History {
         // A node is always the seq of an admitted event, which is its index.
         let entry = &entries[seq.0 as usize];
         match &entry.event {
+            // Empty content derives to no message (`surface.ts:138-141`).
+            SessionEvent::SystemMessage { data, .. } if data.message.content.is_empty() => {}
             SessionEvent::SystemMessage { data, .. } => {
-                builder.system_part(joined_text(&data.message.content, ""));
+                builder.system(joined_text(&data.message.content, ""));
             }
+            SessionEvent::DeveloperMessage { data, .. } if data.message.content.is_empty() => {}
             SessionEvent::DeveloperMessage { data, .. } => {
-                builder.system_part(developer_text(&data.message.content));
+                builder.developer(developer_texts(&data.message.content));
             }
             SessionEvent::UserMessage { message, .. } => {
                 builder.push(Role::User, message.blocks());
@@ -86,6 +106,7 @@ pub(crate) fn history(entries: &[Entry], nodes: &[Seq]) -> History {
                 }
             }
             SessionEvent::ToolResult { data, .. } => {
+                builder.leading = false;
                 builder
                     .results
                     .push(Block::ToolResult(data.message.to_model()));
@@ -97,36 +118,88 @@ pub(crate) fn history(entries: &[Entry], nodes: &[Seq]) -> History {
     builder.finish()
 }
 
-/// pi-ai's `appendDeveloper` keeps the non-empty text blocks, and its
-/// `contentText` joins them with a newline.
-fn developer_text(content: &[ContentBlock]) -> String {
+/// pi-ai's `appendDeveloper` keeps the non-empty text blocks
+/// (`context.ts:177-179`).
+fn developer_texts(content: &[ContentBlock]) -> Vec<Block> {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text) if !text.text.is_empty() => Some(text.text.as_str()),
+            ContentBlock::Text(text) if !text.text.is_empty() => {
+                Some(Block::Text(text.text.clone()))
+            }
             _ => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
 
-#[derive(Default)]
 struct Builder {
-    system: Vec<String>,
+    /// The text of each system message in the leading run.
+    prompt: Vec<String>,
+    /// Whether every message so far was a system message, so that the next
+    /// system message still belongs to the prompt.
+    leading: bool,
     messages: Vec<Message>,
     /// Results seen since the last message, waiting to become one message.
     results: Vec<Block>,
+    /// Whether the last assistant message called tools, and no user or
+    /// assistant message has come since. pi-ai's `pendingToolCalls`.
+    round_open: bool,
+    /// System and developer messages that came while the round was open.
+    /// They go out after its results.
+    held: Vec<Message>,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            prompt: Vec::new(),
+            leading: true,
+            messages: Vec::new(),
+            results: Vec::new(),
+            round_open: false,
+            held: Vec::new(),
+        }
+    }
 }
 
 impl Builder {
-    fn system_part(&mut self, text: String) {
-        if !text.is_empty() {
-            self.system.push(text);
+    fn system(&mut self, text: String) {
+        if self.leading {
+            self.prompt.push(text);
+        } else {
+            self.instruction(Message {
+                role: Role::System,
+                content: vec![Block::Text(text)],
+            });
+        }
+    }
+
+    fn developer(&mut self, content: Vec<Block>) {
+        self.leading = false;
+        if !content.is_empty() {
+            self.instruction(Message {
+                role: Role::Developer,
+                content,
+            });
+        }
+    }
+
+    /// A system or developer message after the leading run.
+    fn instruction(&mut self, message: Message) {
+        if self.round_open {
+            self.held.push(message);
+        } else {
+            self.end_tool_round();
+            self.messages.push(message);
         }
     }
 
     fn push(&mut self, role: Role, content: Vec<Block>) {
+        self.leading = false;
         self.end_tool_round();
+        self.release_held();
+        self.round_open =
+            role == Role::Assistant && content.iter().any(|b| matches!(b, Block::ToolCall(_)));
         self.messages.push(Message { role, content });
     }
 
@@ -141,10 +214,16 @@ impl Builder {
         }
     }
 
+    fn release_held(&mut self) {
+        self.messages.append(&mut self.held);
+    }
+
     fn finish(mut self) -> History {
         self.end_tool_round();
+        self.release_held();
+        let prompt: Vec<String> = self.prompt.into_iter().filter(|p| !p.is_empty()).collect();
         History {
-            system: (!self.system.is_empty()).then(|| self.system.join("\n\n")),
+            system: (!prompt.is_empty()).then(|| prompt.join("\n\n")),
             messages: self.messages,
         }
     }
@@ -440,8 +519,11 @@ mod tests {
         assert_eq!(log.messages(), [Message::user("hi")]);
     }
 
+    /// A developer message's non-empty text blocks stay separate, and a
+    /// later system message keeps its place. Before, both were joined into
+    /// the prompt.
     #[test]
-    fn system_and_developer_text_join_in_surface_order_with_blank_lines() {
+    fn later_system_and_developer_messages_keep_their_place() {
         let log = log_of(vec![
             system("You are terse."),
             user("hi"),
@@ -454,10 +536,157 @@ mod tests {
             system("Also polite."),
         ]);
         assert_eq!(
-            log.history().system.as_deref(),
-            Some("You are terse.\n\nfirst\nsecond\n\nAlso polite.")
+            log.history(),
+            crate::History {
+                system: Some("You are terse.".into()),
+                messages: vec![
+                    Message::user("hi"),
+                    message(
+                        Role::Developer,
+                        vec![Block::Text("first".into()), Block::Text("second".into())]
+                    ),
+                    Message::system("Also polite."),
+                ],
+            }
         );
-        assert_eq!(log.messages(), [Message::user("hi")]);
+    }
+
+    /// The test the brief asks for: system "A", user, assistant, system
+    /// "B", user. Only "A" is the prompt; "B" stays where it was logged.
+    #[test]
+    fn only_the_leading_system_message_becomes_the_prompt() {
+        let log = log_of(vec![
+            system("A"),
+            user("first"),
+            answer("one"),
+            system("B"),
+            user("second"),
+        ]);
+        assert_eq!(
+            log.history(),
+            crate::History {
+                system: Some("A".into()),
+                messages: vec![
+                    Message::user("first"),
+                    message(Role::Assistant, vec![Block::Text("one".into())]),
+                    Message::system("B"),
+                    Message::user("second"),
+                ],
+            }
+        );
+    }
+
+    // dsh v4 llm-pi-ai context.spec.ts: "maps a leading system message to
+    // systemPrompt" and "preserves later system messages for pi-ai to
+    // resolve model support". An empty system node derives to nothing, so
+    // it neither adds to the prompt nor ends the leading run.
+    #[test]
+    fn every_system_message_before_the_first_other_message_joins_the_prompt() {
+        let log = log_of(vec![
+            SessionEvent::system(1, 1, SystemMessage::new("empty", "")),
+            system("lead"),
+            system("rule"),
+            user("hi"),
+            system("additional rule"),
+            system("lead"),
+            SessionEvent::system(1, 1, SystemMessage::new("empty-2", "")),
+        ]);
+        assert_eq!(
+            log.history(),
+            crate::History {
+                system: Some("lead\n\nrule".into()),
+                messages: vec![
+                    Message::user("hi"),
+                    Message::system("additional rule"),
+                    Message::system("lead"),
+                ],
+            }
+        );
+    }
+
+    // dsh v4 llm-pi-ai context.spec.ts: "keeps a later update distinct from
+    // an absent initial prompt".
+    #[test]
+    fn a_system_message_after_a_user_message_is_not_the_prompt() {
+        let log = log_of(vec![user("hi"), system("lead rule")]);
+        assert_eq!(log.history().system, None);
+        assert_eq!(
+            log.messages(),
+            [Message::user("hi"), Message::system("lead rule")]
+        );
+    }
+
+    // dsh v4 llm-pi-ai context.spec.ts: "keeps developer text and tool
+    // changes together at their recorded position", for the text, and
+    // `splitSystemPrompt`, which stops at the first message that isn't a
+    // system message. A developer message with only tool changes leaves no
+    // message, but the system message after it isn't the prompt.
+    #[test]
+    fn a_developer_message_ends_the_leading_run() {
+        let log = log_of(vec![
+            system("lead"),
+            developer(vec![ContentBlock::Other(
+                json!({ "type": "tool-addition", "toolName": "search" }),
+            )]),
+            system("later"),
+            user("hi"),
+        ]);
+        assert_eq!(
+            log.history(),
+            crate::History {
+                system: Some("lead".into()),
+                messages: vec![Message::system("later"), Message::user("hi")],
+            }
+        );
+    }
+
+    // pi-ai's transform holds a system message that comes between a tool
+    // call and its results until the results are in
+    // (`transform-messages.js:130-183`); dsh's DeepSeek adapter expects
+    // the same order ("places system updates after all parallel tool
+    // results and before the next assistant").
+    #[test]
+    fn system_messages_logged_inside_a_tool_round_come_after_its_results() {
+        let log = log_of(vec![
+            system("original"),
+            user("go"),
+            assistant(vec![call("a"), call("b")]),
+            system("first update"),
+            result_event("a", "1"),
+            system("second update"),
+            result_event("b", "2"),
+            user("more input"),
+            answer("done"),
+        ]);
+        assert_eq!(
+            log.messages(),
+            [
+                Message::user("go"),
+                message(Role::Assistant, vec![call("a"), call("b")]),
+                message(
+                    Role::User,
+                    vec![
+                        Block::ToolResult(result("a", "1")),
+                        Block::ToolResult(result("b", "2")),
+                    ]
+                ),
+                Message::system("first update"),
+                Message::system("second update"),
+                Message::user("more input"),
+                message(Role::Assistant, vec![Block::Text("done".into())]),
+            ]
+        );
+    }
+
+    // A system message whose text is empty is still a message in v4, and
+    // each provider decides what to do with it: pi-ai skips it, and dsh's
+    // DeepSeek adapter refuses or clears the prompt.
+    #[test]
+    fn a_later_system_message_with_empty_text_is_kept() {
+        let mut empty_text = SystemMessage::new("system-empty", "");
+        empty_text.content.push(ContentBlock::text(""));
+        let log = log_of(vec![user("hi"), SessionEvent::system(1, 1, empty_text)]);
+        assert_eq!(log.messages(), [Message::user("hi"), Message::system("")]);
     }
 
     // dsh v4 surface.spec.ts: "retains an empty developer node while
@@ -624,67 +853,6 @@ mod tests {
         assert!(
             error.contains("must target a current tool/result"),
             "{error}"
-        );
-    }
-
-    #[test]
-    fn reasoning_signatures_come_from_the_replay_state_when_it_lines_up() {
-        let content = vec![
-            Block::Reasoning {
-                text: "thinking".into(),
-                replay: Some("sig-1".into()),
-            },
-            Block::Text("answer".into()),
-        ];
-        let written = AssistantMessage::from_model("m", "anthropic", "claude", &content);
-        assert_eq!(
-            written.source.replay_state,
-            Some(json!({ "blocks": [
-                { "type": "reasoning", "thinkingSignature": "sig-1" },
-                { "type": "text" },
-            ] }))
-        );
-        assert_eq!(written.blocks(), content);
-    }
-
-    #[test]
-    fn a_replay_state_that_does_not_line_up_drops_every_signature() {
-        let unsigned = vec![
-            Block::Reasoning {
-                text: "thinking".into(),
-                replay: None,
-            },
-            Block::Text("answer".into()),
-        ];
-        let with_state = |state| {
-            let mut message = AssistantMessage::from_model("m", "anthropic", "claude", &unsigned);
-            message.source.replay_state = Some(state);
-            message.blocks()
-        };
-        let signed = json!({ "type": "reasoning", "thinkingSignature": "sig-1" });
-        // Too few entries, then entries of the wrong type.
-        assert_eq!(with_state(json!({ "blocks": [signed] })), unsigned);
-        assert_eq!(
-            with_state(json!({ "blocks": [{ "type": "text" }, signed] })),
-            unsigned
-        );
-        // A pi-ai response half that names another model.
-        let other_model = json!({
-            "response": { "kind": "pi-ai", "provider": "anthropic", "model": "other" },
-            "blocks": [signed, { "type": "text" }],
-        });
-        assert_eq!(with_state(other_model), unsigned);
-        // The same, naming this model, is trusted.
-        let same_model = json!({
-            "response": { "kind": "pi-ai", "provider": "anthropic", "model": "claude" },
-            "blocks": [signed, { "type": "text" }],
-        });
-        assert_eq!(
-            with_state(same_model)[0],
-            Block::Reasoning {
-                text: "thinking".into(),
-                replay: Some("sig-1".into())
-            }
         );
     }
 

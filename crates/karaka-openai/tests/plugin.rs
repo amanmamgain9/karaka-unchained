@@ -99,6 +99,7 @@ fn config(route: &str, base_url: String) -> OpenAiConfig {
         default_effort: None,
         thinking: None,
         max_tokens_field: MaxTokensField::MaxTokens,
+        system_messages_in_history: false,
     }
 }
 
@@ -132,6 +133,7 @@ async fn the_plugin_registers_a_model_that_answers() {
         default_effort: Some(Effort::High),
         thinking: Some(true),
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        system_messages_in_history: false,
     });
 
     let runtime = Runtime::start(with_registry(vec![plugin]))
@@ -194,6 +196,7 @@ async fn a_default_effort_with_thinking_off_stops_the_runtime_from_starting() {
         default_effort: Some(Effort::Low),
         thinking: Some(false),
         max_tokens_field: MaxTokensField::MaxTokens,
+        system_messages_in_history: false,
     });
 
     let Err(StartError::Failed { source, .. }) = Runtime::start(with_registry(vec![plugin])).await
