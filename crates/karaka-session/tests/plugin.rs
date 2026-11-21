@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use karaka_kernel::Runtime;
 use karaka_model::Message;
-use karaka_session::{SessionEvent, SessionId, SessionStore, SessionsPlugin};
+use karaka_session::{
+    SessionEvent, SessionId, SessionStore, SessionsPlugin, UserMessage, UserSource,
+};
 
 #[tokio::test]
 async fn the_plugin_provides_an_empty_store() {
@@ -18,7 +20,8 @@ async fn the_plugin_provides_an_empty_store() {
 
     let id = SessionId::new("a");
     store.create(id.clone()).expect("the id is free");
-    store.append(&id, SessionEvent::user("hi")).unwrap();
+    let hi = UserMessage::text("msg-1", UserSource::user(), "hi");
+    store.append(&id, SessionEvent::user(hi)).unwrap();
 
     // Every read of the port reaches the same store.
     let again = runtime.get::<SessionStore>();

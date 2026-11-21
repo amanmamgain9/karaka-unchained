@@ -194,3 +194,34 @@ Still open from the audit:
 - **Kernel gaps.** Hooks, per-agent composition and cleanup.
 - **The session v4 work.** Everything listed above under session
   format v4.
+
+## Session events at v4, 2026-11-21
+
+`karaka-session` now follows dsh tag `dsh-v0.2.1-rc.2`, the release Play
+This Life runs, with session format v4:
+
+- **Events and their JSON.** The five surface events, turn and step
+  boundaries, `tool/call`, and a passthrough for every other event type.
+  The JSON is v4's envelope, and each original seq is kept.
+- **Derivation.** It returns the system prompt beside the messages, and
+  never makes up a tool result.
+- **Repair.** It follows v4: on load, it computes closer events to append,
+  scoped to the open last turn.
+
+What doesn't round-trip exactly (value-equal, not byte-identical):
+
+- **Key order.** Known fields come out in struct order.
+- **Number text.** `1e21` is written `1e+21`.
+- **`null`.** It is dropped from typed optional fields.
+- **Lone UTF-16 surrogates** (`"\ud800"`). serde_json refuses them, so a
+  stored log containing one would fail to load. This is a real risk:
+  Play This Life's `json` column keeps them. It needs a fix before
+  migrating stored chats.
+
+Also still open:
+
+- **Orphaned calls in closed steps.** Nothing patches them at request
+  time, as pi-ai's "No result provided" does. That belongs in the loop
+  or the providers.
+- **Unknown event types.** They pass through even when not marked
+  `ignorable`, where dsh refuses them.

@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 
 use karaka_model::Message;
 
+use crate::derive::History;
 use crate::event::{Entry, Seq, SessionEvent};
-use crate::log::SessionLog;
+use crate::log::{LogError, SessionLog};
 
 /// Names one session in a [`SessionStore`]. (dsh: `SessionId`.)
 ///
@@ -39,6 +40,8 @@ pub enum SessionError {
     NotFound(SessionId),
     /// A session with this id exists already. (dsh: `SESSION_ALREADY_EXISTS`.)
     AlreadyExists(SessionId),
+    /// The session's log refused an event.
+    Log(LogError),
 }
 
 impl fmt::Display for SessionError {
@@ -46,11 +49,25 @@ impl fmt::Display for SessionError {
         match self {
             Self::NotFound(id) => write!(f, "no session has the id \"{id}\""),
             Self::AlreadyExists(id) => write!(f, "a session with the id \"{id}\" already exists"),
+            Self::Log(error) => error.fmt(f),
         }
     }
 }
 
-impl Error for SessionError {}
+impl Error for SessionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Log(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<LogError> for SessionError {
+    fn from(error: LogError) -> Self {
+        Self::Log(error)
+    }
+}
 
 /// A handle to one session in a store.
 ///
@@ -62,7 +79,9 @@ impl Error for SessionError {}
 /// can keep the handle across an `.await`, such as a model call, while other
 /// connections read the same session. Keeping two turns of one session from
 /// mixing their events is the loop's job, as in dsh, where a session has one
-/// active turn at a time.
+/// active turn at a time. Events that must sit together, such as a round's
+/// results, go in through [`append_all`](Self::append_all), which holds the
+/// lock for the whole batch.
 #[derive(Clone, Debug)]
 pub struct Session {
     id: SessionId,
@@ -70,10 +89,10 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(id: SessionId) -> Self {
+    fn new(id: SessionId, log: SessionLog) -> Self {
         Self {
             id,
-            log: Arc::default(),
+            log: Arc::new(Mutex::new(log)),
         }
     }
 
@@ -82,8 +101,29 @@ impl Session {
     }
 
     /// See [`SessionLog::append`].
-    pub fn append(&self, event: SessionEvent) -> Seq {
+    pub fn append(&self, event: SessionEvent) -> Result<Seq, LogError> {
         self.lock().append(event)
+    }
+
+    /// Appends every event in `events` under one lock, so no other writer's
+    /// event lands between them. All or none are added. See
+    /// [`SessionLog::append_all`].
+    pub fn append_all(
+        &self,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<Vec<Seq>, LogError> {
+        self.lock().append_all(events)
+    }
+
+    /// Works out and appends the closers for a turn a crash left open,
+    /// under one lock. See [`SessionLog::repair`].
+    pub fn repair(&self) -> Result<Vec<Entry>, LogError> {
+        self.lock().repair()
+    }
+
+    /// See [`SessionLog::history`].
+    pub fn history(&self) -> History {
+        self.lock().history()
     }
 
     /// See [`SessionLog::messages`].
@@ -96,6 +136,11 @@ impl Session {
         self.lock().events().to_vec()
     }
 
+    /// A copy of the events from `seq` on. See [`SessionLog::events_since`].
+    pub fn events_since(&self, seq: Seq) -> Vec<Entry> {
+        self.lock().events_since(seq).to_vec()
+    }
+
     pub fn len(&self) -> usize {
         self.lock().len()
     }
@@ -106,8 +151,9 @@ impl Session {
 
     fn lock(&self) -> MutexGuard<'_, SessionLog> {
         // A lock is "poisoned" when a thread panicked while holding it. Every
-        // change to a log is one push that either happened or didn't, so the
-        // log is still whole, and it's safe to carry on with it.
+        // change to a log is checked before anything is pushed, and a batch
+        // is undone before its error is returned, so the log is still whole,
+        // and it's safe to carry on with it.
         self.log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -157,7 +203,28 @@ impl SessionStore {
         if sessions.by_id.contains_key(&id) {
             return Err(SessionError::AlreadyExists(id));
         }
-        Ok(sessions.insert(id))
+        Ok(sessions.insert(id, SessionLog::new()))
+    }
+
+    /// Adds the session `id` with the events storage gave back for it, every
+    /// seq and time kept. Fails if the id is taken or an event doesn't fit;
+    /// either way the store is unchanged. See [`SessionLog::restore`].
+    ///
+    /// Nothing is repaired here. The code that resumes the session calls
+    /// [`Session::repair`] before it continues the session.
+    pub fn restore(
+        &self,
+        id: SessionId,
+        entries: impl IntoIterator<Item = Entry>,
+    ) -> Result<Session, SessionError> {
+        // The log is checked before the map is locked, so a long log never
+        // holds up other sessions.
+        let log = SessionLog::restore(entries)?;
+        let mut sessions = self.write();
+        if sessions.by_id.contains_key(&id) {
+            return Err(SessionError::AlreadyExists(id));
+        }
+        Ok(sessions.insert(id, log))
     }
 
     /// The session called `id`, started empty if there's none yet.
@@ -173,7 +240,7 @@ impl SessionStore {
         // write lock, so look again.
         match sessions.by_id.get(&id) {
             Some(session) => session.clone(),
-            None => sessions.insert(id),
+            None => sessions.insert(id, SessionLog::new()),
         }
     }
 
@@ -184,10 +251,25 @@ impl SessionStore {
 
     /// Appends `event` to the session called `id` and returns its seq.
     pub fn append(&self, id: &SessionId, event: SessionEvent) -> Result<Seq, SessionError> {
-        Ok(self.session(id)?.append(event))
+        Ok(self.session(id)?.append(event)?)
     }
 
-    /// The model's history for the session called `id`.
+    /// Appends `events` to the session called `id` as one batch. See
+    /// [`Session::append_all`].
+    pub fn append_all(
+        &self,
+        id: &SessionId,
+        events: impl IntoIterator<Item = SessionEvent>,
+    ) -> Result<Vec<Seq>, SessionError> {
+        Ok(self.session(id)?.append_all(events)?)
+    }
+
+    /// The system prompt and conversation for the session called `id`.
+    pub fn history(&self, id: &SessionId) -> Result<History, SessionError> {
+        Ok(self.session(id)?.history())
+    }
+
+    /// The model's conversation for the session called `id`.
     pub fn messages(&self, id: &SessionId) -> Result<Vec<Message>, SessionError> {
         Ok(self.session(id)?.messages())
     }
@@ -195,6 +277,11 @@ impl SessionStore {
     /// A copy of the events of the session called `id`.
     pub fn events(&self, id: &SessionId) -> Result<Vec<Entry>, SessionError> {
         Ok(self.session(id)?.events())
+    }
+
+    /// A copy of the events of the session called `id`, from `seq` on.
+    pub fn events_since(&self, id: &SessionId, seq: Seq) -> Result<Vec<Entry>, SessionError> {
+        Ok(self.session(id)?.events_since(seq))
     }
 
     /// Every session's id, in the order they were created. (dsh: `list`.)
@@ -221,9 +308,10 @@ impl SessionStore {
 }
 
 impl Sessions {
-    /// Adds a new, empty session. The caller has checked `id` is free.
-    fn insert(&mut self, id: SessionId) -> Session {
-        let session = Session::new(id.clone());
+    /// Adds a new session holding `log`. The caller has checked `id` is
+    /// free.
+    fn insert(&mut self, id: SessionId, log: SessionLog) -> Session {
+        let session = Session::new(id.clone(), log);
         self.by_id.insert(id.clone(), session.clone());
         self.order.push(id);
         session

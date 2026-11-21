@@ -1,0 +1,169 @@
+[
+  { "type": "turn/start", "seq": 0, "time": 1700000000000, "data": { "turn": 1 } },
+  { "type": "step/start", "seq": 1, "time": 1700000000001, "data": { "turn": 1, "step": 1 } },
+  {
+    "type": "request/header", "seq": 2, "time": 1700000000002,
+    "data": {
+      "header": {
+        "config": { "provider": "mock", "model": "mock-1", "reasoningEffort": "medium" },
+        "tools": [
+          {
+            "name": "clock",
+            "description": "Reads a fake clock.",
+            "parameters": { "type": "object", "properties": { "zone": { "type": "string" } } }
+          }
+        ]
+      },
+      "reason": "initial"
+    }
+  },
+  {
+    "type": "system/message", "seq": 3, "time": 1700000000003, "surfaceOp": "append",
+    "data": {
+      "turn": 1, "step": 1,
+      "message": {
+        "role": "system",
+        "content": [{ "type": "text", "text": "You are a test assistant." }],
+        "source": { "kind": "system-prompt" },
+        "id": "msg-system-1"
+      }
+    }
+  },
+  {
+    "type": "user/message", "seq": 4, "time": 1700000000004, "surfaceOp": "append",
+    "data": {
+      "content": [{ "type": "text", "text": "What time is it in two places?" }],
+      "source": { "kind": "user", "rpcId": "rpc-1", "clientTimeZone": "UTC" },
+      "role": "user",
+      "id": "msg-user-1"
+    }
+  },
+  {
+    "type": "user/message", "seq": 5, "time": 1700000000005, "surfaceOp": "append",
+    "data": {
+      "content": [{ "type": "text", "text": "Runtime context: fake clock reads 12:00." }],
+      "source": {
+        "kind": "runtime-context",
+        "form": "snapshot",
+        "sections": [{ "name": "clock", "text": "Fake clock reads 12:00." }]
+      },
+      "role": "user",
+      "id": "msg-context-1"
+    }
+  },
+  {
+    "type": "assistant/attempt", "seq": 6, "time": 1700000000006,
+    "data": {
+      "turn": 1, "step": 1,
+      "stream": [
+        { "type": "text-chunks", "time0": 1700000000006, "index": 0, "dt": [3], "texts": ["Let", " me"] },
+        { "type": "chunk", "time": 1700000000010, "chunk": { "type": "error", "failure": { "message": "overloaded", "code": "OVERLOADED", "status": 529 } } }
+      ]
+    }
+  },
+  {
+    "type": "assistant/message", "seq": 7, "time": 1700000000020, "surfaceOp": "append",
+    "data": {
+      "turn": 1, "step": 1,
+      "message": {
+        "role": "assistant",
+        "content": [
+          { "type": "reasoning", "text": "Two zones, two calls." },
+          { "type": "text", "text": "Let me check both." },
+          { "type": "tool-call", "id": "call-a", "name": "clock", "arguments": "{\"zone\":\"UTC\"}" },
+          { "type": "tool-call", "id": "call-b", "name": "clock", "arguments": "{\"zone\":\"UTC+6\"}" }
+        ],
+        "source": {
+          "kind": "model",
+          "provider": "mock",
+          "model": "mock-1",
+          "replayState": {
+            "response": { "kind": "pi-ai", "version": 2, "api": "mock-api", "provider": "mock", "model": "mock-1", "stopReason": "toolUse" },
+            "blocks": [
+              { "type": "reasoning", "thinkingSignature": "sig-fixture-1" },
+              { "type": "text" },
+              { "type": "tool-call" },
+              { "type": "tool-call" }
+            ]
+          }
+        },
+        "id": "msg-assistant-1"
+      },
+      "usage": { "inputTokens": 40, "outputTokens": 12, "totalTokens": 60, "cacheReadTokens": 8 },
+      "stream": [
+        { "type": "reasoning-chunks", "time0": 1700000000011, "index": 0, "dt": [], "texts": ["Two zones, two calls."] },
+        { "type": "text-chunks", "time0": 1700000000012, "index": 1, "dt": [], "texts": ["Let me check both."] },
+        { "type": "tool-call-chunks", "time0": 1700000000013, "index": 2, "dt": [], "id": "call-a", "name": "clock", "args": ["{\"zone\":\"UTC\"}"] },
+        { "type": "tool-call-chunks", "time0": 1700000000014, "index": 3, "dt": [], "id": "call-b", "name": "clock", "args": ["{\"zone\":\"UTC+6\"}"] }
+      ]
+    }
+  },
+  {
+    "type": "approval/asked", "seq": 8, "time": 1700000000021,
+    "data": { "id": "approval-1", "toolName": "clock", "callId": "call-a", "reason": "Reads the clock." }
+  },
+  {
+    "type": "approval/decided", "seq": 9, "time": 1700000000022,
+    "data": { "id": "approval-1", "outcome": "allowed-once" }
+  },
+  {
+    "type": "tool/call", "seq": 10, "time": 1700000000023,
+    "data": { "turn": 1, "step": 1, "callId": "call-a", "name": "clock", "arguments": "{\"zone\":\"UTC\"}" }
+  },
+  {
+    "type": "tool/call", "seq": 11, "time": 1700000000024,
+    "data": { "turn": 1, "step": 1, "callId": "call-b", "name": "clock", "arguments": "{\"zone\":\"UTC+6\"}" }
+  },
+  {
+    "type": "tool/result", "seq": 12, "time": 1700000000030, "surfaceOp": "append", "sourceEventSeqs": [11],
+    "data": {
+      "turn": 1, "step": 1,
+      "message": {
+        "role": "tool",
+        "source": { "kind": "tool", "callId": "call-b" },
+        "toolCallId": "call-b",
+        "content": [{ "type": "text", "text": "18:00" }],
+        "isError": false,
+        "id": "msg-result-b"
+      },
+      "meta": { "card": "clock", "zone": "UTC+6" }
+    }
+  },
+  {
+    "type": "tool/result", "seq": 13, "time": 1700000000031, "sourceEventSeqs": [10], "surfaceOp": "append",
+    "data": {
+      "turn": 1, "step": 1,
+      "message": {
+        "role": "tool",
+        "source": { "kind": "tool", "callId": "call-a" },
+        "toolCallId": "call-a",
+        "content": [{ "type": "text", "text": "Error: this tool needs the pro plan." }],
+        "isError": true,
+        "id": "msg-result-a"
+      },
+      "error": { "name": "ToolError", "code": "pro_required", "reason": "The pro plan is required." }
+    }
+  },
+  { "type": "step/end", "seq": 14, "time": 1700000000032, "data": { "turn": 1, "step": 1 } },
+  { "type": "step/start", "seq": 15, "time": 1700000000033, "data": { "turn": 1, "step": 2 } },
+  {
+    "type": "assistant/message", "seq": 16, "time": 1700000000040, "surfaceOp": "append",
+    "data": {
+      "turn": 1, "step": 2,
+      "message": {
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "It is 18:00 in UTC+6. The other clock needs the pro plan." }],
+        "source": { "kind": "model", "provider": "mock", "model": "mock-1" },
+        "id": "msg-assistant-2"
+      },
+      "usage": { "inputTokens": 70, "outputTokens": 15 },
+      "stream": []
+    }
+  },
+  { "type": "step/end", "seq": 17, "time": 1700000000041, "data": { "turn": 1, "step": 2 } },
+  {
+    "type": "plugin:test/marker", "seq": 18, "time": 1700000000042, "ignorable": true,
+    "data": { "note": "an ignorable plugin record" }
+  },
+  { "type": "turn/end", "seq": 19, "time": 1700000000043, "data": { "turn": 1, "reason": { "kind": "completed" } } }
+]

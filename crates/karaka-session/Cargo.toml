@@ -7,13 +7,19 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# No id generator and no serde yet. Callers supply session ids, and events
-# get `Serialize`/`Deserialize` when the first persistence plugin needs them.
+# No id generator yet: callers supply session ids and message ids.
 [dependencies]
 # For the plugin that puts the store in a runtime.
 karaka-kernel.workspace = true
-# The conversation types the log records and derives.
+# The conversation types the log derives.
 karaka-model.workspace = true
+# Events read and write dsh v4's JSON envelope, as Play This Life stores it.
+serde.workspace = true
+# Every event type Karaka doesn't model is kept as raw JSON. `preserve_order`
+# keeps the keys of that JSON in the order they were read, so it is written
+# back the same way. dsh compares some stored values by their JSON text, such
+# as tool schemas in `request/header`, so key order can matter to it.
+serde_json = { workspace = true, features = ["preserve_order"] }
 
 # Only for running the async plugin test.
 [dev-dependencies]
