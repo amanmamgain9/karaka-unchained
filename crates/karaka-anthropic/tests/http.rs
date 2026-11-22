@@ -7,7 +7,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use karaka_anthropic::{AnthropicModel, ThinkingDisplay};
 use karaka_model::{
-    ErrorKind, Event, Message, Model, ModelError, Request, StopReason, ToolSchema, complete,
+    ErrorKind, Event, FinishReason, Message, Model, ModelError, Request, ToolSchema, complete,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -122,9 +122,9 @@ async fn a_streamed_text_answer() {
         .await
         .expect("the call works");
     assert_eq!(response.message.text(), "Hello");
-    assert_eq!(response.stop, StopReason::EndTurn);
-    assert_eq!(response.usage.input_tokens, 20);
-    assert_eq!(response.usage.output_tokens, 5);
+    assert_eq!(response.finish, FinishReason::Stop);
+    assert_eq!(response.usage.unwrap().input_tokens, 20);
+    assert_eq!(response.usage.unwrap().output_tokens, 5);
 
     let sent = server.await.expect("the server ran");
     let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
@@ -229,9 +229,10 @@ async fn a_stream_that_stops_early_is_a_network_error() {
     while let Some(item) = stream.next().await {
         items.push(item);
     }
-    // The delta that arrived is passed on, then the failure ends the stream.
-    assert_eq!(items.len(), 2, "{items:?}");
-    let error = items[1].clone().expect_err("the last item is the failure");
+    // The block's start and the delta that arrived are passed on, then the
+    // failure ends the stream.
+    assert_eq!(items.len(), 3, "{items:?}");
+    let error = items[2].clone().expect_err("the last item is the failure");
     assert_eq!(error.kind, ErrorKind::Network);
 }
 
@@ -370,11 +371,13 @@ async fn a_refusal_after_some_text_ends_the_stream_in_an_error() {
     while let Some(item) = stream.next().await {
         items.push(item);
     }
-    // The delta and the text block went out before the refusal arrived.
-    assert_eq!(items.len(), 3, "{items:?}");
-    assert!(matches!(items[0], Ok(Event::TextDelta(_))));
-    assert!(matches!(items[1], Ok(Event::Block(_))));
-    let error = items[2].clone().expect_err("the last item is the refusal");
+    // The block's start, its delta and its end went out before the
+    // refusal arrived.
+    assert_eq!(items.len(), 4, "{items:?}");
+    assert!(matches!(items[0], Ok(Event::BlockStart { .. })));
+    assert!(matches!(items[1], Ok(Event::TextDelta { .. })));
+    assert!(matches!(items[2], Ok(Event::BlockEnd { .. })));
+    let error = items[3].clone().expect_err("the last item is the refusal");
     assert_eq!(error.kind, ErrorKind::Refused);
     let category = error.refusal.and_then(|refusal| refusal.category);
     assert_eq!(category.as_deref(), Some("bio"));

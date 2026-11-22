@@ -12,7 +12,7 @@
 use std::io::{self, Write};
 
 use karaka_agent::{AssistantStreamFrame, StreamChunk};
-use karaka_model::{Event, ModelError, StopReason, Usage};
+use karaka_model::{Event, FinishReason, ModelError, Usage};
 use karaka_session::{Failure, TurnEndReason};
 
 /// Terminal escape codes that dim text, and that end the dimming.
@@ -32,6 +32,8 @@ pub struct Printer {
     attempt_wrote_text: bool,
     in_reasoning: bool,
     attempts: u64,
+    /// The usage the attempt reported, for the summary after its finish.
+    usage: Option<Usage>,
     /// The failure the last attempt ended with, as the model gave it.
     failure: Option<ModelError>,
     /// The first write that failed. Printing stops there.
@@ -46,6 +48,7 @@ impl Printer {
             attempt_wrote_text: false,
             in_reasoning: false,
             attempts: 0,
+            usage: None,
             failure: None,
             write_error: None,
         }
@@ -67,7 +70,7 @@ impl Printer {
         let more_reasoning = matches!(
             frame,
             AssistantStreamFrame::Chunk {
-                chunk: StreamChunk::Event(Event::ReasoningDelta(_)),
+                chunk: StreamChunk::Event(Event::ReasoningDelta { .. }),
                 ..
             }
         );
@@ -82,10 +85,11 @@ impl Printer {
                     eprintln!("karaka: trying again");
                 }
                 self.attempt_wrote_text = false;
+                self.usage = None;
                 self.failure = None;
             }
             AssistantStreamFrame::Chunk { chunk, .. } => match chunk {
-                StreamChunk::Event(Event::TextDelta(text)) => {
+                StreamChunk::Event(Event::TextDelta { text, .. }) => {
                     // Flushed every time, or the text would wait for a
                     // newline.
                     stdout.write_all(text.as_bytes())?;
@@ -93,17 +97,26 @@ impl Printer {
                     self.wrote_text = true;
                     self.attempt_wrote_text = true;
                 }
-                StreamChunk::Event(Event::ReasoningDelta(text)) if self.show_reasoning => {
+                StreamChunk::Event(Event::ReasoningDelta { text, .. }) if self.show_reasoning => {
                     eprint!("{DIM}{text}{RESET}");
                     self.in_reasoning = true;
                 }
-                StreamChunk::Event(Event::ReasoningDelta(_) | Event::Block(_)) => {}
-                StreamChunk::Event(Event::Done { stop, usage }) => {
+                StreamChunk::Event(Event::Usage { usage }) => self.usage = Some(*usage),
+                StreamChunk::Event(Event::Finish { reason }) => {
                     writeln!(stdout)?;
                     stdout.flush()?;
                     self.wrote_text = false;
-                    eprintln!("{}", summary(stop, usage));
+                    eprintln!(
+                        "{}",
+                        summary(reason, &self.usage.take().unwrap_or_default())
+                    );
                 }
+                StreamChunk::Event(
+                    Event::ReasoningDelta { .. }
+                    | Event::BlockStart { .. }
+                    | Event::ToolCallDelta { .. }
+                    | Event::BlockEnd { .. },
+                ) => {}
                 StreamChunk::Failed(error) => {
                     // Ends the half-written answer, so whatever comes next,
                     // a retry or the error, starts on a line of its own.
@@ -147,12 +160,12 @@ fn other_failure(failure: &Failure) -> String {
 
 /// The line that follows the answer, such as
 /// `stop: finished · in 12 (+100 cached) · out 34 tokens`.
-fn summary(stop: &StopReason, usage: &Usage) -> String {
+fn summary(stop: &FinishReason, usage: &Usage) -> String {
     let stop = match stop {
-        StopReason::EndTurn => "finished",
-        StopReason::ToolCalls => "asked to call tools",
-        StopReason::MaxTokens => "reached the token limit",
-        StopReason::Paused => "paused before finishing",
+        FinishReason::Stop => "finished",
+        FinishReason::ToolCalls => "asked to call tools",
+        FinishReason::MaxTokens => "reached the token limit",
+        FinishReason::Paused => "paused before finishing",
     };
     let mut cache = Vec::new();
     if usage.cache_read_tokens > 0 {
@@ -190,7 +203,7 @@ mod tests {
     use std::time::Duration;
 
     use karaka_agent::{AssistantStreamFrame, StreamChunk};
-    use karaka_model::{ErrorKind, ModelError, Refusal, StopReason, Usage};
+    use karaka_model::{ErrorKind, FinishReason, ModelError, Refusal, Usage};
     use karaka_session::{Failure, TurnEndReason};
 
     use super::{Printer, describe, summary};
@@ -255,7 +268,7 @@ mod tests {
             cache_write_tokens: 0,
         };
         assert_eq!(
-            summary(&StopReason::EndTurn, &usage),
+            summary(&FinishReason::Stop, &usage),
             "stop: finished · in 12 (+100 cached) · out 34 tokens"
         );
     }
@@ -268,7 +281,7 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(
-            summary(&StopReason::MaxTokens, &usage),
+            summary(&FinishReason::MaxTokens, &usage),
             "stop: reached the token limit · in 5 · out 0 tokens"
         );
     }

@@ -346,9 +346,9 @@ async fn step(state: State) -> Step {
 async fn read(mut reading: Reading) -> Step {
     loop {
         if let Some(event) = reading.pending.pop_front() {
-            // `Done` is always last, so anything the server sends after it
+            // `Finish` is always last, so anything the server sends after it
             // is never read.
-            let next = if matches!(event, Event::Done { .. }) {
+            let next = if matches!(event, Event::Finish { .. }) {
                 State::Finished
             } else {
                 State::Reading(reading)

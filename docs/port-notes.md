@@ -652,9 +652,8 @@ system and user messages, before the stream.
 
 ### Where step four differs from dsh
 
-- **A chunk is a `karaka_model::Event`, not a dsh `StreamChunk`.** There are
-  no `block-start`, `block-end`, `tool-call-delta` or `usage` chunks: a block
-  arrives whole as `Event::Block`, and usage comes with `Event::Done`.
+- **A chunk is a `karaka_model::Event`.** Since step five, part A, that is
+  dsh's `StreamChunk` vocabulary, so the frames carry dsh's chunks.
 - **The failure chunk carries the model's own error.** dsh's failed stream
   ends with a `finish` chunk of kind `error`, carrying its `LlmFailure`.
   Karaka's chunk is `StreamChunk::Event(Event)` or `StreamChunk::Failed(ModelError)`,
@@ -691,3 +690,84 @@ printed text back, so `ask` ends the failed attempt's line, and when the
 next attempt starts, says `karaka: trying again` on stderr if the failed
 one had printed text. A failed attempt that printed nothing retries
 silently.
+
+## Agent loop, step five, part A: dsh's chunks in the model seam
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-22.*
+
+### What is done
+
+- **`karaka_model::Event` is dsh's `StreamChunk`** (`llm/src/types.ts:470-482`),
+  field for field:
+  - `BlockStart { index, block_type }`
+  - `TextDelta { index, text }` and `ReasoningDelta { index, text }`
+  - `ToolCallDelta { index, id, name, arguments_delta }`
+  - `BlockEnd { index, block }`
+  - `Usage { usage }`
+  - `Finish { reason }`
+
+  Blocks are numbered from 0 in the order they start. `BlockType` is `text`,
+  `reasoning` or `tool-call`.
+- **`FinishReason`** replaces `StopReason`. It has dsh's `stop`, `tool-calls`
+  and `max-tokens`, and Karaka's own `paused`, recorded as an extension;
+  dsh's `FinishReasonMap` is merge-extensible. `Response.stop` is now
+  `Response.finish`, and `Response.usage` is optional, as dsh's usage is
+  until its chunk arrives.
+- **Failures stay the stream's `Err(ModelError)`.** dsh's `finish` of kind
+  `error` waits for part B, where it is written into the logged stream.
+- **The providers stream dsh's chunks.**
+  - Anthropic and DeepSeek map `content_block_start`, `_delta` and `_stop`
+    one to one onto `block-start`, deltas and `block-end`. `message_stop`
+    gives `usage` and then `finish`, as dsh's `llm-deepseek/src/translate.ts`
+    does for the same events. DeepSeek also sends what dsh sends with a
+    start: a block's opening text as a delta, and a tool call's id and name
+    in an empty `tool-call-delta`.
+  - The Anthropic profile names the call in every `tool-call-delta`, as
+    pi-ai does (`llm-pi-ai/src/stream.ts:189-201`).
+  - OpenAI-compatible streams build their blocks as pi-ai's
+    `openai-completions` does: one text block, one reasoning block, and one
+    block per tool call, each opened by its first piece. Every piece goes
+    out as a delta at once. All blocks end when the stream ends, in index
+    order.
+  - Tool ids are there from the start in all three formats: Anthropic's and
+    DeepSeek's `content_block_start` carries the id and name, and an OpenAI
+    call's first piece carries its id. A server that sends no id gets
+    `call_<index>` at the block's end, as before.
+- **Nothing is held back any more.** A tool call cut off by `max_tokens`
+  streams and ends like any other, as dsh's adapters send it ("Truncated tool
+  JSON is retained in the stream, then pruned by the shared assembler",
+  `translate.ts:150`). Assembling drops it. This replaces the providers'
+  holding back of tool calls (`4b619b2`), and no consumer that assembles an
+  answer ever sees a cut-off call as a finished one.
+- **`BlockAssembler`** (`karaka-model`, `assembler.rs`) ports dsh's
+  `llm/src/assembler.ts`: `blocks`, `interrupted_blocks`, `usage`, `finish`,
+  and `response` once the finish arrives. `complete()` and the loop both use
+  it, in place of the loop's own `Answer`.
+- **`stream_of(blocks, reason, usage)`** scripts an answer as dsh's mock
+  adapter does: each block's start, its content as one delta, its end, then
+  `usage` and `finish`. The test fakes use it.
+- `karaka ask`'s printer and every test moved to the new chunks. ask's output
+  is unchanged; the CLI tests pass as they were.
+
+### Where part A differs from dsh
+
+- **No `replayState` on the finish.** dsh's adapters put reasoning signatures
+  in the `finish` chunk's `replayState`. Karaka's blocks carry their own
+  signatures, with where they came from (`Block::Reasoning.replay`), so
+  `BlockEnd` holds the signature and the finish holds none. The logged
+  message's `source.replayState` is still written from the blocks, as
+  before. Part B's logged `finish` record can compute the envelope from the
+  assembled blocks if dsh's replay tools need it there.
+- **An interrupted reasoning block keeps no signature unless the finish had
+  arrived.** This matches dsh, whose signatures only come with the finish.
+- **The finish is required.** dsh's assembler counts a missing finish as a
+  stop. A Karaka stream always ends with a finish or an error, so a stream
+  that just ends is a `Network` failure, as before.
+- **`tool-call-delta` names.** The Anthropic profile sends the name in every
+  delta, as pi-ai does. DeepSeek sends it once, at the start, as dsh's own
+  adapter does. OpenAI sends it in every piece once it is known.
+- **OpenAI block order** now follows pi-ai: within one chunk, text before
+  reasoning before tool calls, and blocks numbered in the order they first
+  appear. Before, reasoning always came first.
+- **No `totalTokens` or `reasoningTokens`** in `Usage`. dsh's DeepSeek
+  adapter computes a total; Karaka's `Usage` has no field for one.

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use karaka_model::{
-    ErrorKind, Event, Message, Model, ModelError, Request, StopReason, ToolSchema, complete,
+    ErrorKind, Event, FinishReason, Message, Model, ModelError, Request, ToolSchema, complete,
 };
 use karaka_openai::OpenAiModel;
 use serde_json::Value;
@@ -117,9 +117,9 @@ async fn a_streamed_text_answer() {
         .await
         .expect("the call works");
     assert_eq!(response.message.text(), "Hello");
-    assert_eq!(response.stop, StopReason::EndTurn);
-    assert_eq!(response.usage.input_tokens, 20);
-    assert_eq!(response.usage.output_tokens, 5);
+    assert_eq!(response.finish, FinishReason::Stop);
+    assert_eq!(response.usage.unwrap().input_tokens, 20);
+    assert_eq!(response.usage.unwrap().output_tokens, 5);
 
     let sent = server.await.expect("the server ran");
     let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
@@ -160,7 +160,7 @@ async fn a_body_that_ends_after_the_finish_reason_still_finishes() {
         .await
         .expect("the call works");
     assert_eq!(response.message.text(), "Hello");
-    assert_eq!(response.stop, StopReason::EndTurn);
+    assert_eq!(response.finish, FinishReason::Stop);
 }
 
 #[tokio::test]
@@ -219,9 +219,10 @@ async fn a_stream_cut_off_before_the_finish_reason_is_a_network_error() {
     let (address, _server) = serve_once(streamed(&[HEL])).await;
 
     let items = drain(&model(address)).await;
-    // The delta that arrived is passed on, then the failure ends the stream.
-    assert_eq!(items.len(), 2, "{items:?}");
-    let error = items[1].clone().expect_err("the last item is the failure");
+    // The text block's start and the delta that arrived are passed on,
+    // then the failure ends the stream.
+    assert_eq!(items.len(), 3, "{items:?}");
+    let error = items[2].clone().expect_err("the last item is the failure");
     assert_eq!(error.kind, ErrorKind::Network);
 }
 
@@ -356,8 +357,9 @@ async fn a_content_filter_ends_the_stream_in_a_refusal() {
     let (address, _server) = serve_once(streamed(&[HEL, filter, "[DONE]"])).await;
 
     let items = drain(&model(address)).await;
-    // The delta that arrived is passed on, then the refusal ends the stream.
-    assert_eq!(items.len(), 2, "{items:?}");
-    let error = items[1].clone().expect_err("the last item is the refusal");
+    // The text block's start and the delta that arrived are passed on,
+    // then the refusal ends the stream.
+    assert_eq!(items.len(), 3, "{items:?}");
+    let error = items[2].clone().expect_err("the last item is the refusal");
     assert_eq!(error.kind, ErrorKind::Refused);
 }

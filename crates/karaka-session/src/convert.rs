@@ -49,7 +49,7 @@
 //! provider and model, and v4 compares those with the message's source: the
 //! signatures survive only if the caller gave the same ones.
 
-use karaka_model::{Block, Origin, Replay, Response, StopReason, ToolCall, ToolResult, Usage};
+use karaka_model::{Block, FinishReason, Origin, Replay, Response, ToolCall, ToolResult, Usage};
 use serde_json::{Map, Value, json};
 
 use crate::data::{AssistantMessageData, ToolResultData};
@@ -159,9 +159,9 @@ impl AssistantMessage {
     ) -> Self {
         let calls_tools = content.iter().any(|b| matches!(b, Block::ToolCall(_)));
         let stop = if calls_tools {
-            StopReason::ToolCalls
+            FinishReason::ToolCalls
         } else {
-            StopReason::EndTurn
+            FinishReason::Stop
         };
         Self::answer(id, provider, model, content, stop)
     }
@@ -171,7 +171,7 @@ impl AssistantMessage {
         provider: impl Into<String>,
         model: impl Into<String>,
         content: &[Block],
-        stop: StopReason,
+        stop: FinishReason,
     ) -> Self {
         let mut blocks = Vec::new();
         // Each block's replay, lined up with `blocks`.
@@ -414,7 +414,7 @@ fn pi_ai_block(block: &Value, index: usize) -> Result<(&str, Option<String>), St
 fn replay_state(
     blocks: &[ContentBlock],
     replays: &[Option<&Replay>],
-    stop: StopReason,
+    stop: FinishReason,
 ) -> Option<Value> {
     let origin = &replays.iter().flatten().next()?.origin;
     let deepseek = origin.api == DEEPSEEK.0;
@@ -456,11 +456,11 @@ fn replay_state(
 
 /// pi-ai's name for a stop reason. It calls a paused turn a stop
 /// (`anthropic-messages.js:1298-1299`).
-fn pi_ai_stop_reason(stop: StopReason) -> &'static str {
+fn pi_ai_stop_reason(stop: FinishReason) -> &'static str {
     match stop {
-        StopReason::EndTurn | StopReason::Paused => "stop",
-        StopReason::ToolCalls => "toolUse",
-        StopReason::MaxTokens => "length",
+        FinishReason::Stop | FinishReason::Paused => "stop",
+        FinishReason::ToolCalls => "toolUse",
+        FinishReason::MaxTokens => "length",
     }
 }
 
@@ -488,10 +488,10 @@ impl AssistantMessageData {
                 provider,
                 model,
                 &response.message.content,
-                response.stop,
+                response.finish,
             ),
             stream: Vec::new(),
-            usage: Some(response.usage.into()),
+            usage: response.usage.map(Into::into),
             interrupted: false,
             extra: Extra::new(),
         }
@@ -586,7 +586,7 @@ pub(crate) fn joined_text(content: &[ContentBlock], separator: &str) -> String {
 #[cfg(test)]
 mod tests {
     use karaka_model::{
-        Block, Message, Origin, Replay, Response, Role, StopReason, ToolCall, Usage,
+        Block, FinishReason, Message, Origin, Replay, Response, Role, ToolCall, Usage,
     };
     use serde_json::{Value, json};
 
@@ -707,8 +707,8 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![reasoning("cut off", anthropic("claude-opus-5-5", "sig"))],
             },
-            stop: StopReason::MaxTokens,
-            usage: Usage::default(),
+            finish: FinishReason::MaxTokens,
+            usage: Some(Usage::default()),
         };
         let data = AssistantMessageData::from_response(
             "m",

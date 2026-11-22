@@ -16,8 +16,8 @@ use karaka_agent::{
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
 use karaka_model::{
-    Backoff, Block, ErrorKind, Event, EventStream, Model, ModelError, ModelRegistry, ModelsPlugin,
-    Request, RetryPolicy, StopReason, ToolCall, ToolSchema, Usage,
+    Backoff, Block, ErrorKind, Event, EventStream, FinishReason, Model, ModelError, ModelRegistry,
+    ModelsPlugin, Request, RetryPolicy, ToolCall, ToolSchema, Usage, stream_of,
 };
 use karaka_retry::{RETRY, RETRY_STARTED, RetryHandler, RetryPlugin, policy_key};
 use karaka_session::{
@@ -70,13 +70,14 @@ impl Stream for Playback {
 }
 
 fn text(answer: &str) -> Vec<Result<Event, ModelError>> {
-    vec![
-        Ok(Event::Block(Block::Text(answer.into()))),
-        Ok(Event::Done {
-            stop: StopReason::EndTurn,
-            usage: Usage::default(),
-        }),
-    ]
+    stream_of(
+        &[Block::Text(answer.into())],
+        FinishReason::Stop,
+        Usage::default(),
+    )
+    .into_iter()
+    .map(Ok)
+    .collect()
 }
 
 fn fail(kind: ErrorKind, message: &str) -> Vec<Result<Event, ModelError>> {
@@ -91,17 +92,15 @@ fn fail_after(kind: ErrorKind, message: &str, millis: u64) -> Vec<Result<Event, 
 }
 
 fn echo_call() -> Vec<Result<Event, ModelError>> {
-    vec![
-        Ok(Event::Block(Block::ToolCall(ToolCall {
-            id: "c1".into(),
-            name: "echo".into(),
-            arguments: "{}".into(),
-        }))),
-        Ok(Event::Done {
-            stop: StopReason::ToolCalls,
-            usage: Usage::default(),
-        }),
-    ]
+    let call = Block::ToolCall(ToolCall {
+        id: "c1".into(),
+        name: "echo".into(),
+        arguments: "{}".into(),
+    });
+    stream_of(&[call], FinishReason::ToolCalls, Usage::default())
+        .into_iter()
+        .map(Ok)
+        .collect()
 }
 
 struct Echo;

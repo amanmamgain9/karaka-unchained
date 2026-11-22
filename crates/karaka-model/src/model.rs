@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_core::Stream;
 
-use crate::{Block, Message, RetryPolicy, Role};
+use crate::{Block, BlockAssembler, Message, RetryPolicy};
 
 /// What a model provider implements.
 ///
@@ -30,11 +30,12 @@ pub trait Model: Send + Sync {
     /// lose every signature when the session is read back.
     fn provider(&self) -> &str;
 
-    /// Starts one model call and returns its events as they arrive.
+    /// Starts one model call and returns its chunks as they arrive (see
+    /// [`Event`]).
     ///
     /// Nothing is sent until the stream is first polled, and dropping the
-    /// stream cancels the call. A successful stream ends with
-    /// [`Event::Done`]; a failed one ends with an `Err`.
+    /// stream cancels the call. A successful stream ends with `usage` and
+    /// then [`Event::Finish`]; a failed one ends with an `Err`.
     ///
     /// A call can fail after part of the answer has arrived. A refusal, for
     /// one, can come after some text has streamed, and the stream then ends
@@ -129,33 +130,80 @@ pub struct ToolSchema {
     pub parameters: String,
 }
 
-/// Something that happened during a model call.
+/// One piece of a model's streamed answer. (dsh: `StreamChunk`,
+/// `llm/src/types.ts:470-482`.)
 ///
-/// Deltas are for showing the answer as it is written. Each block also
-/// arrives whole as [`Event::Block`] once it is finished, so a caller that
-/// only wants the result can ignore the deltas.
+/// These are dsh's chunks, field for field, so a stream can be logged and
+/// replayed as dsh logs it:
 ///
-/// A call that finishes with [`StopReason::MaxTokens`] never yields a
-/// [`ToolCall`](crate::ToolCall) block. The limit can cut a call off partway, and running a
-/// tool on arguments that may be incomplete isn't safe, so providers drop
-/// such calls, as dsh does (`llm/src/assembler.ts:131-141`). A provider
-/// that learns why the model stopped only after a call's block is finished
-/// holds that block back until it knows. It holds back the blocks after it
-/// too, so the blocks still arrive in message order. Deltas are never held
-/// back.
+/// - Each block has an `index`, counted from 0 in the order blocks start,
+///   so deltas of blocks that interleave can be told apart.
+/// - A block opens with [`BlockStart`](Self::BlockStart), grows with deltas,
+///   and closes with [`BlockEnd`](Self::BlockEnd), which carries it whole.
+///   A caller that only wants the result can skip the deltas.
+/// - [`Usage`](Self::Usage) comes before [`Finish`](Self::Finish), and
+///   `Finish` is always the last chunk.
+///
+/// A failed call doesn't finish: its stream ends with an `Err` instead. dsh
+/// also has a `finish` of kind `error`; Karaka keeps failures as the
+/// stream's error.
+///
+/// Tool arguments stay raw JSON text, and nothing is held back: a call that
+/// the output limit cut off still streams, and a finish of
+/// [`FinishReason::MaxTokens`] tells the assembler to drop it, as dsh's does
+/// ([`BlockAssembler`](crate::BlockAssembler)).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    /// More of the text block being written.
-    TextDelta(String),
-    /// More of the reasoning block being written.
-    ReasoningDelta(String),
-    /// A finished block, in message order.
-    Block(Block),
-    /// The call finished. Always the last event.
-    Done { stop: StopReason, usage: Usage },
+    /// A block opens. (dsh: `block-start`.)
+    BlockStart { index: usize, block_type: BlockType },
+    /// More of a text block. (dsh: `text-delta`.)
+    TextDelta { index: usize, text: String },
+    /// More of a reasoning block. (dsh: `reasoning-delta`.)
+    ReasoningDelta { index: usize, text: String },
+    /// More of a tool call's arguments, as raw JSON text. `name` comes when
+    /// the provider says it. (dsh: `tool-call-delta`.)
+    ToolCallDelta {
+        index: usize,
+        id: String,
+        name: Option<String>,
+        arguments_delta: String,
+    },
+    /// A block is finished, and this is all of it. (dsh: `block-end`.)
+    ///
+    /// A reasoning block carries its signature here, in its `replay`. dsh
+    /// keeps signatures out of the block, in the `replayState` of the
+    /// `finish` chunk; Karaka's blocks carry them, with where they came
+    /// from, so the finish has none.
+    BlockEnd { index: usize, block: Block },
+    /// What the call cost. (dsh: `usage`.)
+    Usage { usage: Usage },
+    /// The call finished. Always the last chunk. (dsh: `finish`.)
+    Finish { reason: FinishReason },
+}
+
+/// The kind of a block, as a [`BlockStart`](Event::BlockStart) names it.
+/// (dsh: `ContentBlockType`, the kinds a model writes.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockType {
+    Text,
+    Reasoning,
+    ToolCall,
+}
+
+impl BlockType {
+    /// dsh's name for it: `text`, `reasoning` or `tool-call`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Reasoning => "reasoning",
+            Self::ToolCall => "tool-call",
+        }
+    }
 }
 
 /// Why the model stopped writing, when it stopped without failing.
+/// (dsh: `FinishReason`, without its `error` and `aborted` kinds, which are
+/// a stream's `Err` here.)
 ///
 /// Some reasons a provider gives are failures, even when they arrive in a
 /// successful response: a refusal, a content filter, a full context window,
@@ -163,23 +211,38 @@ pub enum Event {
 /// call with a [`ModelError`] instead, so none of them can pass for an
 /// answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StopReason {
-    /// It finished its answer, or reached a stop sequence.
-    EndTurn,
+pub enum FinishReason {
+    /// It finished its answer, or reached a stop sequence. (dsh: `stop`.)
+    Stop,
     /// It wants tools to run; the results go back in the next request.
+    /// (dsh: `tool-calls`.)
     ToolCalls,
     /// It reached `max_tokens` before finishing. Any tool call it had
-    /// started is dropped (see [`Event`]).
+    /// started is dropped when the answer is assembled. (dsh: `max-tokens`.)
     MaxTokens,
     /// The provider paused a long turn of its own server-side tools, such as
     /// Anthropic's web search, and the turn isn't over. Anthropic resumes it
     /// when the conversation is sent back as it is.
     ///
-    /// Karaka sends no server tools yet, so this shouldn't happen. It also
-    /// doesn't keep those tools' blocks, which resuming would need. Until it
-    /// does, treat a paused answer as unfinished, like
-    /// [`StopReason::MaxTokens`].
+    /// Karaka's own reason: dsh's pi-ai calls a paused turn a stop. dsh's
+    /// `FinishReasonMap` is open to more kinds, and this is one. Karaka sends
+    /// no server tools yet, so it shouldn't happen. It also doesn't keep
+    /// those tools' blocks, which resuming would need. Until it does, treat
+    /// a paused answer as unfinished, like [`FinishReason::MaxTokens`].
     Paused,
+}
+
+impl FinishReason {
+    /// dsh's `kind`: `stop`, `tool-calls` or `max-tokens`, and Karaka's
+    /// `paused`.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::ToolCalls => "tool-calls",
+            Self::MaxTokens => "max-tokens",
+            Self::Paused => "paused",
+        }
+    }
 }
 
 /// Tokens counted for one call.
@@ -199,43 +262,74 @@ pub struct Usage {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Response {
     pub message: Message,
-    pub stop: StopReason,
-    pub usage: Usage,
+    pub finish: FinishReason,
+    /// `None` when the provider sent no usage.
+    pub usage: Option<Usage>,
 }
 
 /// Runs one call to the end and returns the assembled answer, for callers
 /// that don't show it while it's written.
 pub async fn complete(model: &dyn Model, request: Request) -> Result<Response, ModelError> {
     let mut stream = model.stream(request);
-    let mut content = Vec::new();
+    let mut answer = BlockAssembler::new();
     // `poll_fn` turns the stream's `poll_next` into something to `.await`,
     // which saves depending on a library for it.
     while let Some(event) = poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-        match event? {
-            Event::TextDelta(_) | Event::ReasoningDelta(_) => {}
-            Event::Block(block) => content.push(block),
-            Event::Done { stop, usage } => {
-                // Providers already drop these (see `Event`). Doing it here
-                // as well keeps the rule for any `Model`, including one
-                // written without it in mind.
-                if stop == StopReason::MaxTokens {
-                    content.retain(|block| !matches!(block, Block::ToolCall(_)));
-                }
-                return Ok(Response {
-                    message: Message {
-                        role: Role::Assistant,
-                        content,
-                    },
-                    stop,
-                    usage,
-                });
-            }
+        answer.push(&event?);
+        if let Some(response) = answer.response() {
+            return Ok(response);
         }
     }
     Err(ModelError::new(
         ErrorKind::Network,
         "the stream ended before the model finished",
     ))
+}
+
+/// The chunks a model streams for an answer of `blocks`, as dsh's mock
+/// adapter scripts one (`agent-loop/tests/mock-adapter.ts`): each block's
+/// start, its content as one delta, its end, then `usage` and the finish.
+/// For fakes and tests.
+pub fn stream_of(blocks: &[Block], reason: FinishReason, usage: Usage) -> Vec<Event> {
+    let mut events = Vec::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let (block_type, delta) = match block {
+            Block::Text(text) => (
+                BlockType::Text,
+                Event::TextDelta {
+                    index,
+                    text: text.clone(),
+                },
+            ),
+            Block::Reasoning { text, .. } => (
+                BlockType::Reasoning,
+                Event::ReasoningDelta {
+                    index,
+                    text: text.clone(),
+                },
+            ),
+            Block::ToolCall(call) => (
+                BlockType::ToolCall,
+                Event::ToolCallDelta {
+                    index,
+                    id: call.id.clone(),
+                    name: Some(call.name.clone()),
+                    arguments_delta: call.arguments.clone(),
+                },
+            ),
+            // A model never writes a tool result.
+            Block::ToolResult(_) => continue,
+        };
+        events.push(Event::BlockStart { index, block_type });
+        events.push(delta);
+        events.push(Event::BlockEnd {
+            index,
+            block: block.clone(),
+        });
+    }
+    events.push(Event::Usage { usage });
+    events.push(Event::Finish { reason });
+    events
 }
 
 /// Why a model call failed.
@@ -408,8 +502,8 @@ mod tests {
     use futures_core::Stream;
 
     use super::{
-        ErrorKind, Event, EventStream, Model, ModelError, Refusal, Request, StopReason, Usage,
-        complete,
+        BlockType, ErrorKind, Event, EventStream, FinishReason, Model, ModelError, Refusal,
+        Request, Usage, complete, stream_of,
     };
     use crate::{Block, Message, Role, ToolCall};
 
@@ -442,37 +536,51 @@ mod tests {
         Request::new("test-model", vec![Message::user("hi")])
     }
 
-    fn done() -> Event {
-        Event::Done {
-            stop: StopReason::EndTurn,
-            usage: Usage {
-                input_tokens: 3,
-                output_tokens: 2,
-                ..Usage::default()
-            },
+    fn usage() -> Usage {
+        Usage {
+            input_tokens: 3,
+            output_tokens: 2,
+            ..Usage::default()
+        }
+    }
+
+    fn delta(text: &str) -> Event {
+        Event::TextDelta {
+            index: 0,
+            text: text.into(),
         }
     }
 
     #[tokio::test]
     async fn complete_keeps_the_blocks_and_skips_the_deltas() {
         let model = Scripted(vec![
-            Ok(Event::TextDelta("hel".into())),
-            Ok(Event::TextDelta("lo".into())),
-            Ok(Event::Block(Block::Text("hello".into()))),
-            Ok(done()),
+            Ok(Event::BlockStart {
+                index: 0,
+                block_type: BlockType::Text,
+            }),
+            Ok(delta("hel")),
+            Ok(delta("lo")),
+            Ok(Event::BlockEnd {
+                index: 0,
+                block: Block::Text("hello".into()),
+            }),
+            Ok(Event::Usage { usage: usage() }),
+            Ok(Event::Finish {
+                reason: FinishReason::Stop,
+            }),
         ]);
         let response = complete(&model, request()).await.expect("the call works");
         assert_eq!(response.message.role, Role::Assistant);
         assert_eq!(response.message.text(), "hello");
         assert_eq!(response.message.content.len(), 1);
-        assert_eq!(response.stop, StopReason::EndTurn);
-        assert_eq!(response.usage.input_tokens, 3);
+        assert_eq!(response.finish, FinishReason::Stop);
+        assert_eq!(response.usage, Some(usage()));
     }
 
     #[tokio::test]
     async fn complete_passes_on_a_failure() {
         let model = Scripted(vec![
-            Ok(Event::TextDelta("hel".into())),
+            Ok(delta("hel")),
             Err(ModelError::new(ErrorKind::Unavailable, "overloaded")),
         ]);
         let error = complete(&model, request())
@@ -484,42 +592,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_rejects_a_stream_that_ends_without_done() {
-        let model = Scripted(vec![Ok(Event::Block(Block::Text("hel".into())))]);
+    async fn complete_rejects_a_stream_that_ends_without_a_finish() {
+        let model = Scripted(vec![Ok(Event::BlockEnd {
+            index: 0,
+            block: Block::Text("hel".into()),
+        })]);
         let error = complete(&model, request())
             .await
             .expect_err("the call fails");
         assert_eq!(error.kind, ErrorKind::Network);
     }
 
+    /// The tool call streams, and assembling drops it, as dsh's assembler
+    /// does (`assembler.ts:131-141`).
     #[tokio::test]
     async fn complete_drops_tool_calls_from_a_max_tokens_finish() {
-        let model = Scripted(vec![
-            Ok(Event::Block(Block::Reasoning {
+        let blocks = [
+            Block::Reasoning {
                 text: "look it up".into(),
                 replay: None,
-            })),
-            Ok(Event::Block(Block::Text("Let me check.".into()))),
-            Ok(Event::Block(Block::ToolCall(ToolCall {
+            },
+            Block::Text("Let me check.".into()),
+            Block::ToolCall(ToolCall {
                 id: "call_1".into(),
                 name: "search".into(),
                 arguments: r#"{"query": "wea"#.into(),
-            }))),
-            Ok(Event::Done {
-                stop: StopReason::MaxTokens,
-                usage: Usage::default(),
             }),
-        ]);
+        ];
+        let events = stream_of(&blocks, FinishReason::MaxTokens, Usage::default());
+        let model = Scripted(events.into_iter().map(Ok).collect());
         let response = complete(&model, request()).await.expect("the call works");
-        assert_eq!(response.stop, StopReason::MaxTokens);
+        assert_eq!(response.finish, FinishReason::MaxTokens);
+        assert_eq!(response.message.content, blocks[..2]);
+    }
+
+    /// dsh's mock adapter shape: start, one delta, end for each block, then
+    /// usage and the finish.
+    #[test]
+    fn stream_of_scripts_an_answer_as_dshs_mock_adapter_does() {
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        };
+        let events = stream_of(
+            &[Block::Text("hi".into()), Block::ToolCall(call.clone())],
+            FinishReason::ToolCalls,
+            usage(),
+        );
         assert_eq!(
-            response.message.content,
+            events,
             [
-                Block::Reasoning {
-                    text: "look it up".into(),
-                    replay: None,
+                Event::BlockStart {
+                    index: 0,
+                    block_type: BlockType::Text
                 },
-                Block::Text("Let me check.".into()),
+                delta("hi"),
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Text("hi".into())
+                },
+                Event::BlockStart {
+                    index: 1,
+                    block_type: BlockType::ToolCall
+                },
+                Event::ToolCallDelta {
+                    index: 1,
+                    id: "c1".into(),
+                    name: Some("echo".into()),
+                    arguments_delta: "{}".into()
+                },
+                Event::BlockEnd {
+                    index: 1,
+                    block: Block::ToolCall(call)
+                },
+                Event::Usage { usage: usage() },
+                Event::Finish {
+                    reason: FinishReason::ToolCalls
+                },
             ]
         );
     }

@@ -1,14 +1,31 @@
-//! Streamed Chat Completions chunks, turned into [`Event`]s.
+//! Streamed Chat Completions chunks, turned into dsh's chunks ([`Event`]).
 //!
 //! The [`Decoder`] only sees the JSON of each chunk, one at a time. Reading
 //! those out of the HTTP body is a separate job, so everything here can be
 //! tested without a network.
+//!
+//! This format has no block boundaries: text, reasoning and tool calls all
+//! arrive as pieces of one `delta` per chunk, and nothing says when one of
+//! them is finished. So the blocks are made as pi-ai makes them
+//! (`api/openai-completions.js:203-470`), and dsh passes pi-ai's events on
+//! as chunks (`llm-pi-ai/src/stream.ts:157-232`):
+//!
+//! - The first text opens one text block, the first reasoning one reasoning
+//!   block, and each tool call, by the server's index, a block of its own.
+//!   Blocks are numbered in the order they open, and each piece goes out as
+//!   a delta at once, tool arguments as raw JSON text.
+//! - Every block ends only when the stream does, in that order, before
+//!   `usage` and `finish`.
+//!
+//! Nothing is dropped here: a tool call cut off by the output limit ends
+//! like any other, and the assembler drops it once the finish says why the
+//! model stopped.
 
 use std::collections::BTreeMap;
 
 use karaka_model::{
-    Block, ErrorKind, Event, ModelError, StopReason, ToolCall, Usage, is_context_overflow,
-    is_out_of_quota,
+    Block, BlockType, ErrorKind, Event, FinishReason, ModelError, ToolCall, Usage,
+    is_context_overflow, is_out_of_quota,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,38 +33,36 @@ use serde_json::Value;
 /// What the server sends after the last chunk. It isn't JSON.
 const DONE: &str = "[DONE]";
 
-/// Assembles one streamed response.
-///
-/// This format has no block boundaries: text, reasoning and tool calls all
-/// arrive as pieces of one `delta` per chunk, and nothing says when one of
-/// them is finished. So the decoder keeps all of them until the end and
-/// only then hands out the finished blocks.
+/// Turns one streamed response into chunks.
 #[derive(Default)]
 pub(crate) struct Decoder {
-    reasoning: String,
-    text: String,
-    /// Tool calls by the server's `index`. Parallel calls can arrive
-    /// interleaved, and a `BTreeMap` gives them back in index order.
-    tool_calls: BTreeMap<u32, PartialCall>,
-    stop: Option<StopReason>,
+    /// Every block opened so far; a block's place here is its index.
+    blocks: Vec<Partial>,
+    text: Option<usize>,
+    reasoning: Option<usize>,
+    /// The block of each tool call, by the server's `index`.
+    tool_calls: BTreeMap<u32, usize>,
+    stop: Option<FinishReason>,
     usage: Usage,
 }
 
-/// A tool call whose pieces are still arriving.
-#[derive(Default)]
-struct PartialCall {
-    id: String,
-    name: String,
-    arguments: String,
+/// A block whose pieces are still arriving.
+enum Partial {
+    Text(String),
+    Reasoning(String),
+    ToolCall {
+        /// The server's index, for an id when the server sends none.
+        server_index: u32,
+        id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 impl Decoder {
-    /// Reads one chunk's JSON, or the final `[DONE]`.
-    ///
-    /// Returns a list because one chunk can mean several events: a chunk
-    /// can carry both reasoning and text, and `[DONE]` releases every
-    /// finished block and then [`Event::Done`] at once. Most chunks give one
-    /// event or none, and an empty `Vec` costs no allocation.
+    /// Reads one chunk's JSON, or the final `[DONE]`, and gives the chunks
+    /// it means: often none or one, and at `[DONE]` every block's end, then
+    /// `usage` and `finish`. An empty `Vec` costs no allocation.
     ///
     /// An error payload, a finish reason that isn't a finished answer, or
     /// JSON that doesn't fit ends the call with an `Err`.
@@ -112,7 +127,37 @@ impl Decoder {
         self.finish(stop)
     }
 
+    /// Opens a block, and gives its index.
+    fn open(&mut self, partial: Partial, events: &mut Vec<Event>) -> usize {
+        let index = self.blocks.len();
+        let block_type = match partial {
+            Partial::Text(_) => BlockType::Text,
+            Partial::Reasoning(_) => BlockType::Reasoning,
+            Partial::ToolCall { .. } => BlockType::ToolCall,
+        };
+        self.blocks.push(partial);
+        events.push(Event::BlockStart { index, block_type });
+        index
+    }
+
+    /// One chunk's delta, in pi-ai's order: text, then reasoning, then tool
+    /// calls (`openai-completions.js:378-452`).
     fn delta(&mut self, delta: Delta, events: &mut Vec<Event>) {
+        if let Some(more) = delta.content.filter(|text| !text.is_empty()) {
+            let index = match self.text {
+                Some(index) => index,
+                None => {
+                    let index = self.open(Partial::Text(String::new()), events);
+                    self.text = Some(index);
+                    index
+                }
+            };
+            if let Partial::Text(text) = &mut self.blocks[index] {
+                text.push_str(&more);
+            }
+            events.push(Event::TextDelta { index, text: more });
+        }
+
         // DeepSeek calls it `reasoning_content`, some other servers
         // `reasoning`. Only one is used, in case a server sends both with
         // the same text. DeepSeek's first chunk carries an empty string,
@@ -122,99 +167,130 @@ impl Decoder {
             .flatten()
             .find(|text| !text.is_empty());
         if let Some(more) = reasoning {
-            self.reasoning.push_str(&more);
-            events.push(Event::ReasoningDelta(more));
+            let index = match self.reasoning {
+                Some(index) => index,
+                None => {
+                    let index = self.open(Partial::Reasoning(String::new()), events);
+                    self.reasoning = Some(index);
+                    index
+                }
+            };
+            if let Partial::Reasoning(text) = &mut self.blocks[index] {
+                text.push_str(&more);
+            }
+            events.push(Event::ReasoningDelta { index, text: more });
         }
 
-        if let Some(more) = delta.content.filter(|text| !text.is_empty()) {
-            self.text.push_str(&more);
-            events.push(Event::TextDelta(more));
-        }
-
-        // Tool arguments arrive as pieces of JSON that only parse once
-        // they're all there, so they aren't passed on one by one.
         for (position, piece) in delta.tool_calls.into_iter().enumerate() {
             // A server that sends each call whole may leave out `index`;
             // then the call's place in the list stands in for it.
-            let index = piece.index.unwrap_or(position as u32);
-            let call = self.tool_calls.entry(index).or_default();
+            let server_index = piece.index.unwrap_or(position as u32);
+            let index = match self.tool_calls.get(&server_index) {
+                Some(&index) => index,
+                None => {
+                    let partial = Partial::ToolCall {
+                        server_index,
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    };
+                    let index = self.open(partial, events);
+                    self.tool_calls.insert(server_index, index);
+                    index
+                }
+            };
+            let Partial::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } = &mut self.blocks[index]
+            else {
+                continue;
+            };
             // The id and the name usually come only in the first piece. A
             // server that repeats them sends them whole each time, so they
             // replace rather than add up.
-            if let Some(id) = piece.id.filter(|id| !id.is_empty()) {
-                call.id = id;
+            if let Some(more) = piece.id.filter(|id| !id.is_empty()) {
+                *id = more;
             }
+            let mut arguments_delta = String::new();
             if let Some(function) = piece.function {
-                if let Some(name) = function.name.filter(|name| !name.is_empty()) {
-                    call.name = name;
+                if let Some(more) = function.name.filter(|name| !name.is_empty()) {
+                    *name = more;
                 }
-                if let Some(arguments) = function.arguments {
-                    call.arguments.push_str(&arguments);
+                if let Some(more) = function.arguments {
+                    arguments.push_str(&more);
+                    arguments_delta = more;
                 }
             }
+            // A delta for every piece, even one with no arguments, as pi-ai
+            // sends one (`openai-completions.js:445-450`), naming the call
+            // once its name is known.
+            events.push(Event::ToolCallDelta {
+                index,
+                id: id.clone(),
+                name: (!name.is_empty()).then(|| name.clone()),
+                arguments_delta,
+            });
         }
     }
 
-    /// The finished blocks, then [`Event::Done`]. Reasoning comes before the
-    /// text it led to, and tool calls come last, in index order.
+    /// Every block's end, in index order, then `usage` and `finish`, as
+    /// pi-ai ends each block only when the stream ends
+    /// (`openai-completions.js:467-469`).
     ///
     /// Fails with [`ErrorKind::EmptyResponse`] on a normal stop with no
     /// blocks at all.
-    fn finish(&mut self, stop: StopReason) -> Result<Vec<Event>, ModelError> {
-        let mut events = Vec::new();
-        let reasoning = std::mem::take(&mut self.reasoning);
-        if !reasoning.is_empty() {
-            // There's no signature to keep: this format has none. DeepSeek
-            // wants the text itself back, which the block already holds.
-            events.push(Event::Block(Block::Reasoning {
-                text: reasoning,
-                replay: None,
-            }));
-        }
-        let text = std::mem::take(&mut self.text);
-        if !text.is_empty() {
-            events.push(Event::Block(Block::Text(text)));
-        }
-        let mut tool_calls = std::mem::take(&mut self.tool_calls);
-        // The limit can cut a call's arguments off partway, so a call from a
-        // `length` finish never goes out, as dsh drops it
-        // (`llm/src/assembler.ts:137-141`). Everything arrives only now, so
-        // nothing has to be held back to do this.
-        if stop == StopReason::MaxTokens {
-            tool_calls.clear();
-        }
-        for (index, call) in tool_calls {
-            events.push(Event::Block(Block::ToolCall(ToolCall {
-                // The result has to name the call it answers, so a call the
-                // server gave no id gets one that is unique in this answer.
-                id: if call.id.is_empty() {
-                    format!("call_{index}")
-                } else {
-                    call.id
-                },
-                name: call.name,
-                // A tool without arguments may send no JSON at all.
-                arguments: if call.arguments.is_empty() {
-                    "{}".into()
-                } else {
-                    call.arguments
-                },
-            })));
-        }
+    fn finish(&mut self, stop: FinishReason) -> Result<Vec<Event>, ModelError> {
         // A finished answer with nothing in it would end the turn with
         // nothing to show or act on, so dsh retries it instead
         // (`llm-pi-ai/src/stream.ts:96-107`). Any block counts, so an
         // answer that is only reasoning is kept.
-        if stop == StopReason::EndTurn && events.is_empty() {
+        if stop == FinishReason::Stop && self.blocks.is_empty() {
             return Err(ModelError::new(
                 ErrorKind::EmptyResponse,
                 "the server finished an answer with no content",
             ));
         }
-        events.push(Event::Done {
-            stop,
-            usage: self.usage,
-        });
+        let mut events: Vec<Event> = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .enumerate()
+            .map(|(index, partial)| {
+                let block = match partial {
+                    Partial::Text(text) => Block::Text(text),
+                    // There's no signature to keep: this format has none.
+                    // DeepSeek wants the text itself back, which the block
+                    // already holds.
+                    Partial::Reasoning(text) => Block::Reasoning { text, replay: None },
+                    Partial::ToolCall {
+                        server_index,
+                        id,
+                        name,
+                        arguments,
+                    } => Block::ToolCall(ToolCall {
+                        // The result has to name the call it answers, so a
+                        // call the server gave no id gets one that is unique
+                        // in this answer.
+                        id: if id.is_empty() {
+                            format!("call_{server_index}")
+                        } else {
+                            id
+                        },
+                        name,
+                        // A tool without arguments may send no JSON at all.
+                        arguments: if arguments.is_empty() {
+                            "{}".into()
+                        } else {
+                            arguments
+                        },
+                    }),
+                };
+                Event::BlockEnd { index, block }
+            })
+            .collect();
+        events.push(Event::Usage { usage: self.usage });
+        events.push(Event::Finish { reason: stop });
         Ok(events)
     }
 }
@@ -222,13 +298,13 @@ impl Decoder {
 /// What a finish reason means, mapped as pi-ai maps it
 /// (`api/openai-completions.js:1192-1214`). Only some reasons are an answer.
 /// The others fail the call.
-fn stop_reason(reason: &str) -> Result<StopReason, ModelError> {
+fn stop_reason(reason: &str) -> Result<FinishReason, ModelError> {
     match reason {
         // `end` is what some servers send for `stop`.
-        "stop" | "end" => Ok(StopReason::EndTurn),
+        "stop" | "end" => Ok(FinishReason::Stop),
         // `function_call` is the name from before parallel tool calls.
-        "tool_calls" | "function_call" => Ok(StopReason::ToolCalls),
-        "length" => Ok(StopReason::MaxTokens),
+        "tool_calls" | "function_call" => Ok(FinishReason::ToolCalls),
+        "length" => Ok(FinishReason::MaxTokens),
         "content_filter" => Err(ModelError::new(
             ErrorKind::Refused,
             "the server's content filter stopped the answer",
@@ -417,7 +493,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use karaka_model::{Block, ErrorKind, Event, ModelError, StopReason, ToolCall, Usage};
+    use karaka_model::{
+        Block, BlockAssembler, BlockType, ErrorKind, Event, FinishReason, ModelError, ToolCall,
+        Usage,
+    };
 
     use super::{Decoder, classify};
 
@@ -452,12 +531,27 @@ mod tests {
 
     const HI: &str = r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
 
-    /// The `Done` at the end of `events`, which must be there.
-    fn done(events: &[Event]) -> (&StopReason, &Usage) {
-        match events.last() {
-            Some(Event::Done { stop, usage }) => (stop, usage),
-            other => panic!("expected Done last, got {other:?}"),
+    /// The `usage` and `finish` at the end of `events`, which must be there.
+    fn done(events: &[Event]) -> (&FinishReason, &Usage) {
+        match &events[events.len().saturating_sub(2)..] {
+            [Event::Usage { usage }, Event::Finish { reason }] => (reason, usage),
+            other => panic!("expected usage and finish last, got {other:?}"),
         }
+    }
+
+    fn text_delta(index: usize, text: &str) -> Event {
+        Event::TextDelta {
+            index,
+            text: text.into(),
+        }
+    }
+
+    fn start(index: usize, block_type: BlockType) -> Event {
+        Event::BlockStart { index, block_type }
+    }
+
+    fn end(index: usize, block: Block) -> Event {
+        Event::BlockEnd { index, block }
     }
 
     #[test]
@@ -475,17 +569,20 @@ mod tests {
         assert_eq!(
             events,
             [
-                Event::TextDelta("Hel".into()),
-                Event::TextDelta("lo".into()),
-                Event::Block(Block::Text("Hello".into())),
-                Event::Done {
-                    stop: StopReason::EndTurn,
+                start(0, BlockType::Text),
+                text_delta(0, "Hel"),
+                text_delta(0, "lo"),
+                end(0, Block::Text("Hello".into())),
+                Event::Usage {
                     usage: Usage {
                         input_tokens: 20,
                         output_tokens: 5,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
-                    },
+                    }
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop
                 },
             ]
         );
@@ -503,20 +600,29 @@ mod tests {
         ])
         .expect("the stream decodes");
 
+        let reasoning = |text: &str| Event::ReasoningDelta {
+            index: 0,
+            text: text.into(),
+        };
         assert_eq!(
-            events[..5],
+            events[..7],
             [
-                Event::ReasoningDelta("think".into()),
-                Event::ReasoningDelta("ing".into()),
-                Event::TextDelta("answer".into()),
-                Event::Block(Block::Reasoning {
-                    text: "thinking".into(),
-                    replay: None,
-                }),
-                Event::Block(Block::Text("answer".into())),
+                start(0, BlockType::Reasoning),
+                reasoning("think"),
+                reasoning("ing"),
+                start(1, BlockType::Text),
+                text_delta(1, "answer"),
+                end(
+                    0,
+                    Block::Reasoning {
+                        text: "thinking".into(),
+                        replay: None,
+                    }
+                ),
+                end(1, Block::Text("answer".into())),
             ]
         );
-        assert_eq!(done(&events).0, &StopReason::EndTurn);
+        assert_eq!(done(&events).0, &FinishReason::Stop);
     }
 
     #[test]
@@ -527,7 +633,13 @@ mod tests {
         ])
         .expect("the stream decodes");
 
-        assert_eq!(events[0], Event::ReasoningDelta("hmm".into()));
+        assert_eq!(
+            events[1],
+            Event::ReasoningDelta {
+                index: 0,
+                text: "hmm".into()
+            }
+        );
     }
 
     #[test]
@@ -544,24 +656,48 @@ mod tests {
         ])
         .expect("the stream decodes");
 
-        let call = |id: &str, name: &str, arguments: &str| {
-            Event::Block(Block::ToolCall(ToolCall {
-                id: id.into(),
-                name: name.into(),
-                arguments: arguments.into(),
-            }))
+        let delta = |index: usize, id: &str, name: &str, arguments: &str| Event::ToolCallDelta {
+            index,
+            id: id.into(),
+            name: Some(name.into()),
+            arguments_delta: arguments.into(),
         };
-        // No deltas: the calls come out whole, in index order.
+        let call = |index: usize, id: &str, name: &str, arguments: &str| {
+            end(
+                index,
+                Block::ToolCall(ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: arguments.into(),
+                }),
+            )
+        };
+        // Each piece goes out as it comes, raw, under its call's block.
         assert_eq!(
-            events[..3],
+            events[..9],
             [
-                call("call_a", "clock", r#"{"zone": "UTC"}"#),
-                call("call_b", "weather", r#"{"city": "Oslo"}"#),
-                // A call with no arguments gets an empty object.
-                call("call_c", "ping", "{}"),
+                start(0, BlockType::ToolCall),
+                delta(0, "call_a", "clock", ""),
+                start(1, BlockType::ToolCall),
+                delta(1, "call_b", "weather", r#"{"ci"#),
+                delta(0, "call_a", "clock", r#"{"zone": "#),
+                delta(1, "call_b", "weather", r#"ty": "Oslo"}"#),
+                delta(0, "call_a", "clock", r#""UTC"}"#),
+                start(2, BlockType::ToolCall),
+                delta(2, "call_c", "ping", ""),
             ]
         );
-        assert_eq!(done(&events).0, &StopReason::ToolCalls);
+        // The calls end whole, in index order, when the stream does.
+        assert_eq!(
+            events[9..12],
+            [
+                call(0, "call_a", "clock", r#"{"zone": "UTC"}"#),
+                call(1, "call_b", "weather", r#"{"city": "Oslo"}"#),
+                // A call with no arguments gets an empty object.
+                call(2, "call_c", "ping", "{}"),
+            ]
+        );
+        assert_eq!(done(&events).0, &FinishReason::ToolCalls);
     }
 
     #[test]
@@ -605,8 +741,8 @@ mod tests {
             .expect("the chunk decodes");
 
         let events = decoder.end_of_body().expect("the answer is whole");
-        assert_eq!(events[0], Event::Block(Block::Text("hi".into())));
-        assert_eq!(done(&events).0, &StopReason::MaxTokens);
+        assert_eq!(events[0], end(0, Block::Text("hi".into())));
+        assert_eq!(done(&events).0, &FinishReason::MaxTokens);
     }
 
     #[test]
@@ -663,7 +799,7 @@ mod tests {
     #[test]
     fn a_content_filter_is_a_refusal() {
         let (events, error) = decode_until_error(&[HI, &finish("content_filter"), "[DONE]"]);
-        assert_eq!(events, [Event::TextDelta("hi".into())]);
+        assert_eq!(events, [start(0, BlockType::Text), text_delta(0, "hi")]);
         assert_eq!(error.kind, ErrorKind::Refused);
         assert!(!error.kind.is_retryable());
     }
@@ -678,7 +814,7 @@ mod tests {
     #[test]
     fn end_is_a_normal_stop() {
         let events = decode(&[HI, &finish("end"), "[DONE]"]).expect("the stream decodes");
-        assert_eq!(done(&events).0, &StopReason::EndTurn);
+        assert_eq!(done(&events).0, &FinishReason::Stop);
     }
 
     /// dsh's "classifies a completed stop with no content as an
@@ -705,19 +841,23 @@ mod tests {
         ])
         .expect("the stream decodes");
         assert_eq!(
-            events[1],
-            Event::Block(Block::Reasoning {
-                text: "mull".into(),
-                replay: None,
-            })
+            events[2],
+            end(
+                0,
+                Block::Reasoning {
+                    text: "mull".into(),
+                    replay: None,
+                }
+            )
         );
-        assert_eq!(done(&events).0, &StopReason::EndTurn);
+        assert_eq!(done(&events).0, &FinishReason::Stop);
     }
 
-    /// dsh's assembler drops "the tool calls a max-tokens finish drops"
-    /// (`llm/tests/assembler.spec.ts`), and keeps what came before them.
+    /// A tool call cut off by the limit still streams and ends, and the
+    /// assembler drops it, keeping what came before it, as dsh's does
+    /// (`llm/tests/assembler.spec.ts`).
     #[test]
-    fn a_max_tokens_finish_drops_a_cut_off_tool_call() {
+    fn a_max_tokens_finish_leaves_the_cut_off_tool_call_to_the_assembler() {
         let events = decode(&[
             r#"{"choices":[{"index":0,"delta":{"reasoning_content":"search"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":"Looking."},"finish_reason":null}]}"#,
@@ -727,18 +867,22 @@ mod tests {
         ])
         .expect("the stream decodes");
 
+        assert_eq!(done(&events).0, &FinishReason::MaxTokens);
+        let mut answer = BlockAssembler::new();
+        for event in &events {
+            answer.push(event);
+        }
+        assert_eq!(answer.blocks().len(), 2);
         assert_eq!(
-            events[2..4],
+            answer.blocks(),
             [
-                Event::Block(Block::Reasoning {
+                Block::Reasoning {
                     text: "search".into(),
                     replay: None,
-                }),
-                Event::Block(Block::Text("Looking.".into())),
+                },
+                Block::Text("Looking.".into()),
             ]
         );
-        assert_eq!(events.len(), 5, "{events:?}");
-        assert_eq!(done(&events).0, &StopReason::MaxTokens);
     }
 
     #[test]
@@ -812,10 +956,11 @@ mod tests {
         .expect("the stream decodes");
 
         assert_eq!(
-            events[..2],
+            events[..3],
             [
-                Event::TextDelta("ok".into()),
-                Event::Block(Block::Text("ok".into())),
+                start(0, BlockType::Text),
+                text_delta(0, "ok"),
+                end(0, Block::Text("ok".into())),
             ]
         );
     }

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use karaka_anthropic::{AnthropicModel, DeepSeekThinking};
 use karaka_model::{
-    Block, Effort, ErrorKind, Message, ModelError, Request, Role, StopReason, ToolCall, ToolResult,
-    ToolSchema, complete,
+    Block, Effort, ErrorKind, FinishReason, Message, ModelError, Request, Role, ToolCall,
+    ToolResult, ToolSchema, complete,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -156,9 +156,9 @@ async fn a_deepseek_call_sends_what_dsh_sends() {
     .await
     .expect("the call works");
     assert_eq!(response.message.text(), "Hello 世界");
-    assert_eq!(response.stop, StopReason::EndTurn);
-    assert_eq!(response.usage.input_tokens, 12);
-    assert_eq!(response.usage.output_tokens, 5);
+    assert_eq!(response.finish, FinishReason::Stop);
+    assert_eq!(response.usage.unwrap().input_tokens, 12);
+    assert_eq!(response.usage.unwrap().output_tokens, 5);
 
     let sent = server.await.expect("the server ran");
     let (head, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");

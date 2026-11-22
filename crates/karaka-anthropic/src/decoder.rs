@@ -1,8 +1,25 @@
-//! Anthropic's streamed events, turned into [`Event`]s.
+//! Anthropic's streamed events, turned into dsh's chunks ([`Event`]).
 //!
 //! The [`Decoder`] only sees the JSON of each event, one at a time. Reading
 //! those out of the HTTP body is a separate job, so everything here can be
 //! tested without a network.
+//!
+//! Anthropic's events map onto dsh's chunks one to one, as dsh's DeepSeek
+//! adapter maps the same events (`llm-deepseek/src/translate.ts:103-166`)
+//! and its pi-ai adapter maps pi-ai's (`llm-pi-ai/src/stream.ts:157-232`):
+//!
+//! - `content_block_start` is a `block-start`, `content_block_delta` a
+//!   text, reasoning or tool-call delta, and `content_block_stop` a
+//!   `block-end` with the finished block. Blocks are numbered from 0 in the
+//!   order they start; a block Karaka skips gets no number.
+//! - `message_stop` gives `usage`, then `finish`.
+//! - A signature arrives as a `signature_delta`, which is no chunk: it goes
+//!   into the reasoning block's `replay` at its end.
+//!
+//! Nothing is held back. A tool call cut off by `max_tokens` streams like
+//! any other, and the assembler drops it once the finish says why the model
+//! stopped, as dsh's does ("Truncated tool JSON is retained in the stream,
+//! then pruned by the shared assembler", `translate.ts:150`).
 //!
 //! DeepSeek sends the same events. Its profile reads them as dsh's
 //! `llm-deepseek/src/translate.ts` does, which is stricter: a kind of block,
@@ -11,8 +28,8 @@
 //! JSON object.
 
 use karaka_model::{
-    Block, ErrorKind, Event, ModelError, Origin, Refusal, Replay, StopReason, ToolCall, Usage,
-    is_context_overflow, is_out_of_quota,
+    Block, BlockType, ErrorKind, Event, FinishReason, ModelError, Origin, Refusal, Replay,
+    ToolCall, Usage, is_context_overflow, is_out_of_quota,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -21,11 +38,10 @@ use crate::Profile;
 use crate::deepseek;
 use crate::request::{self, json_object};
 
-/// Assembles one streamed response.
+/// Turns one streamed response into chunks.
 ///
 /// Anthropic sends one content block at a time: start, deltas, stop. So the
-/// decoder holds the block being written, and only the finished blocks that
-/// must wait for the stop reason.
+/// decoder holds only the block being written.
 pub(crate) struct Decoder {
     profile: Profile,
     /// Where each signature in this answer comes from: the profile's API
@@ -37,26 +53,26 @@ pub(crate) struct Decoder {
     /// checks the order of events.
     started: bool,
     open: Option<Open>,
-    /// Finished blocks waiting for the stop reason.
-    ///
-    /// Anthropic stops each block before it says why the model stopped, but
-    /// a tool call cut off by `max_tokens` must never reach anyone (see
-    /// [`Event`]). So a finished tool call waits here until `message_stop`,
-    /// and every block after it waits too, to keep the blocks in order.
-    /// Blocks before the first tool call go out as soon as they finish.
-    ///
-    /// A refusal can cut a tool call off as well. It fails the call at the
-    /// stop reason, so held calls never go out then either.
-    held: Vec<Block>,
-    /// Whether any block has finished, whether it went out or is held. A
-    /// normal stop with none is an empty response.
+    /// The index the next block that starts gets.
+    next_index: usize,
+    /// The arguments of every tool call that has finished, which the
+    /// DeepSeek profile checks once it knows why the model stopped.
+    finished_calls: Vec<String>,
+    /// Whether any block has finished. A normal stop with none is an empty
+    /// response.
     any_block: bool,
     usage: Usage,
-    stop: Option<StopReason>,
+    stop: Option<FinishReason>,
 }
 
 /// A block that has started and not yet stopped.
-enum Open {
+struct Open {
+    /// `None` for a block Karaka skips, which sends no chunks.
+    index: Option<usize>,
+    kind: OpenKind,
+}
+
+enum OpenKind {
     Text(String),
     Thinking {
         text: String,
@@ -100,7 +116,8 @@ impl Decoder {
             origin,
             started: false,
             open: None,
-            held: Vec::new(),
+            next_index: 0,
+            finished_calls: Vec::new(),
             any_block: false,
             usage: Usage::default(),
             stop: None,
@@ -111,11 +128,9 @@ impl Decoder {
         self.profile
     }
 
-    /// Reads one event's JSON.
-    ///
-    /// Returns a list because `message_stop` releases every held block and
-    /// then [`Event::Done`] at once. Every other event gives one event or
-    /// none, and an empty `Vec` costs no allocation.
+    /// Reads one event's JSON, and gives the chunks it means: none, one,
+    /// or a few, such as a block's start and its first text. An empty `Vec`
+    /// costs no allocation.
     ///
     /// An error event, a stop reason that isn't a finished answer, or JSON
     /// that doesn't fit ends the call with an `Err`.
@@ -151,8 +166,16 @@ impl Decoder {
                 Vec::new()
             }
             WireEvent::ContentBlockStart { content_block } => {
-                let open = self.start(content_block, data)?;
-                let events = self.initial_delta(&open).into_iter().collect();
+                let kind = self.start(content_block, data)?;
+                let open = Open {
+                    index: (!matches!(kind, OpenKind::Skipped)).then(|| {
+                        let index = self.next_index;
+                        self.next_index += 1;
+                        index
+                    }),
+                    kind,
+                };
+                let events = self.opening(&open);
                 self.open = Some(open);
                 events
             }
@@ -162,10 +185,7 @@ impl Decoder {
                     .open
                     .take()
                     .ok_or_else(|| protocol(self.profile, "a block stopped"))?;
-                match self.finish(open) {
-                    Some(block) => self.finished(block),
-                    None => Vec::new(),
-                }
+                self.finish(open).into_iter().collect()
             }
             WireEvent::MessageDelta { delta, usage } => {
                 self.add_usage(usage);
@@ -212,13 +232,13 @@ impl Decoder {
 
     /// The block a `content_block_start` opens. `data` is the event's JSON,
     /// for the DeepSeek profile to read a tool's starting input from.
-    fn start(&self, block: StartBlock, data: &str) -> Result<Open, ModelError> {
+    fn start(&self, block: StartBlock, data: &str) -> Result<OpenKind, ModelError> {
         Ok(match block {
-            StartBlock::Text { text } => Open::Text(text),
+            StartBlock::Text { text } => OpenKind::Text(text),
             StartBlock::Thinking {
                 thinking,
                 signature,
-            } => Open::Thinking {
+            } => OpenKind::Thinking {
                 text: thinking,
                 signature,
             },
@@ -235,7 +255,7 @@ impl Decoder {
                         })?
                     }
                 };
-                Open::ToolUse {
+                OpenKind::ToolUse {
                     id,
                     name,
                     initial,
@@ -243,7 +263,7 @@ impl Decoder {
                 }
             }
             StartBlock::Other => match self.profile {
-                Profile::Anthropic => Open::Skipped,
+                Profile::Anthropic => OpenKind::Skipped,
                 // dsh calls this unsupported content (`translate.ts:60`).
                 // Trying again would get the same kind of block.
                 Profile::DeepSeek => {
@@ -256,35 +276,47 @@ impl Decoder {
         })
     }
 
-    /// Text that a DeepSeek block starts with, passed on as a delta, as dsh
-    /// does (`translate.ts:127-128`). Anthropic starts every block empty.
-    fn initial_delta(&self, open: &Open) -> Option<Event> {
-        if self.profile != Profile::DeepSeek {
-            return None;
-        }
-        match open {
-            Open::Text(text) if !text.is_empty() => Some(Event::TextDelta(text.clone())),
-            Open::Thinking { text, .. } if !text.is_empty() => {
-                Some(Event::ReasoningDelta(text.clone()))
+    /// The chunks a block opens with: its `block-start`, and for DeepSeek
+    /// what dsh sends with it (`translate.ts:124-131`): the text the block
+    /// starts with, if any, or a tool call's id and name in an empty delta.
+    /// Anthropic starts every text block empty, and pi-ai names a tool call
+    /// in each of its deltas instead (`llm-pi-ai/src/stream.ts:181-201`).
+    fn opening(&self, open: &Open) -> Vec<Event> {
+        let Some(index) = open.index else {
+            return Vec::new();
+        };
+        let block_type = match &open.kind {
+            OpenKind::Text(_) => BlockType::Text,
+            OpenKind::Thinking { .. } => BlockType::Reasoning,
+            OpenKind::ToolUse { .. } => BlockType::ToolCall,
+            OpenKind::Skipped => return Vec::new(),
+        };
+        let mut events = vec![Event::BlockStart { index, block_type }];
+        if self.profile == Profile::DeepSeek {
+            match &open.kind {
+                OpenKind::Text(text) if !text.is_empty() => events.push(Event::TextDelta {
+                    index,
+                    text: text.clone(),
+                }),
+                OpenKind::Thinking { text, .. } if !text.is_empty() => {
+                    events.push(Event::ReasoningDelta {
+                        index,
+                        text: text.clone(),
+                    });
+                }
+                OpenKind::ToolUse { id, name, .. } => events.push(Event::ToolCallDelta {
+                    index,
+                    id: id.clone(),
+                    name: Some(name.clone()),
+                    arguments_delta: String::new(),
+                }),
+                _ => {}
             }
-            _ => None,
         }
+        events
     }
 
-    /// Sends a finished block on, or holds it for the stop reason (see
-    /// [`Decoder::held`]).
-    fn finished(&mut self, block: Block) -> Vec<Event> {
-        self.any_block = true;
-        if matches!(block, Block::ToolCall(_)) || !self.held.is_empty() {
-            self.held.push(block);
-            Vec::new()
-        } else {
-            vec![Event::Block(block)]
-        }
-    }
-
-    /// The held blocks, then [`Event::Done`]. On `max_tokens` the tool calls
-    /// among them are dropped, as dsh drops them (`llm/src/assembler.ts:137-141`).
+    /// `usage`, then `finish`.
     fn done(&mut self) -> Result<Vec<Event>, ModelError> {
         let provider = self.profile.name();
         let stop = self.stop.take().ok_or_else(|| {
@@ -298,7 +330,7 @@ impl Decoder {
         // nothing to show or act on. dsh retries it instead
         // (`llm-pi-ai/src/stream.ts:96-107`, `llm-deepseek/src/translate.ts:149`).
         // Any block counts, so an answer that is only thinking is kept.
-        if stop == StopReason::EndTurn && !self.any_block {
+        if stop == FinishReason::Stop && !self.any_block {
             return Err(ModelError::new(
                 ErrorKind::EmptyResponse,
                 format!("{provider} finished an answer with no content"),
@@ -306,28 +338,24 @@ impl Decoder {
         }
         // dsh refuses finished tool arguments that aren't a JSON object,
         // rather than run a tool on them (`translate.ts:151-158`). Ones cut
-        // off by `max_tokens` are dropped below instead.
-        if self.profile == Profile::DeepSeek && stop != StopReason::MaxTokens {
-            let broken_call = self.held.iter().any(|block| {
-                matches!(block, Block::ToolCall(call) if json_object(&call.arguments).is_none())
-            });
-            if broken_call {
-                return Err(broken(
-                    self.profile,
-                    "a tool call's arguments aren't a JSON object",
-                ));
-            }
+        // off by `max_tokens` stream as they are, and the assembler drops
+        // them.
+        if self.profile == Profile::DeepSeek
+            && stop != FinishReason::MaxTokens
+            && self
+                .finished_calls
+                .iter()
+                .any(|arguments| json_object(arguments).is_none())
+        {
+            return Err(broken(
+                self.profile,
+                "a tool call's arguments aren't a JSON object",
+            ));
         }
-        let mut events: Vec<Event> = std::mem::take(&mut self.held)
-            .into_iter()
-            .filter(|block| stop != StopReason::MaxTokens || !matches!(block, Block::ToolCall(_)))
-            .map(Event::Block)
-            .collect();
-        events.push(Event::Done {
-            stop,
-            usage: self.usage,
-        });
-        Ok(events)
+        Ok(vec![
+            Event::Usage { usage: self.usage },
+            Event::Finish { reason: stop },
+        ])
     }
 
     fn delta(&mut self, delta: Delta) -> Result<Option<Event>, ModelError> {
@@ -336,33 +364,47 @@ impl Decoder {
             .open
             .as_mut()
             .ok_or_else(|| protocol(profile, "a delta arrived"))?;
-        Ok(match (open, delta) {
-            (Open::Text(text), Delta::Text { text: more }) => {
+        let index = open.index;
+        let event = match (&mut open.kind, delta) {
+            (OpenKind::Text(text), Delta::Text { text: more }) => {
                 text.push_str(&more);
-                Some(Event::TextDelta(more))
+                Some(Event::TextDelta {
+                    index: index.unwrap_or_default(),
+                    text: more,
+                })
             }
-            (Open::Thinking { text, .. }, Delta::Thinking { thinking: more }) => {
+            (OpenKind::Thinking { text, .. }, Delta::Thinking { thinking: more }) => {
                 text.push_str(&more);
-                Some(Event::ReasoningDelta(more))
+                Some(Event::ReasoningDelta {
+                    index: index.unwrap_or_default(),
+                    text: more,
+                })
             }
-            (Open::Thinking { signature, .. }, Delta::Signature { signature: more }) => {
+            (OpenKind::Thinking { signature, .. }, Delta::Signature { signature: more }) => {
                 signature.get_or_insert_default().push_str(&more);
                 None
             }
-            // Tool arguments arrive as pieces of JSON that only parse once
-            // they're all there, so they aren't passed on one by one.
-            (Open::ToolUse { json, .. }, Delta::InputJson { partial_json }) => {
+            // Each piece of the arguments goes on as it is, raw JSON text.
+            // pi-ai names the call in each piece, and dsh's DeepSeek adapter
+            // only in the first, at the block's start.
+            (OpenKind::ToolUse { id, name, json, .. }, Delta::InputJson { partial_json }) => {
                 json.push_str(&partial_json);
-                None
+                Some(Event::ToolCallDelta {
+                    index: index.unwrap_or_default(),
+                    id: id.clone(),
+                    name: (profile == Profile::Anthropic).then(|| name.clone()),
+                    arguments_delta: partial_json,
+                })
             }
-            (Open::Skipped, _) => None,
+            (OpenKind::Skipped, _) => None,
             // A new kind of delta. DeepSeek's profile refuses it
             // (`translate.ts:87`), below.
             (_, Delta::Other) if profile == Profile::Anthropic => None,
             _ => {
                 return Err(broken(profile, "a delta of the wrong kind arrived"));
             }
-        })
+        };
+        Ok(event)
     }
 
     fn add_usage(&mut self, wire: WireUsage) {
@@ -386,13 +428,15 @@ impl Decoder {
         }
     }
 
-    /// A finished block, or `None` for one Karaka skips.
-    fn finish(&self, open: Open) -> Option<Block> {
-        Some(match open {
-            Open::Text(text) => Block::Text(text),
+    /// The `block-end` for a block that stopped, or `None` for one Karaka
+    /// skips.
+    fn finish(&mut self, open: Open) -> Option<Event> {
+        let index = open.index?;
+        let block = match open.kind {
+            OpenKind::Text(text) => Block::Text(text),
             // Kept even when the text is empty, as it is unless thinking is set
             // to be shown: the signature still has to go back next turn.
-            Open::Thinking { text, signature } => Block::Reasoning {
+            OpenKind::Thinking { text, signature } => Block::Reasoning {
                 text,
                 replay: match self.profile {
                     Profile::Anthropic => Some(signature.unwrap_or_default()),
@@ -402,19 +446,25 @@ impl Decoder {
                 }
                 .map(|signature| Replay::new(self.origin.clone(), signature)),
             },
-            Open::ToolUse {
+            OpenKind::ToolUse {
                 id,
                 name,
                 initial,
                 json,
-            } => Block::ToolCall(ToolCall {
-                id,
-                name,
+            } => {
                 // A tool without arguments may send no JSON at all.
-                arguments: if json.is_empty() { initial } else { json },
-            }),
-            Open::Skipped => return None,
-        })
+                let arguments = if json.is_empty() { initial } else { json };
+                self.finished_calls.push(arguments.clone());
+                Block::ToolCall(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                })
+            }
+            OpenKind::Skipped => return None,
+        };
+        self.any_block = true;
+        Some(Event::BlockEnd { index, block })
     }
 }
 
@@ -440,17 +490,17 @@ fn tool_input(data: &str) -> Option<String> {
 /// (`api/anthropic-messages.js:1285-1307`). Only some reasons are an answer.
 /// The others fail the call, even though they come in a successful
 /// response.
-fn stop_reason(reason: &str, details: Option<StopDetails>) -> Result<StopReason, ModelError> {
+fn stop_reason(reason: &str, details: Option<StopDetails>) -> Result<FinishReason, ModelError> {
     match reason {
         // Karaka sends no stop sequences, so `stop_sequence` shouldn't come.
         // If it does, the answer ended where the request asked.
-        "end_turn" | "stop_sequence" => Ok(StopReason::EndTurn),
-        "tool_use" => Ok(StopReason::ToolCalls),
-        "max_tokens" => Ok(StopReason::MaxTokens),
+        "end_turn" | "stop_sequence" => Ok(FinishReason::Stop),
+        "tool_use" => Ok(FinishReason::ToolCalls),
+        "max_tokens" => Ok(FinishReason::MaxTokens),
         // A server-tools turn that Anthropic paused and will resume. Not a
         // failure, so it isn't an error. pi-ai calls it a normal stop; Karaka
         // keeps it apart, because the turn isn't finished.
-        "pause_turn" => Ok(StopReason::Paused),
+        "pause_turn" => Ok(FinishReason::Paused),
         "refusal" => Err(refusal(details)),
         // A safety filter flagged the answer. Newer than the SDK's types.
         "sensitive" => Err(ModelError::new(
@@ -477,11 +527,11 @@ fn stop_reason(reason: &str, details: Option<StopDetails>) -> Result<StopReason,
 /// What a stop reason means for DeepSeek. dsh knows only these four, and
 /// calls any other malformed (`translate.ts:90-97`), refusals and
 /// `pause_turn` among them.
-fn deepseek_stop_reason(reason: &str) -> Result<StopReason, ModelError> {
+fn deepseek_stop_reason(reason: &str) -> Result<FinishReason, ModelError> {
     match reason {
-        "end_turn" | "stop_sequence" => Ok(StopReason::EndTurn),
-        "tool_use" => Ok(StopReason::ToolCalls),
-        "max_tokens" => Ok(StopReason::MaxTokens),
+        "end_turn" | "stop_sequence" => Ok(FinishReason::Stop),
+        "tool_use" => Ok(FinishReason::ToolCalls),
+        "max_tokens" => Ok(FinishReason::MaxTokens),
         _ => Err(ModelError::new(
             ErrorKind::Malformed,
             format!("DeepSeek stopped for a reason Karaka doesn't know: {reason}"),
@@ -678,7 +728,8 @@ impl WireError {
 #[cfg(test)]
 mod tests {
     use karaka_model::{
-        Block, ErrorKind, Event, ModelError, Origin, Refusal, Replay, StopReason, ToolCall, Usage,
+        Block, BlockAssembler, BlockType, ErrorKind, Event, FinishReason, ModelError, Origin,
+        Refusal, Replay, ToolCall, Usage,
     };
 
     use super::{Decoder, classify};
@@ -718,6 +769,45 @@ mod tests {
         panic!("expected a failure, got {out:?}");
     }
 
+    /// The blocks among `events`, from their ends.
+    fn blocks(events: &[Event]) -> Vec<Block> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::BlockEnd { block, .. } => Some(block.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Why the stream finished, from its last chunk.
+    fn finish(events: &[Event]) -> Option<FinishReason> {
+        match events.last() {
+            Some(Event::Finish { reason }) => Some(*reason),
+            _ => None,
+        }
+    }
+
+    /// The answer as the assembler puts it together.
+    fn assembled(events: &[Event]) -> Vec<Block> {
+        let mut answer = BlockAssembler::new();
+        for event in events {
+            answer.push(event);
+        }
+        answer.blocks()
+    }
+
+    fn text_delta(index: usize, text: &str) -> Event {
+        Event::TextDelta {
+            index,
+            text: text.into(),
+        }
+    }
+
+    fn start(index: usize, block_type: BlockType) -> Event {
+        Event::BlockStart { index, block_type }
+    }
+
     /// The stop reason `reason`, with `details` as its `stop_details`.
     fn stop(reason: &str, details: &str) -> String {
         format!(
@@ -750,17 +840,23 @@ mod tests {
         assert_eq!(
             events,
             [
-                Event::TextDelta("Hel".into()),
-                Event::TextDelta("lo".into()),
-                Event::Block(Block::Text("Hello".into())),
-                Event::Done {
-                    stop: StopReason::EndTurn,
+                start(0, BlockType::Text),
+                text_delta(0, "Hel"),
+                text_delta(0, "lo"),
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Text("Hello".into())
+                },
+                Event::Usage {
                     usage: Usage {
                         input_tokens: 20,
                         output_tokens: 5,
                         cache_read_tokens: 100,
                         cache_write_tokens: 0,
-                    },
+                    }
+                },
+                Event::Finish {
+                    reason: FinishReason::Stop
                 },
             ]
         );
@@ -783,29 +879,55 @@ mod tests {
         ])
         .expect("the stream decodes");
 
-        assert_eq!(events[0], Event::ReasoningDelta("check the clock".into()));
+        // The arguments stream as raw JSON pieces, each naming the call,
+        // as pi-ai's do (`llm-pi-ai/src/stream.ts:189-201`).
         assert_eq!(
-            events[1],
-            Event::Block(Block::Reasoning {
-                text: "check the clock".into(),
-                replay: signed("sig"),
-            })
+            events[..8],
+            [
+                start(0, BlockType::Reasoning),
+                Event::ReasoningDelta {
+                    index: 0,
+                    text: "check the clock".into()
+                },
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Reasoning {
+                        text: "check the clock".into(),
+                        replay: signed("sig"),
+                    }
+                },
+                start(1, BlockType::ToolCall),
+                Event::ToolCallDelta {
+                    index: 1,
+                    id: "toolu_1".into(),
+                    name: Some("clock".into()),
+                    arguments_delta: r#"{"zone": "#.into()
+                },
+                Event::ToolCallDelta {
+                    index: 1,
+                    id: "toolu_1".into(),
+                    name: Some("clock".into()),
+                    arguments_delta: r#""UTC"}"#.into()
+                },
+                Event::BlockEnd {
+                    index: 1,
+                    block: Block::ToolCall(ToolCall {
+                        id: "toolu_1".into(),
+                        name: "clock".into(),
+                        arguments: r#"{"zone": "UTC"}"#.into(),
+                    })
+                },
+                Event::Usage {
+                    usage: Usage {
+                        input_tokens: 20,
+                        output_tokens: 30,
+                        cache_read_tokens: 100,
+                        cache_write_tokens: 0,
+                    }
+                },
+            ]
         );
-        assert_eq!(
-            events[2],
-            Event::Block(Block::ToolCall(ToolCall {
-                id: "toolu_1".into(),
-                name: "clock".into(),
-                arguments: r#"{"zone": "UTC"}"#.into(),
-            }))
-        );
-        assert!(matches!(
-            events[3],
-            Event::Done {
-                stop: StopReason::ToolCalls,
-                ..
-            }
-        ));
+        assert_eq!(finish(&events), Some(FinishReason::ToolCalls));
     }
 
     #[test]
@@ -823,11 +945,18 @@ mod tests {
         ])
         .expect("the stream decodes");
 
-        let [Event::Block(Block::Text(text)), Event::Done { stop, .. }] = events.as_slice() else {
-            panic!("expected the text block, then Done, got {events:?}");
-        };
-        assert_eq!(text, "Found it.");
-        assert_eq!(*stop, StopReason::EndTurn);
+        // The skipped block gets no index, so the text is block 0.
+        assert_eq!(
+            events[..2],
+            [
+                start(0, BlockType::Text),
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Text("Found it.".into())
+                },
+            ]
+        );
+        assert_eq!(finish(&events), Some(FinishReason::Stop));
     }
 
     #[test]
@@ -870,8 +999,12 @@ mod tests {
         assert_eq!(
             events,
             [
-                Event::TextDelta("Hel".into()),
-                Event::Block(Block::Text("Hel".into())),
+                start(0, BlockType::Text),
+                text_delta(0, "Hel"),
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Text("Hel".into())
+                },
             ]
         );
         assert_eq!(error.kind, ErrorKind::Refused);
@@ -924,13 +1057,7 @@ mod tests {
             MESSAGE_STOP,
         ])
         .expect("the stream decodes");
-        assert!(matches!(
-            events.last(),
-            Some(Event::Done {
-                stop: StopReason::EndTurn,
-                ..
-            })
-        ));
+        assert_eq!(finish(&events), Some(FinishReason::Stop));
     }
 
     #[test]
@@ -944,13 +1071,7 @@ mod tests {
             MESSAGE_STOP,
         ])
         .expect("the stream decodes");
-        assert!(matches!(
-            events.last(),
-            Some(Event::Done {
-                stop: StopReason::Paused,
-                ..
-            })
-        ));
+        assert_eq!(finish(&events), Some(FinishReason::Paused));
     }
 
     /// dsh's "classifies a completed stop with no content as an
@@ -976,25 +1097,21 @@ mod tests {
         .expect("the stream decodes");
 
         assert_eq!(
-            events[0],
-            Event::Block(Block::Reasoning {
+            blocks(&events),
+            [Block::Reasoning {
                 text: String::new(),
                 replay: signed("sig"),
-            })
+            }]
         );
-        assert!(matches!(
-            events[1],
-            Event::Done {
-                stop: StopReason::EndTurn,
-                ..
-            }
-        ));
+        assert_eq!(finish(&events), Some(FinishReason::Stop));
     }
 
-    /// dsh's assembler drops "the tool calls a max-tokens finish drops"
-    /// (`llm/tests/assembler.spec.ts`), and keeps what came before them.
+    /// A tool call cut off by `max_tokens` still streams, as in dsh
+    /// ("Truncated tool JSON is retained in the stream", `translate.ts:150`),
+    /// and the assembler drops it, keeping what came before it
+    /// (`llm/tests/assembler.spec.ts`).
     #[test]
-    fn a_max_tokens_finish_drops_a_cut_off_tool_call() {
+    fn a_max_tokens_finish_streams_a_cut_off_tool_call_for_the_assembler_to_drop() {
         let events = decode(&[
             START,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
@@ -1010,32 +1127,28 @@ mod tests {
         ])
         .expect("the stream decodes");
 
+        let cut_off = Block::ToolCall(ToolCall {
+            id: "toolu_1".into(),
+            name: "search".into(),
+            arguments: r#"{"query": "wea"#.into(),
+        });
+        let reasoning = Block::Reasoning {
+            text: "search".into(),
+            replay: signed(""),
+        };
+        let looking = Block::Text("Looking.".into());
         assert_eq!(
-            events,
-            [
-                Event::ReasoningDelta("search".into()),
-                Event::Block(Block::Reasoning {
-                    text: "search".into(),
-                    replay: signed(""),
-                }),
-                Event::Block(Block::Text("Looking.".into())),
-                Event::Done {
-                    stop: StopReason::MaxTokens,
-                    usage: Usage {
-                        input_tokens: 20,
-                        output_tokens: 2,
-                        cache_read_tokens: 100,
-                        cache_write_tokens: 0,
-                    },
-                },
-            ]
+            blocks(&events),
+            [reasoning.clone(), looking.clone(), cut_off]
         );
+        assert_eq!(finish(&events), Some(FinishReason::MaxTokens));
+        assert_eq!(assembled(&events), [reasoning, looking]);
     }
 
-    /// A tool call, and the text after it, wait for the stop reason; then
-    /// both come out in order.
+    /// Nothing waits for the stop reason: each block ends as soon as it
+    /// stops, in the order they came, as dsh's adapters send them.
     #[test]
-    fn tool_calls_and_what_follows_them_wait_for_the_stop_reason() {
+    fn each_block_ends_as_it_stops() {
         let mut decoder = Decoder::anthropic(MODEL);
         let mut feed = |data: &str| decoder.feed(data).expect("the event decodes");
 
@@ -1043,39 +1156,37 @@ mod tests {
         feed(
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"clock","input":{}}}"#,
         );
-        assert_eq!(feed(BLOCK_STOP), [], "the tool call went out early");
+        assert_eq!(
+            feed(BLOCK_STOP),
+            [Event::BlockEnd {
+                index: 0,
+                block: Block::ToolCall(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "clock".into(),
+                    arguments: "{}".into(),
+                })
+            }]
+        );
         feed(
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
         );
-        // The text's delta still goes out at once.
         assert_eq!(
             feed(
                 r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done."}}"#
             ),
-            [Event::TextDelta("Done.".into())]
+            [text_delta(1, "Done.")]
         );
-        assert_eq!(feed(r#"{"type":"content_block_stop","index":1}"#), []);
-        assert_eq!(feed(&stop("tool_use", "null")), []);
-
-        let events = feed(MESSAGE_STOP);
         assert_eq!(
-            events[..2],
-            [
-                Event::Block(Block::ToolCall(ToolCall {
-                    id: "toolu_1".into(),
-                    name: "clock".into(),
-                    arguments: "{}".into(),
-                })),
-                Event::Block(Block::Text("Done.".into())),
-            ]
+            feed(r#"{"type":"content_block_stop","index":1}"#),
+            [Event::BlockEnd {
+                index: 1,
+                block: Block::Text("Done.".into())
+            }]
         );
-        assert!(matches!(
-            events[2],
-            Event::Done {
-                stop: StopReason::ToolCalls,
-                ..
-            }
-        ));
+        assert_eq!(feed(&stop("tool_use", "null")), []);
+        let events = feed(MESSAGE_STOP);
+        assert!(matches!(events[0], Event::Usage { .. }));
+        assert_eq!(finish(&events), Some(FinishReason::ToolCalls));
     }
 
     #[test]
@@ -1197,17 +1308,6 @@ mod tests {
         deepseek_decode(events).expect_err("the call fails")
     }
 
-    /// The blocks among `events`, without the deltas and `Done`.
-    fn blocks(events: &[Event]) -> Vec<Block> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Block(block) => Some(block.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// dsh's "emits first-seen blocks, raw tool JSON and cumulative
     /// disjoint usage before finish".
     #[test]
@@ -1229,29 +1329,67 @@ mod tests {
         ])
         .expect("the stream decodes");
 
+        // Blocks are numbered in the order they start, whatever index the
+        // wire gives them (`translate.ts:121`).
         assert_eq!(
             events,
             [
+                start(0, BlockType::Reasoning),
                 // The text the block started with comes first, as a delta.
-                Event::ReasoningDelta("first".into()),
-                Event::ReasoningDelta(" thought".into()),
-                Event::Block(Block::Reasoning {
-                    text: "first thought".into(),
-                    replay: ds_signed("signature"),
-                }),
-                Event::Block(Block::ToolCall(ToolCall {
+                Event::ReasoningDelta {
+                    index: 0,
+                    text: "first".into()
+                },
+                Event::ReasoningDelta {
+                    index: 0,
+                    text: " thought".into()
+                },
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Reasoning {
+                        text: "first thought".into(),
+                        replay: ds_signed("signature"),
+                    }
+                },
+                start(1, BlockType::ToolCall),
+                // dsh names the call once, in an empty delta at its start,
+                // and its pieces after that carry only the id.
+                Event::ToolCallDelta {
+                    index: 1,
                     id: "call_1".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path": "a"}"#.into(),
-                })),
-                Event::Done {
-                    stop: StopReason::ToolCalls,
+                    name: Some("read".into()),
+                    arguments_delta: String::new()
+                },
+                Event::ToolCallDelta {
+                    index: 1,
+                    id: "call_1".into(),
+                    name: None,
+                    arguments_delta: r#"{"path":"#.into()
+                },
+                Event::ToolCallDelta {
+                    index: 1,
+                    id: "call_1".into(),
+                    name: None,
+                    arguments_delta: r#" "a"}"#.into()
+                },
+                Event::BlockEnd {
+                    index: 1,
+                    block: Block::ToolCall(ToolCall {
+                        id: "call_1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path": "a"}"#.into(),
+                    })
+                },
+                Event::Usage {
                     usage: Usage {
                         input_tokens: 12,
                         output_tokens: 5,
                         cache_read_tokens: 30,
                         cache_write_tokens: 7,
-                    },
+                    }
+                },
+                Event::Finish {
+                    reason: FinishReason::ToolCalls
                 },
             ]
         );
@@ -1268,8 +1406,17 @@ mod tests {
             MESSAGE_STOP,
         ])
         .expect("the stream decodes");
-        assert_eq!(events[0], Event::TextDelta("initial".into()));
-        assert_eq!(events[1], Event::Block(Block::Text("initial".into())));
+        assert_eq!(
+            events[..3],
+            [
+                start(0, BlockType::Text),
+                text_delta(0, "initial"),
+                Event::BlockEnd {
+                    index: 0,
+                    block: Block::Text("initial".into())
+                },
+            ]
+        );
     }
 
     /// dsh's "preserves initial tool input %j without JSON deltas".
@@ -1297,7 +1444,8 @@ mod tests {
 
     /// dsh's "preserves signature-only thinking and prunes truncated tools
     /// with their replay entries". A thinking block with no signature at
-    /// all keeps no replay.
+    /// all keeps no replay. The cut-off tool streams, and the assembler
+    /// drops it.
     #[test]
     fn deepseek_signature_only_thinking_is_kept_and_a_cut_off_tool_dropped() {
         let events = deepseek_decode(&[
@@ -1314,8 +1462,9 @@ mod tests {
             MESSAGE_STOP,
         ])
         .expect("the stream decodes");
+        assert_eq!(blocks(&events).len(), 3);
         assert_eq!(
-            blocks(&events),
+            assembled(&events),
             [
                 Block::Reasoning {
                     text: String::new(),
@@ -1342,13 +1491,7 @@ mod tests {
                 MESSAGE_STOP,
             ])
             .expect("the stream decodes");
-            assert!(matches!(
-                events.last(),
-                Some(Event::Done {
-                    stop: StopReason::EndTurn,
-                    ..
-                })
-            ));
+            assert_eq!(finish(&events), Some(FinishReason::Stop));
         }
     }
 
@@ -1496,6 +1639,6 @@ mod tests {
             MESSAGE_STOP,
         ])
         .expect("Anthropic doesn't check for message_start");
-        assert_eq!(events[0], Event::TextDelta("Hel".into()));
+        assert_eq!(events[1], text_delta(0, "Hel"));
     }
 }

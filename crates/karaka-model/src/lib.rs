@@ -5,6 +5,7 @@
 //! Provider crates translate these types to and from their own wire format.
 //! Nothing outside a provider crate ever sees that format.
 
+mod assembler;
 mod message;
 mod model;
 mod plugin;
@@ -13,10 +14,11 @@ mod retry;
 mod retry_after;
 mod wording;
 
+pub use assembler::BlockAssembler;
 pub use message::{Block, Message, Origin, Replay, Role, ToolCall, ToolResult};
 pub use model::{
-    Effort, ErrorKind, Event, EventStream, Model, ModelError, Refusal, Request, Response,
-    StopReason, ToolSchema, Usage, complete,
+    BlockType, Effort, ErrorKind, Event, EventStream, FinishReason, Model, ModelError, Refusal,
+    Request, Response, ToolSchema, Usage, complete, stream_of,
 };
 pub use plugin::ModelsPlugin;
 pub use registry::{ModelRegistry, RegistryError};

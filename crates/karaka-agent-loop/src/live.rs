@@ -185,7 +185,10 @@ mod tests {
         let (frames, _subscription) = heard(&listeners);
         let mut live = LiveAttempt::new(&listeners, &counters, "s", 1, 1);
         live.start();
-        live.push(StreamChunk::Event(Event::TextDelta("hi".into())));
+        live.push(StreamChunk::Event(Event::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        }));
         let refused = Err(LogError::Invalid {
             seq: Seq(4),
             reason: "refused".into(),

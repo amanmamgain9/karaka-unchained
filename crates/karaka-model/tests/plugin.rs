@@ -9,8 +9,8 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId, Runtime};
 use karaka_model::{
-    Block, Event, EventStream, Message, Model, ModelError, ModelRegistry, ModelsPlugin, Request,
-    StopReason, Usage, complete,
+    Block, Event, EventStream, FinishReason, Message, Model, ModelError, ModelRegistry,
+    ModelsPlugin, Request, Usage, complete, stream_of,
 };
 
 /// A model that always answers with its own name, so a test can tell which
@@ -23,13 +23,12 @@ impl Model for Named {
     }
 
     fn stream(&self, _request: Request) -> EventStream {
-        Box::pin(Playback(VecDeque::from([
-            Ok(Event::Block(Block::Text(self.0.into()))),
-            Ok(Event::Done {
-                stop: StopReason::EndTurn,
-                usage: Usage::default(),
-            }),
-        ])))
+        let events = stream_of(
+            &[Block::Text(self.0.into())],
+            FinishReason::Stop,
+            Usage::default(),
+        );
+        Box::pin(Playback(events.into_iter().map(Ok).collect()))
     }
 }
 

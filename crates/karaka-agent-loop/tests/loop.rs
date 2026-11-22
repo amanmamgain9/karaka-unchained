@@ -20,8 +20,9 @@ use karaka_agent::{
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
 use karaka_model::{
-    Block, Effort, ErrorKind, Event, EventStream, Message, Model, ModelError, ModelRegistry,
-    ModelsPlugin, Request, RetryPolicy, Role, StopReason, ToolCall, ToolResult, ToolSchema, Usage,
+    Block, Effort, ErrorKind, Event, EventStream, FinishReason, Message, Model, ModelError,
+    ModelRegistry, ModelsPlugin, Request, RetryPolicy, Role, ToolCall, ToolResult, ToolSchema,
+    Usage, stream_of,
 };
 use karaka_session::{
     CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
@@ -132,20 +133,27 @@ fn usage() -> Usage {
     }
 }
 
-fn done(stop: StopReason) -> Result<Event, ModelError> {
-    Ok(Event::Done {
-        stop,
-        usage: usage(),
-    })
+/// The chunks of an answer of `blocks`, as dsh's mock adapter scripts one.
+fn answer(blocks: &[Block], reason: FinishReason) -> Reply {
+    Reply::Events(
+        stream_of(blocks, reason, usage())
+            .into_iter()
+            .map(Ok)
+            .collect(),
+    )
 }
 
-/// dsh's `textResponse`: the text in deltas, then whole, then the finish.
-fn text(answer: &str) -> Reply {
-    Reply::Events(vec![
-        Ok(Event::TextDelta(answer.into())),
-        Ok(Event::Block(Block::Text(answer.into()))),
-        done(StopReason::EndTurn),
-    ])
+/// dsh's `textResponse`: the block's start, the text, its end, then usage
+/// and the finish.
+fn text(answer_text: &str) -> Reply {
+    answer(&[Block::Text(answer_text.into())], FinishReason::Stop)
+}
+
+fn delta(text: &str) -> Event {
+    Event::TextDelta {
+        index: 0,
+        text: text.into(),
+    }
 }
 
 fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
@@ -158,12 +166,8 @@ fn call(id: &str, name: &str, arguments: &str) -> ToolCall {
 
 /// dsh's `toolCallResponse`, for any number of calls.
 fn calls(calls: &[ToolCall]) -> Reply {
-    let mut events: Vec<_> = calls
-        .iter()
-        .map(|call| Ok(Event::Block(Block::ToolCall(call.clone()))))
-        .collect();
-    events.push(done(StopReason::ToolCalls));
-    Reply::Events(events)
+    let blocks: Vec<Block> = calls.iter().cloned().map(Block::ToolCall).collect();
+    answer(&blocks, FinishReason::ToolCalls)
 }
 
 // The fake tools.
@@ -681,12 +685,14 @@ async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
 /// max-tokens-truncated step" (`loop.spec.ts:1530`).
 #[tokio::test]
 async fn an_answer_cut_off_by_the_limit_ends_the_turn_with_max_tokens() {
-    let harness = Harness::new(vec![Reply::Events(vec![
-        Ok(Event::Block(Block::Text("truncat".into()))),
-        // A model that breaks the rule and sends a cut-off call anyway.
-        Ok(Event::Block(Block::ToolCall(call("c1", "echo", r#"{"te"#)))),
-        done(StopReason::MaxTokens),
-    ])])
+    // The cut-off call streams, and the assembler drops it.
+    let harness = Harness::new(vec![answer(
+        &[
+            Block::Text("truncat".into()),
+            Block::ToolCall(call("c1", "echo", r#"{"te"#)),
+        ],
+        FinishReason::MaxTokens,
+    )])
     .await;
     harness.say("go").await;
 
@@ -706,10 +712,7 @@ async fn an_answer_cut_off_by_the_limit_ends_the_turn_with_max_tokens() {
 #[tokio::test]
 async fn max_tokens_ends_only_its_own_turn() {
     let harness = Harness::new(vec![
-        Reply::Events(vec![
-            Ok(Event::Block(Block::Text("cut".into()))),
-            done(StopReason::MaxTokens),
-        ]),
+        answer(&[Block::Text("cut".into())], FinishReason::MaxTokens),
         text("clean"),
     ])
     .await;
@@ -727,11 +730,7 @@ async fn max_tokens_ends_only_its_own_turn() {
 async fn a_model_error_ends_the_turn_with_a_structured_failure() {
     let mut busy = ModelError::new(ErrorKind::RateLimited, "Slow down.");
     busy.retry_after = Some(Duration::from_secs(2));
-    let harness = Harness::new(vec![Reply::Events(vec![
-        Ok(Event::TextDelta("Hel".into())),
-        Err(busy),
-    ])])
-    .await;
+    let harness = Harness::new(vec![Reply::Events(vec![Ok(delta("Hel")), Err(busy)])]).await;
     harness.say("hi").await;
 
     // No assistant message: the partial answer belongs to a failed call.
@@ -865,10 +864,7 @@ async fn a_route_with_no_model_ends_the_turn_with_no_adapter() {
 async fn a_cancel_mid_stream_keeps_the_partial_answer() {
     let waiting = Arc::new(Notify::new());
     let harness = Harness::new(vec![
-        Reply::Hang(
-            vec![Event::TextDelta("partial".into())],
-            Arc::clone(&waiting),
-        ),
+        Reply::Hang(vec![delta("partial")], Arc::clone(&waiting)),
         text("after"),
     ])
     .await;
@@ -924,8 +920,11 @@ async fn a_cancel_before_any_text_keeps_no_answer() {
     let waiting = Arc::new(Notify::new());
     let harness = Harness::new(vec![Reply::Hang(
         vec![
-            Event::TextDelta("   ".into()),
-            Event::Block(Block::ToolCall(call("c1", "echo", "{}"))),
+            delta("   "),
+            Event::BlockEnd {
+                index: 1,
+                block: Block::ToolCall(call("c1", "echo", "{}")),
+            },
         ],
         Arc::clone(&waiting),
     )])
@@ -1776,10 +1775,12 @@ async fn a_call_publishes_start_chunks_and_a_committed_end() {
         frame_lines(&frames),
         [
             "1 start a1:1 turn 1 step 1",
-            r#"2 chunk a1:1 #0 Event(TextDelta("hello there"))"#,
-            r#"3 chunk a1:1 #1 Event(Block(Text("hello there")))"#,
-            "4 chunk a1:1 #2 Event(Done { stop: EndTurn, usage: Usage { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 } })",
-            "5 end a1:1 after 3: assistant/message at 6",
+            "2 chunk a1:1 #0 Event(BlockStart { index: 0, block_type: Text })",
+            r#"3 chunk a1:1 #1 Event(TextDelta { index: 0, text: "hello there" })"#,
+            r#"4 chunk a1:1 #2 Event(BlockEnd { index: 0, block: Text("hello there") })"#,
+            "5 chunk a1:1 #3 Event(Usage { usage: Usage { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 } })",
+            "6 chunk a1:1 #4 Event(Finish { reason: Stop })",
+            "7 end a1:1 after 5: assistant/message at 6",
         ]
     );
     assert_eq!(harness.events()[6].event.event_type(), "assistant/message");
@@ -1822,7 +1823,7 @@ async fn a_retried_call_is_a_new_attempt() {
             "4 start a1:2 turn 1 step 1",
         ]
     );
-    assert_eq!(lines[7], "8 end a1:2 after 3: assistant/message at 7");
+    assert_eq!(lines[9], "10 end a1:2 after 5: assistant/message at 7");
     let failure = frames.lock().unwrap()[1].clone();
     assert!(matches!(
         failure,
@@ -1852,9 +1853,9 @@ async fn each_step_publishes_its_own_attempt() {
         .collect();
     assert_eq!(
         starts,
-        ["1 start a1:1 turn 1 step 1", "5 start a1:2 turn 1 step 2"]
+        ["1 start a1:1 turn 1 step 1", "8 start a1:2 turn 1 step 2"]
     );
-    assert_eq!(lines[3], "4 end a1:1 after 2: assistant/message at 6");
+    assert_eq!(lines[6], "7 end a1:1 after 5: assistant/message at 6");
 }
 
 /// dsh: "cancel() mid-stream ends the turn with reason aborted"
@@ -1863,11 +1864,8 @@ async fn each_step_publishes_its_own_attempt() {
 #[tokio::test]
 async fn a_cancelled_call_ends_with_what_it_settled_as() {
     for (events, settled) in [
-        (
-            vec![Event::TextDelta("partial".into())],
-            "assistant/message",
-        ),
-        (vec![Event::TextDelta("  ".into())], "assistant/attempt"),
+        (vec![delta("partial")], "assistant/message"),
+        (vec![delta("  ")], "assistant/attempt"),
     ] {
         let waiting = Arc::new(Notify::new());
         let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
@@ -1911,6 +1909,7 @@ async fn a_broken_listener_doesnt_stop_the_turn() {
         harness.endings(),
         [TurnEndReason::Completed, TurnEndReason::Completed]
     );
-    assert_eq!(frames.lock().unwrap().len(), 10);
+    // Two calls of 7 frames each: start, 5 chunks, end.
+    assert_eq!(frames.lock().unwrap().len(), 14);
     assert!(gone.lock().unwrap().is_empty());
 }

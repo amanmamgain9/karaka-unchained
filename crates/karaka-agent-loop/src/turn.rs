@@ -62,8 +62,8 @@ use std::task::{Context, Poll};
 use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
 
 use karaka_model::{
-    Block, ErrorKind, Event, Message, Model, ModelError, Request, Response, Role, StopReason,
-    ToolCall,
+    Block, BlockAssembler, ErrorKind, FinishReason, Message, Model, ModelError, Request, Response,
+    Role, ToolCall,
 };
 use karaka_session::{
     AssistantMessage, AssistantMessageData, CancelCause, CloseCause, ContentBlock, Extra, Failure,
@@ -72,7 +72,6 @@ use karaka_session::{
 };
 
 use crate::agent::{Cancel, Inner};
-use crate::answer::Answer;
 use crate::failure::{handler_panicked, model_failure, no_model, other_failure};
 use crate::live::LiveAttempt;
 
@@ -191,10 +190,13 @@ impl Inner {
     ) -> Result<Option<TurnEndReason>, Stop> {
         let response = self.call_model(turn, step, input, cancel).await?;
 
-        // `karaka_model::StopReason::Paused` says to treat a paused answer as
+        // `karaka_model::FinishReason::Paused` says to treat a paused answer as
         // unfinished, like one cut off by the limit, until Karaka can resume
         // server-side tools.
-        if matches!(response.stop, StopReason::MaxTokens | StopReason::Paused) {
+        if matches!(
+            response.finish,
+            FinishReason::MaxTokens | FinishReason::Paused
+        ) {
             return Ok(Some(TurnEndReason::MaxTokens));
         }
         let calls: Vec<&ToolCall> = response
@@ -508,13 +510,17 @@ async fn stream(
 ) -> Streamed {
     let mut events = model.stream(request);
     live.start();
-    let mut answer = Answer::default();
+    // dsh's assembler, which `complete` uses too, so the loop keeps the
+    // same blocks and drops the same ones (`llm/src/assembler.ts`).
+    let mut answer = BlockAssembler::new();
     loop {
         // `biased` checks the switch first, so a cancel wins over an event
         // that is ready at the same moment.
         let event = tokio::select! {
             biased;
-            cause = cancel.cancelled() => return Streamed::Cancelled(cause, answer.interrupted()),
+            cause = cancel.cancelled() => {
+                return Streamed::Cancelled(cause, answer.interrupted_blocks());
+            }
             event = poll_fn(|cx| events.as_mut().poll_next(cx)) => event,
         };
         // Every item goes out as a chunk before the loop acts on it: an
@@ -530,18 +536,13 @@ async fn stream(
             Err(error) => StreamChunk::Failed(error.clone()),
         });
         match event {
-            Ok(Event::Done { stop, usage }) => {
-                let message = Message {
-                    role: Role::Assistant,
-                    content: answer.finish(stop),
-                };
-                return Streamed::Finished(Response {
-                    message,
-                    stop,
-                    usage,
-                });
+            Ok(event) => {
+                answer.push(&event);
+                // The finish is always the last chunk.
+                if let Some(response) = answer.response() {
+                    return Streamed::Finished(response);
+                }
             }
-            Ok(event) => answer.push(event),
             Err(error) => return Streamed::Failed(error),
         }
     }

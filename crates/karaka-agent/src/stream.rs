@@ -92,11 +92,10 @@ impl AssistantStreamFrame {
 /// What a chunk carries: one item of the model's stream. (dsh:
 /// `StreamChunk`.)
 ///
-/// Karaka's streams are made of [`Event`]s, which have no separate block
-/// starts and ends, so each event goes as it is. A stream that fails ends
-/// with its error instead, and that is the attempt's last chunk before its
-/// `End`, as dsh's failed stream ends with a `finish` chunk of kind `error`
-/// carrying the failure.
+/// Each [`Event`] is one of dsh's chunks, and goes as it is. A stream that
+/// fails ends with its error instead, and that is the attempt's last chunk
+/// before its `End`, as dsh's failed stream ends with a `finish` chunk of
+/// kind `error` carrying the failure.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamChunk {
     /// An event, as the model sent it.
