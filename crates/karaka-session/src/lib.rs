@@ -20,6 +20,8 @@
 //! - `derive.rs`: the history, and which system messages become the prompt.
 //! - `convert.rs`: between v4's messages and `karaka-model`'s.
 //! - `repair.rs`: the events that close a turn a crash left open.
+//! - `stream.rs`: the compact `stream` records a model call's settlement
+//!   embeds.
 //! - `request.rs`: the request header, the route's context and failed
 //!   attempts, which the loop logs around each model call.
 //!
@@ -43,6 +45,7 @@ mod plugin;
 mod repair;
 mod request;
 mod store;
+mod stream;
 mod surface;
 
 pub use data::{
@@ -70,3 +73,7 @@ pub use request::{
     RequestHeaderData, RequestHeaderReason, call_config_equals, canonical_header, header_equals,
 };
 pub use store::{Session, SessionError, SessionId, SessionStore};
+pub use stream::{
+    StreamAccumulator, StreamError, TimedChunk, chunk_event, chunk_json, expand_stream,
+    failure_json, finish_json,
+};

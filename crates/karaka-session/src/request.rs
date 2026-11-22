@@ -154,8 +154,8 @@ pub struct RequestContext {
 pub struct AssistantAttemptData {
     pub turn: u64,
     pub step: u64,
-    /// The stream the model sent, in v4's compact records, as raw JSON.
-    /// Karaka keeps no streams, so its own attempts write it empty.
+    /// The stream the model sent, in v4's compact records, as raw JSON. A
+    /// failed call's ends with a `finish` of kind `error`; see `stream.rs`.
     pub stream: Vec<Value>,
     #[serde(flatten)]
     pub extra: Extra,

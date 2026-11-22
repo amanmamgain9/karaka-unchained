@@ -16,6 +16,8 @@ karaka-model.workspace = true
 karaka-tools.workspace = true
 karaka-session.workspace = true
 karaka-agent.workspace = true
+# The compact stream records each settlement embeds are JSON.
+serde_json.workspace = true
 # Each agent drives its turns on a task of its own. `sync` is for the watch
 # channels that carry a cancel and the idle state, and `macros` for
 # `select!`, which races each model stream and tool call against a cancel.
@@ -26,6 +28,5 @@ tokio = { workspace = true, features = ["rt", "sync", "macros"] }
 [dev-dependencies]
 # `rt-multi-thread` for one test that drives an agent from many threads.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-# The scripted model's stream, and the JSON a stored log comes back as.
+# The scripted model's stream.
 futures-core.workspace = true
-serde_json.workspace = true

@@ -211,7 +211,8 @@ impl SessionEvent {
         })
     }
 
-    /// An `assistant/attempt` with no stream: Karaka keeps none.
+    /// An `assistant/attempt` with an empty stream, for tests and for a
+    /// call that sent nothing.
     pub fn assistant_attempt(turn: u64, step: u64) -> Self {
         Self::AssistantAttempt(AssistantAttemptData {
             turn,

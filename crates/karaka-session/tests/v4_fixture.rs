@@ -314,3 +314,27 @@ fn the_log_cut_after_its_tool_calls_repairs_to_two_failed_results() {
     assert_eq!(ids, [("call-a", true), ("call-b", true)]);
     assert_eq!(session.repair(), Ok(Vec::new()));
 }
+
+/// Every embedded stream in the log expands, as dsh's storage verifier
+/// reads them, and packs back to the very records it held.
+#[test]
+fn every_embedded_stream_expands_and_packs_back() {
+    let mut checked = 0;
+    for entry in entries() {
+        let stream = match entry.event {
+            SessionEvent::AssistantMessage { data, .. } => data.stream,
+            SessionEvent::AssistantAttempt(data) => data.stream,
+            _ => continue,
+        };
+        let expanded = karaka_session::expand_stream(&stream).expect("the records are valid");
+        let mut packed = karaka_session::StreamAccumulator::new();
+        for chunk in expanded {
+            packed
+                .push(chunk.time, chunk.chunk)
+                .expect("the chunk is valid");
+        }
+        assert_eq!(packed.snapshot(), stream);
+        checked += 1;
+    }
+    assert_eq!(checked, 3);
+}

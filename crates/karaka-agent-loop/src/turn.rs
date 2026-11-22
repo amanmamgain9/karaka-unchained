@@ -60,15 +60,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
+use serde_json::Value;
 
 use karaka_model::{
     Block, BlockAssembler, ErrorKind, FinishReason, Message, Model, ModelError, Request, Response,
     Role, ToolCall,
 };
 use karaka_session::{
-    AssistantMessage, AssistantMessageData, CancelCause, CloseCause, ContentBlock, Extra, Failure,
-    History, LogError, Seq, SessionEvent, SurfaceIntent, SurfaceOp, SystemMessage,
-    SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason, UserMessage,
+    AssistantAttemptData, AssistantMessage, AssistantMessageData, CancelCause, CloseCause,
+    ContentBlock, Extra, Failure, History, LogError, Seq, SessionEvent, SurfaceIntent, SurfaceOp,
+    SystemMessage, SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason, UserMessage,
 };
 
 use crate::agent::{Cancel, Inner};
@@ -290,7 +291,7 @@ impl Inner {
             );
             match stream(model.as_ref(), request, cancel, &mut live).await {
                 Streamed::Finished(response) => {
-                    let data = AssistantMessageData::from_response(
+                    let mut data = AssistantMessageData::from_response(
                         self.next_id("assistant"),
                         turn,
                         step,
@@ -298,6 +299,9 @@ impl Inner {
                         &config.model,
                         &response,
                     );
+                    // The finish record carries the replay state the message's
+                    // source has, built once, from the assembled blocks.
+                    data.stream = live.stream(data.message.source.replay_state.as_ref());
                     let logged = self.session.append(SessionEvent::assistant(data));
                     live.settle(SettledAs::AssistantMessage, logged)?;
                     return Ok(response);
@@ -305,9 +309,7 @@ impl Inner {
                 // A call that left no message is logged as an attempt, so the
                 // log shows it was made. (dsh: `agent.ts:489-510`.)
                 Streamed::Failed(error) => {
-                    let logged = self
-                        .session
-                        .append(SessionEvent::assistant_attempt(turn, step));
+                    let logged = self.session.append(attempt(turn, step, live.stream(None)));
                     live.settle(SettledAs::AssistantAttempt, logged)?;
                     drop(live);
                     self.recover(turn, step, model.as_ref(), model_failure(&error), cancel)
@@ -315,13 +317,16 @@ impl Inner {
                 }
                 Streamed::Cancelled(cause, content) => {
                     if content.is_empty() {
-                        let logged = self
-                            .session
-                            .append(SessionEvent::assistant_attempt(turn, step));
+                        let logged = self.session.append(attempt(turn, step, live.stream(None)));
                         live.settle(SettledAs::AssistantAttempt, logged)?;
                     } else {
-                        let logged =
-                            self.append_interrupted(turn, step, model.provider(), &content);
+                        let logged = self.append_interrupted(
+                            turn,
+                            step,
+                            model.provider(),
+                            &content,
+                            live.stream(None),
+                        );
                         live.settle(SettledAs::AssistantMessage, logged)?;
                     }
                     return Err(Stop::Aborted(cause));
@@ -451,6 +456,7 @@ impl Inner {
         step: u64,
         provider: &str,
         content: &[Block],
+        stream: Vec<Value>,
     ) -> Result<Seq, LogError> {
         let message = AssistantMessage::from_model(
             self.next_id("assistant"),
@@ -463,7 +469,7 @@ impl Inner {
                 turn,
                 step,
                 message,
-                stream: Vec::new(),
+                stream,
                 usage: None,
                 interrupted: true,
                 extra: Extra::new(),
@@ -546,6 +552,17 @@ async fn stream(
             Err(error) => return Streamed::Failed(error),
         }
     }
+}
+
+/// The `assistant/attempt` for a call that left no message, with its
+/// stream.
+fn attempt(turn: u64, step: u64, stream: Vec<Value>) -> SessionEvent {
+    SessionEvent::AssistantAttempt(AssistantAttemptData {
+        turn,
+        step,
+        stream,
+        extra: Extra::new(),
+    })
 }
 
 /// A system message's text: its text blocks joined with nothing between,

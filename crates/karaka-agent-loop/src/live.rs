@@ -9,14 +9,27 @@
 //! An attempt that started and is dropped without settling sends
 //! `abandoned` as it goes, as dsh's `if (!live.ended) live.abandon()` does.
 //!
-//! dsh also folds the chunks into the compact `stream` records that its
-//! `assistant/message` and `assistant/attempt` embed. That isn't ported: the
-//! logged `stream` stays empty.
+//! It also keeps the chunks as the compact `stream` records the call's
+//! `assistant/message` or `assistant/attempt` embeds, as dsh's attempt owns
+//! its `AssistantStreamAccumulator`. A chunk's frame and its record carry
+//! the same time. Two things are written differently from the frames:
+//!
+//! - The `finish` record waits for the settlement, so it can carry the
+//!   answer's replay state, the same envelope the message's
+//!   `source.replayState` gets, as a dsh adapter's finish carries it.
+//! - A failure is recorded as dsh's `finish` of kind `error`, with the
+//!   failure as `turn/end` writes it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karaka_agent::{AssistantStreamFrame, FrameListeners, SettledAs, StreamChunk, StreamOutcome};
-use karaka_session::{LogError, Seq, Time};
+use karaka_model::{Event, FinishReason};
+use karaka_session::{
+    LogError, Seq, StreamAccumulator, Time, chunk_json, failure_json, finish_json,
+};
+use serde_json::Value;
+
+use crate::failure::model_failure;
 
 /// The counters an agent keeps for its frames.
 #[derive(Debug, Default)]
@@ -39,6 +52,10 @@ pub(crate) struct LiveAttempt<'a> {
     index: u64,
     started: bool,
     ended: bool,
+    /// The chunks so far, as the records the settlement embeds.
+    records: StreamAccumulator,
+    /// The finish and when it came, recorded only at the settlement.
+    finish: Option<(Time, FinishReason)>,
 }
 
 impl<'a> LiveAttempt<'a> {
@@ -61,6 +78,8 @@ impl<'a> LiveAttempt<'a> {
             index: 0,
             started: false,
             ended: false,
+            records: StreamAccumulator::new(),
+            finish: None,
         }
     }
 
@@ -78,15 +97,39 @@ impl<'a> LiveAttempt<'a> {
     /// One item of the stream arrived: an event, or the failure that ends
     /// it. (dsh: `push`.)
     pub(crate) fn push(&mut self, chunk: StreamChunk) {
+        let time = Time::now();
+        let record = match &chunk {
+            StreamChunk::Event(Event::Finish { reason }) => {
+                self.finish = Some((time, *reason));
+                None
+            }
+            StreamChunk::Event(event) => Some(chunk_json(event)),
+            StreamChunk::Failed(error) => Some(failure_json(&model_failure(error))),
+        };
+        if let Some(record) = record {
+            // Only a time or an index past JavaScript's safe integers is
+            // refused, which no clock or answer reaches.
+            let _ = self.records.push(time, record);
+        }
         let index = self.index;
         self.index += 1;
         self.emit(|attempt_id, revision, _| AssistantStreamFrame::Chunk {
             attempt_id,
             revision,
             index,
-            time: Time::now(),
+            time,
             chunk,
         });
+    }
+
+    /// The records to embed in the call's settlement: every chunk so far,
+    /// and the finish, if it came, carrying `replay_state`. (dsh: `stream`.)
+    pub(crate) fn stream(&self, replay_state: Option<&Value>) -> Vec<Value> {
+        let mut records = self.records.clone();
+        if let Some((time, reason)) = self.finish {
+            let _ = records.push(time, finish_json(reason, replay_state));
+        }
+        records.snapshot()
     }
 
     /// The call's event was offered to the log: `logged` is what the append

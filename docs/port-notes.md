@@ -509,8 +509,8 @@ system and user messages, before the stream.
   on resume, and the resumed header leaves it out.
 - **No `developer/message` for tool changes**, as above: only the `change`
   header records them.
-- **Attempt streams are empty.** dsh embeds the exact stream it received.
-  Karaka keeps no streams, and v4 accepts an empty one.
+- **Attempt streams were empty** until step five, part B, which embeds the
+  exact stream, as dsh does.
 - **The `agent/request` hook and `startsRequestSeries` aren't ported**, so a
   plugin can't change the config per step or start a series itself.
 
@@ -646,9 +646,8 @@ system and user messages, before the stream.
 ### Left out
 
 - **The durable compact `stream` records** that dsh's `assistant/message`
-  and `assistant/attempt` embed (`AssistantStreamAccumulator`). Karaka's
-  `Event` is coarser than dsh's `StreamChunk`, so matching dsh's records is a
-  step of its own. The logged `stream` stays empty, which v4 accepts.
+  and `assistant/attempt` embed (`AssistantStreamAccumulator`). Done in step
+  five.
 
 ### Where step four differs from dsh
 
@@ -771,3 +770,69 @@ silently.
   appear. Before, reasoning always came first.
 - **No `totalTokens` or `reasoningTokens`** in `Usage`. dsh's DeepSeek
   adapter computes a total; Karaka's `Usage` has no field for one.
+
+## Agent loop, step five, part B: the compact stream records
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-22.*
+
+### What is done
+
+- **The records** (`karaka-session`, `stream.rs`; dsh's
+  `llm/src/assistant-stream.ts`).
+  - `StreamAccumulator` packs one call's timed chunks into dsh's records:
+    `text-chunks`, `reasoning-chunks` and `tool-call-chunks`, each
+    `{ time0, index, dt, texts | args }`, and a raw `chunk` record for
+    everything else. The packing rules are dsh's: a delta joins the run before
+    it when it is the same kind and block, at a safe gap. A tool call's
+    deltas also need the same id and the same name or none. A tool-call
+    delta with an empty id or name is kept raw.
+  - `expand_stream` gives the exact timed chunks back, checking each record
+    as dsh's `validateRecord` does, in its words.
+  - Times are epoch milliseconds, as dsh's `Date.now()`; Karaka's `Time` is
+    already that. Times, gaps and indices must be JavaScript safe integers.
+- **Chunks are kept as dsh's JSON.** A record a dsh adapter wrote, a
+  `finish` with `replayState`, one of kind `error`, a block kind Karaka
+  doesn't model, or any field it doesn't name, expands and packs again
+  unchanged. `chunk_json` writes a Karaka `Event` as dsh's chunk, and
+  `chunk_event` reads one back where Karaka has a type for it.
+- **The loop feeds the records from the same chunks the frames carry**,
+  with the same times (`live.rs`, as dsh's `AssistantStreamAttempt` owns its
+  accumulator). Every `assistant/message`, the interrupted one included,
+  and every `assistant/attempt` embeds its snapshot.
+- **The finish record.**
+  - It waits for the settlement, so it can carry the answer's replay state:
+    the same envelope the message's `source.replayState` gets, built once
+    from the assembled blocks, as a dsh adapter's finish carries it.
+  - A failed call's stream ends with a raw `finish` record of kind `error`,
+    made from the `ModelError`, with the failure as `turn/end` writes it.
+  - A cancelled call has no finish, as in dsh.
+- **Checking at the durable boundary**, as dsh does it. dsh's session keeps
+  embedded streams opaque: it checks only that `stream` is a list
+  (`core/session/src/index.ts:281-293`), which Karaka's type guarantees. Its
+  JSONL storage verifier expands each stream and checks that it assembles to
+  the logged answer (`session-persistence-jsonl/src/generation.ts:553-577`).
+  Karaka has no durable backend yet; `expand_stream` with `chunk_event` and
+  the `BlockAssembler` is the check one would run, and the loop tests run it
+  on what the loop logs.
+- **Tests.** dsh's `assistant-stream.spec.ts` cases: packing, run breaks,
+  unsafe values and empty identities, and every malformed record it lists.
+  Also round trips (Karaka chunks to records and back, exactly), dsh-written
+  records kept whole, and records assembling to the same answer. Loop tests
+  cover the embedded stream of an answer, of a signed answer's finish, of a
+  failed attempt, and of a cancel.
+
+### Where part B differs from dsh
+
+- **Chunk JSON is Karaka's writing of dsh's shapes.** A `block-end` holds
+  v4's content block, as a message holds it, so a reasoning block's
+  signature is in the finish's `replayState`, not the block, as in dsh.
+  `usage` always writes the two cache counts, as Karaka's logged usage
+  does; pi-ai writes them only when not zero.
+- **The finish's `replayState` is Karaka's envelope**, pi-ai's v2 or
+  DeepSeek's shape (see `convert.rs`), the same one the message's source
+  gets, not something an adapter wrote straight off the wire.
+- **The full storage verifier isn't ported**, only the pieces it needs.
+  It belongs with the first durable backend.
+- **No stream reader helpers** (first token time, visible content, joined
+  text and the like). Nothing in Karaka reads them yet.
+

@@ -20,18 +20,18 @@ use karaka_agent::{
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
 use karaka_model::{
-    Block, Effort, ErrorKind, Event, EventStream, FinishReason, Message, Model, ModelError,
-    ModelRegistry, ModelsPlugin, Request, RetryPolicy, Role, ToolCall, ToolResult, ToolSchema,
-    Usage, stream_of,
+    Block, BlockAssembler, Effort, ErrorKind, Event, EventStream, FinishReason, Message, Model,
+    ModelError, ModelRegistry, ModelsPlugin, Origin, Replay, Request, RetryPolicy, Role, ToolCall,
+    ToolResult, ToolSchema, Usage, stream_of,
 };
 use karaka_session::{
     CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
     RequestHeaderData, RequestHeaderReason, Seq, SessionEvent, SessionId, SessionStore,
-    SessionsPlugin, SurfaceIntent, SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TokenUsage,
-    TurnEndReason, UserMessage, UserSource,
+    SessionsPlugin, SurfaceIntent, SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TimedChunk,
+    TokenUsage, TurnEndReason, UserMessage, UserSource, chunk_event, chunk_json, expand_stream,
 };
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
@@ -1912,4 +1912,164 @@ async fn a_broken_listener_doesnt_stop_the_turn() {
     // Two calls of 7 frames each: start, 5 chunks, end.
     assert_eq!(frames.lock().unwrap().len(), 14);
     assert!(gone.lock().unwrap().is_empty());
+}
+
+// The compact `stream` records each settlement embeds. dsh: `step()` in
+// `agent-loop/src/agent.ts:465-545`, with `AssistantStreamAttempt`.
+
+/// The `stream` of the settlement at `seq`, expanded.
+fn expanded_stream(harness: &Harness, seq: usize) -> Vec<TimedChunk> {
+    let events = harness.events();
+    let stream = match &events[seq].event {
+        SessionEvent::AssistantMessage { data, .. } => data.stream.clone(),
+        SessionEvent::AssistantAttempt(data) => data.stream.clone(),
+        other => panic!("expected a settlement at {seq}, got {other:?}"),
+    };
+    expand_stream(&stream).expect("the records are valid")
+}
+
+/// The chunks `frames` carried, with their times, as dsh's JSON.
+fn framed_chunks(frames: &Mutex<Vec<AssistantStreamFrame>>) -> Vec<TimedChunk> {
+    frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            AssistantStreamFrame::Chunk {
+                time,
+                chunk: StreamChunk::Event(event),
+                ..
+            } => Some(TimedChunk {
+                time: *time,
+                chunk: chunk_json(event),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// dsh: "records exact replay chunks inside the durable assistant message"
+/// (`loop.spec.ts:998`). The records expand to the very chunks the frames
+/// carried, at the same times, and assemble to the logged answer, as
+/// dsh's storage verifier checks (`generation.ts:553-577`).
+#[tokio::test]
+async fn an_answer_embeds_its_exact_stream() {
+    let harness = Harness::new(vec![text("hello there")]).await;
+    let agent = harness.agent();
+    let (frames, _subscription) = listen(agent.as_ref());
+    harness.say("hi").await;
+
+    let expanded = expanded_stream(&harness, 6);
+    assert_eq!(expanded, framed_chunks(&frames));
+    let kinds: Vec<&str> = expanded
+        .iter()
+        .map(|chunk| chunk.chunk["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["block-start", "text-delta", "block-end", "usage", "finish"]
+    );
+    assert_eq!(
+        expanded[4].chunk,
+        json!({ "type": "finish", "reason": { "kind": "stop" } })
+    );
+
+    let mut assembled = BlockAssembler::new();
+    for chunk in &expanded {
+        assembled.push(&chunk_event(&chunk.chunk).unwrap());
+    }
+    let events = harness.events();
+    let SessionEvent::AssistantMessage { data, .. } = &events[6].event else {
+        panic!("expected the answer");
+    };
+    assert_eq!(assembled.blocks(), data.message.blocks());
+    assert_eq!(assembled.usage().map(TokenUsage::from), data.usage);
+}
+
+/// An answer with a signature: the finish record carries the replay state
+/// the message's source has, as a dsh adapter's finish carries it.
+#[tokio::test]
+async fn the_finish_record_carries_the_answers_replay_state() {
+    let signed = Block::Reasoning {
+        text: "think".into(),
+        replay: Some(Replay::new(
+            Origin::new("anthropic-messages", PROVIDER, MODEL),
+            "sig",
+        )),
+    };
+    let harness = Harness::new(vec![answer(
+        &[signed, Block::Text("done".into())],
+        FinishReason::Stop,
+    )])
+    .await;
+    harness.say("hi").await;
+
+    let events = harness.events();
+    let SessionEvent::AssistantMessage { data, .. } = &events[6].event else {
+        panic!("expected the answer");
+    };
+    let state = data
+        .message
+        .source
+        .replay_state
+        .clone()
+        .expect("the answer has replay state");
+    let finish = expanded_stream(&harness, 6).pop().unwrap().chunk;
+    assert_eq!(
+        finish,
+        json!({ "type": "finish", "reason": { "kind": "stop" }, "replayState": state })
+    );
+}
+
+/// A failed call's attempt ends its stream with dsh's `finish` of kind
+/// `error`, the failure written as `turn/end` writes it.
+#[tokio::test]
+async fn a_failed_attempt_ends_its_stream_with_the_failure() {
+    let mut busy = ModelError::new(ErrorKind::RateLimited, "Slow down.");
+    busy.retry_after = Some(Duration::from_secs(2));
+    let harness = Harness::new(vec![Reply::Events(vec![Ok(delta("Hel")), Err(busy)])]).await;
+    harness.say("hi").await;
+
+    let expanded = expanded_stream(&harness, 6);
+    assert_eq!(
+        expanded[0].chunk,
+        json!({ "type": "text-delta", "index": 0, "text": "Hel" })
+    );
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("expected a failed turn, got {endings:?}");
+    };
+    assert_eq!(
+        expanded[1].chunk,
+        json!({ "type": "finish", "reason": { "kind": "error", "failure": serde_json::to_value(failure).unwrap() } })
+    );
+    assert_eq!(expanded.len(), 2);
+}
+
+/// A cancel leaves what streamed, with no finish: the interrupted answer
+/// embeds its prefix, and an attempt with nothing worth keeping embeds its
+/// chunks too.
+#[tokio::test]
+async fn a_cancelled_call_embeds_what_streamed() {
+    for (events, kept) in [
+        (vec![delta("partial")], "partial"),
+        (vec![delta("  ")], "  "),
+    ] {
+        let waiting = Arc::new(Notify::new());
+        let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
+        let agent = harness.agent();
+        agent.followup(user("go"));
+        waiting.notified().await;
+        agent.cancel(CancelCause::User);
+        idle(agent.as_ref()).await;
+
+        let expanded = expanded_stream(&harness, 6);
+        assert_eq!(
+            expanded
+                .iter()
+                .map(|chunk| &chunk.chunk)
+                .collect::<Vec<_>>(),
+            [&json!({ "type": "text-delta", "index": 0, "text": kept })]
+        );
+    }
 }

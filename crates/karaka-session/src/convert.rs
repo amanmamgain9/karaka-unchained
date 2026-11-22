@@ -468,9 +468,9 @@ impl AssistantMessageData {
     /// The `assistant/message` data for a finished model call in step
     /// `step` of turn `turn`.
     ///
-    /// The stream is written empty, since Karaka keeps no stream records,
-    /// and v4 accepts that. The response's stop reason goes only into the
-    /// replay state, the one place outside the stream where v4 keeps it.
+    /// The stream is written empty; the loop fills it with the call's
+    /// records. The response's stop reason goes into the replay state too,
+    /// the one place outside the stream where v4 keeps it.
     /// See [`AssistantMessage::from_model`] for `provider` and `model`.
     pub fn from_response(
         id: impl Into<String>,

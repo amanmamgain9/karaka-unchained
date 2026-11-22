@@ -46,9 +46,10 @@ pub struct AssistantMessageData {
     pub turn: u64,
     pub step: u64,
     pub message: AssistantMessage,
-    /// The exact timed stream the model sent, in v4's compact records. Kept
-    /// as raw JSON: Karaka doesn't replay streams. Karaka's own events write
-    /// an empty stream, which v4 accepts.
+    /// The exact timed stream the model sent, in v4's compact records, as
+    /// raw JSON, so a record a dsh adapter wrote keeps every field. See
+    /// `stream.rs` for the records and [`expand_stream`](crate::expand_stream)
+    /// for reading them.
     pub stream: Vec<Value>,
     /// What the call cost. Absent when the provider reported nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
