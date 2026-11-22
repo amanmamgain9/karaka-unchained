@@ -34,11 +34,15 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use karaka_agent::{Agent, CancelSwitch, Cancellation, WhenIdle, cancellation};
+use karaka_agent::{
+    Agent, CancelSwitch, Cancellation, FrameListener, FrameListeners, FrameSubscription, WhenIdle,
+    cancellation,
+};
 use karaka_session::{CancelCause, Session, SessionEvent, SessionId, UserMessage};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use crate::live::FrameCounters;
 use crate::plugin::Shared;
 use crate::turn::Ran;
 
@@ -71,6 +75,9 @@ pub(crate) struct Inner {
     /// request built after a replacement starts a new series.
     /// (dsh: `requestSurfaceGeneration`.)
     pub(crate) request_generation: AtomicU64,
+    /// Who hears the live frames of this agent's model calls.
+    pub(crate) frames: FrameListeners,
+    pub(crate) frame_counters: FrameCounters,
     /// `true` while no driver runs. [`Agent::when_idle`] waits on it.
     /// Messages may still be queued, after a failed turn.
     idle: watch::Sender<bool>,
@@ -109,6 +116,8 @@ impl LoopAgent {
         let generation = session.surface_generation();
         let inner = Inner {
             header_logged: AtomicBool::new(false),
+            frames: FrameListeners::new(),
+            frame_counters: FrameCounters::default(),
             request_generation: AtomicU64::new(generation),
             session,
             shared,
@@ -152,6 +161,10 @@ impl Agent for LoopAgent {
         if let Some(switch) = &state.switch {
             switch.cancel(cause);
         }
+    }
+
+    fn subscribe(&self, listener: FrameListener) -> FrameSubscription {
+        self.inner.frames.subscribe(listener)
     }
 
     fn when_idle(&self) -> WhenIdle<'_> {

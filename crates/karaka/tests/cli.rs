@@ -327,6 +327,8 @@ fn a_model_error_says_whether_to_try_again() {
         &[
             ("ANTHROPIC_API_KEY", "test-key".into()),
             ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            // Off: this checks the error line, not the retry.
+            ("KARAKA_MAX_RETRIES", "0".into()),
         ],
         "",
     );
@@ -643,4 +645,83 @@ fn chat_retries_a_rate_limit_and_answers() {
     assert_eq!(sent.len(), 2);
     // Both requests carried the same conversation.
     assert_eq!(body(&sent[0]), body(&sent[1]));
+}
+
+/// `ask` goes through the loop, so a rate limit is retried: the server
+/// refuses once, and the answer comes on the second request. The failed
+/// attempt printed nothing, so there is nothing to take back and no note.
+#[test]
+fn ask_retries_a_rate_limit_and_answers() {
+    let (address, server) = serve(vec![
+        http_response(
+            "429 Too Many Requests",
+            &[("content-type", "application/json")],
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Slow down."}}"#,
+        ),
+        streamed(ANTHROPIC_HELLO),
+    ]);
+
+    let output = karaka(
+        &["ask", "say", "hello"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Hello, world\n");
+    assert_eq!(
+        stderr,
+        "stop: finished · in 12 (+100 cached) · out 34 tokens\n"
+    );
+    let sent = server.join().expect("the server ran");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(body(&sent[0]), body(&sent[1]));
+}
+
+/// Anthropic's events for "Hel", then an overloaded error mid-stream.
+const ANTHROPIC_BREAKS_OFF: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_0","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
+    "\n\n",
+    "event: error\n",
+    r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    "\n\n",
+);
+
+/// A retry after text was printed can't take the text back. The line is
+/// ended, a note goes to stderr, and the retry's answer follows.
+#[test]
+fn ask_ends_the_line_and_says_so_when_it_retries_after_text() {
+    let (address, server) = serve(vec![
+        streamed(ANTHROPIC_BREAKS_OFF),
+        streamed(ANTHROPIC_HELLO),
+    ]);
+
+    let output = karaka(
+        &["ask", "say", "hello"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Hel\nHello, world\n");
+    assert_eq!(
+        stderr,
+        "karaka: trying again\nstop: finished · in 12 (+100 cached) · out 34 tokens\n"
+    );
+    assert_eq!(server.join().expect("the server ran").len(), 2);
 }

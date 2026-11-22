@@ -386,8 +386,6 @@ Each lives in dsh at the path given, under `packages/`.
   after a restart with other tools, or a tool registered between turns.
   Karaka's model seam has no block for them, so only the header records the
   change (see step two).
-- **Assistant stream frames for a live UI.** `AssistantStreamAttempt`,
-  `core/agent-loop/src/assistant-stream.ts`, sent as `agent/assistant-stream`.
 - **Compaction.** `compaction/compaction` and its siblings.
 
 ### A failed turn stops the driver
@@ -609,12 +607,87 @@ system and user messages, before the stream.
   session closes a turn that a crash left open, as dsh's resume does, and
   that `turn/end` resets the count, so a restarted agent starts its next
   turn from zero, as dsh's does.
-- **`karaka ask` doesn't retry.** It streams the answer straight from the
-  model, outside the loop, and the hook needs a session and a turn. Running
-  `ask` through the loop would print the answer only once it is finished,
-  unless the loop published stream frames for a live view (dsh's
-  `agent/assistant-stream`, left out in step one). With those, `ask` could
-  become a one-turn chat.
+- **`karaka ask` didn't retry** at first, since it ran outside the loop.
+  Step four moved it into the loop, so it retries now.
 - **The retry tests use the real loop**, so `karaka-retry` has
   `karaka-agent-loop` as a dev-dependency. Its library depends only on
   seams.
+
+## Agent loop, step four: live stream frames
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-22.*
+
+### What is done
+
+- **The frame type** (`karaka-agent`, `stream.rs`; dsh `AssistantStreamFrame`,
+  `core/agent/src/runtime-types.ts:128-167`): `Start`, `Chunk` and `End`, each
+  with an attempt id `{session}:{n}`, where `n` counts the agent's attempts,
+  and a revision that counts up across all of the agent's frames.
+  `End.outcome` is `Committed { event_type, seq }` or `Abandoned`.
+- **Subscribing** (dsh: the agent-scoped `agent/assistant-stream` emit,
+  `runtime-types.ts:355`). `Agent::subscribe(listener)` returns a
+  `FrameSubscription` that unsubscribes when dropped. A listener is a plain
+  function, called in order on the turn's task, as dsh's emit is synchronous.
+  `FrameListeners` keeps the list, so every loop subscribes and catches
+  panics the same way. A listener that panics is caught and dropped, and the
+  turn and the other listeners carry on.
+- **The loop emits them** (`karaka-agent-loop`, `live.rs`; dsh
+  `AssistantStreamAttempt`, `core/agent-loop/src/assistant-stream.ts`), in
+  dsh's order (`agent.ts:440-560`):
+  - `start` only once the stream is open; a call that never starts sends
+    nothing;
+  - a `chunk` for each event, before the loop acts on it;
+  - `end` committed only after the `assistant/message` or
+    `assistant/attempt` append has returned its seq;
+  - `abandoned` when that append fails, or when an attempt that started is
+    dropped without settling, as dsh's `if (!live.ended) live.abandon()` does.
+  - A retried call is a new attempt, with a new id.
+
+### Left out
+
+- **The durable compact `stream` records** that dsh's `assistant/message`
+  and `assistant/attempt` embed (`AssistantStreamAccumulator`). Karaka's
+  `Event` is coarser than dsh's `StreamChunk`, so matching dsh's records is a
+  step of its own. The logged `stream` stays empty, which v4 accepts.
+
+### Where step four differs from dsh
+
+- **A chunk is a `karaka_model::Event`, not a dsh `StreamChunk`.** There are
+  no `block-start`, `block-end`, `tool-call-delta` or `usage` chunks: a block
+  arrives whole as `Event::Block`, and usage comes with `Event::Done`.
+- **The failure chunk carries the model's own error.** dsh's failed stream
+  ends with a `finish` chunk of kind `error`, carrying its `LlmFailure`.
+  Karaka's chunk is `StreamChunk::Event(Event)` or `StreamChunk::Failed(ModelError)`,
+  and a failed attempt's last chunk is the `ModelError` itself, refusal details
+  included, which the logged `Failure` can't hold.
+- **A stream that ends with neither its last event nor an error** fails as
+  `Network`, "the stream ended before the model finished": the error
+  Karaka's providers give for a body that breaks off. dsh's adapters call
+  that `STREAM_CLOSED`, in their own words ("DeepSeek Messages stream ended
+  before message_stop"), and don't retry it; Karaka retries it, as
+  `karaka-model` already decided. For `karaka ask`, the only change in
+  wording is for a model that breaks the stream contract this way: it used
+  to print the bare sentence, and now prints it as any other error, "the
+  connection failed: the stream ended before the model finished (trying
+  again may help)". A real provider's cut-off stream reads as before.
+- **A listener that panics is dropped.** dsh's emit has no such case.
+- **A slow listener holds the turn up**, as in dsh. The listener contract
+  says to hand slow work on.
+
+### `karaka ask` through the loop
+
+`ask` is now a one-turn chat on a fresh session (`chat::loop_plugins`, the
+same plugins as `chat`), so it retries as the provider's policy says. It
+prints from the live frames: text on stdout as it is written, reasoning
+dimmed on stderr for a terminal, the `stop: …` summary from the `Done`
+chunk, and on failure the model's own error line from the last failure
+chunk, as before. Its output, messages and exit codes are unchanged; the
+CLI test of a 429's error line sets `KARAKA_MAX_RETRIES=0`, since it checks
+the line, not the retry.
+
+**A CLI-only behaviour: a retry after text.** dsh's views replace a failed
+attempt's text with the retry's, by attempt id. A terminal can't take
+printed text back, so `ask` ends the failed attempt's line, and when the
+next attempt starts, says `karaka: trying again` on stderr if the failed
+one had printed text. A failed attempt that printed nothing retries
+silently.

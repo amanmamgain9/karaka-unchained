@@ -1,67 +1,148 @@
 //! Showing an answer while it is written: the text on stdout, everything
 //! else on stderr, so `karaka ask ... > answer.txt` keeps only the answer.
+//!
+//! The answer comes as the agent loop's live frames (`AssistantStreamFrame`),
+//! each model call an attempt of its own. A retried call is a new attempt.
+//! dsh's views replace a failed attempt's text with the retry's, by its
+//! attempt id; a terminal can't take printed text back, so this ends the
+//! failed attempt's line, and if it had printed any text, says on stderr
+//! that it is trying again. That is this command's own behaviour, not the
+//! loop's.
 
-use std::future::poll_fn;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 
-use karaka_model::{Event, EventStream, ModelError, StopReason, Usage};
+use karaka_agent::{AssistantStreamFrame, StreamChunk};
+use karaka_model::{Event, ModelError, StopReason, Usage};
+use karaka_session::{Failure, TurnEndReason};
 
 /// Terminal escape codes that dim text, and that end the dimming.
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-/// Prints the answer's text to stdout as it arrives. Reasoning goes to
-/// stderr, dimmed, but only for a person watching a terminal: in a pipe or a
-/// log it would be noise, and so would the escape codes.
-pub async fn print_answer(mut stream: EventStream) -> Result<(), String> {
-    let show_reasoning = io::stderr().is_terminal();
-    let mut stdout = io::stdout();
-    let mut wrote_text = false;
-    let mut in_reasoning = false;
-    let write_failed = |error: io::Error| format!("couldn't write the answer: {error}");
+/// Prints one turn's frames as they come.
+#[derive(Debug)]
+pub struct Printer {
+    /// Reasoning goes to stderr, dimmed, but only for a person watching a
+    /// terminal: in a pipe or a log it would be noise, and so would the
+    /// escape codes.
+    show_reasoning: bool,
+    /// Whether stdout's current line holds answer text.
+    wrote_text: bool,
+    /// Whether this attempt printed any text at all.
+    attempt_wrote_text: bool,
+    in_reasoning: bool,
+    attempts: u64,
+    /// The failure the last attempt ended with, as the model gave it.
+    failure: Option<ModelError>,
+    /// The first write that failed. Printing stops there.
+    write_error: Option<io::Error>,
+}
 
-    // `poll_fn` turns the stream's `poll_next` into something to `.await`, as
-    // `karaka_model::complete` does. That needs no library of stream
-    // helpers, and not even the `Stream` trait: a `dyn Stream` can call its
-    // own methods without it.
-    while let Some(event) = poll_fn(|cx| stream.as_mut().poll_next(cx)).await {
-        // Whatever follows the reasoning starts on a line of its own.
-        if in_reasoning && !matches!(event, Ok(Event::ReasoningDelta(_))) {
-            eprintln!();
-            in_reasoning = false;
-        }
-        match event {
-            Ok(Event::TextDelta(text)) => {
-                // Flushed every time, or the text would wait for a newline.
-                stdout
-                    .write_all(text.as_bytes())
-                    .and_then(|()| stdout.flush())
-                    .map_err(write_failed)?;
-                wrote_text = true;
-            }
-            Ok(Event::ReasoningDelta(text)) if show_reasoning => {
-                eprint!("{DIM}{text}{RESET}");
-                in_reasoning = true;
-            }
-            Ok(Event::ReasoningDelta(_) | Event::Block(_)) => {}
-            Ok(Event::Done { stop, usage }) => {
-                writeln!(stdout)
-                    .and_then(|()| stdout.flush())
-                    .map_err(write_failed)?;
-                eprintln!("{}", summary(&stop, &usage));
-                return Ok(());
-            }
-            Err(error) => {
-                // Ends the half-written answer, so the error starts on a line
-                // of its own. The error matters more than this newline.
-                if wrote_text {
-                    let _ = writeln!(stdout);
-                }
-                return Err(describe(&error));
-            }
+impl Printer {
+    pub fn new(show_reasoning: bool) -> Self {
+        Self {
+            show_reasoning,
+            wrote_text: false,
+            attempt_wrote_text: false,
+            in_reasoning: false,
+            attempts: 0,
+            failure: None,
+            write_error: None,
         }
     }
-    Err("the stream ended before the model finished".into())
+
+    /// Prints what `frame` adds.
+    pub fn frame(&mut self, frame: &AssistantStreamFrame) {
+        if self.write_error.is_some() {
+            return;
+        }
+        if let Err(error) = self.print(frame) {
+            self.write_error = Some(error);
+        }
+    }
+
+    fn print(&mut self, frame: &AssistantStreamFrame) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        // Whatever follows the reasoning starts on a line of its own.
+        let more_reasoning = matches!(
+            frame,
+            AssistantStreamFrame::Chunk {
+                chunk: StreamChunk::Event(Event::ReasoningDelta(_)),
+                ..
+            }
+        );
+        if self.in_reasoning && !more_reasoning {
+            eprintln!();
+            self.in_reasoning = false;
+        }
+        match frame {
+            AssistantStreamFrame::Start { .. } => {
+                self.attempts += 1;
+                if self.attempts > 1 && self.attempt_wrote_text {
+                    eprintln!("karaka: trying again");
+                }
+                self.attempt_wrote_text = false;
+                self.failure = None;
+            }
+            AssistantStreamFrame::Chunk { chunk, .. } => match chunk {
+                StreamChunk::Event(Event::TextDelta(text)) => {
+                    // Flushed every time, or the text would wait for a
+                    // newline.
+                    stdout.write_all(text.as_bytes())?;
+                    stdout.flush()?;
+                    self.wrote_text = true;
+                    self.attempt_wrote_text = true;
+                }
+                StreamChunk::Event(Event::ReasoningDelta(text)) if self.show_reasoning => {
+                    eprint!("{DIM}{text}{RESET}");
+                    self.in_reasoning = true;
+                }
+                StreamChunk::Event(Event::ReasoningDelta(_) | Event::Block(_)) => {}
+                StreamChunk::Event(Event::Done { stop, usage }) => {
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                    self.wrote_text = false;
+                    eprintln!("{}", summary(stop, usage));
+                }
+                StreamChunk::Failed(error) => {
+                    // Ends the half-written answer, so whatever comes next,
+                    // a retry or the error, starts on a line of its own.
+                    if self.wrote_text {
+                        writeln!(stdout)?;
+                        stdout.flush()?;
+                        self.wrote_text = false;
+                    }
+                    self.failure = Some(error.clone());
+                }
+            },
+            AssistantStreamFrame::End { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// How the command ends, once the turn has: `reason` is its `turn/end`.
+    /// A failed turn reports the model's own error, as the last attempt's
+    /// failure chunk gave it, with whether trying again might help.
+    pub fn finish(&self, reason: Option<&TurnEndReason>) -> Result<(), String> {
+        if let Some(error) = &self.write_error {
+            return Err(format!("couldn't write the answer: {error}"));
+        }
+        match reason {
+            Some(TurnEndReason::Completed | TurnEndReason::MaxTokens) => Ok(()),
+            Some(TurnEndReason::Error(failure)) => Err(match &self.failure {
+                Some(error) => describe(error),
+                None => other_failure(failure),
+            }),
+            Some(TurnEndReason::Aborted(_)) => Err("the turn was cancelled".into()),
+            Some(other) => Err(format!("the turn ended: {other:?}")),
+            None => Err("the turn didn't end".into()),
+        }
+    }
+}
+
+/// A failure that wasn't the model's, such as a request-error handler's.
+fn other_failure(failure: &Failure) -> String {
+    format!("{} ({})", failure.message, failure.code)
 }
 
 /// The line that follows the answer, such as
@@ -108,9 +189,62 @@ fn describe(error: &ModelError) -> String {
 mod tests {
     use std::time::Duration;
 
-    use karaka_model::{ErrorKind, ModelError, StopReason, Usage};
+    use karaka_agent::{AssistantStreamFrame, StreamChunk};
+    use karaka_model::{ErrorKind, ModelError, Refusal, StopReason, Usage};
+    use karaka_session::{Failure, TurnEndReason};
 
-    use super::{describe, summary};
+    use super::{Printer, describe, summary};
+
+    fn failed(error: ModelError) -> AssistantStreamFrame {
+        AssistantStreamFrame::Chunk {
+            attempt_id: "ask:1".into(),
+            revision: 2,
+            index: 0,
+            time: karaka_session::Time(1),
+            chunk: StreamChunk::Failed(error),
+        }
+    }
+
+    fn failure(message: &str, code: &str) -> TurnEndReason {
+        TurnEndReason::Error(Failure {
+            message: message.into(),
+            code: code.into(),
+            status: None,
+            provider_retry_after_ms: None,
+            request_id: None,
+            offload_images: None,
+        })
+    }
+
+    /// The error line is the model's own error, from the failure chunk, so
+    /// a refusal still names its category, which a logged failure can't.
+    #[test]
+    fn a_failed_turn_reports_the_models_own_error() {
+        let mut refused = ModelError::new(ErrorKind::Refused, "No.");
+        refused.refusal = Some(Refusal {
+            category: Some("cyber".into()),
+            explanation: None,
+        });
+        let mut printer = Printer::new(false);
+        printer.frame(&failed(refused));
+        assert_eq!(
+            printer.finish(Some(&failure("No.", "REFUSED"))),
+            Err(
+                "the model declined to answer: No. (category: cyber) (trying again won't help)"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn a_turn_that_failed_outside_the_model_says_so() {
+        let printer = Printer::new(false);
+        assert_eq!(
+            printer.finish(Some(&failure("recovery failed", "UNKNOWN"))),
+            Err("recovery failed (UNKNOWN)".into())
+        );
+        assert_eq!(printer.finish(Some(&TurnEndReason::Completed)), Ok(()));
+    }
 
     #[test]
     fn the_summary_reads_as_a_sentence() {

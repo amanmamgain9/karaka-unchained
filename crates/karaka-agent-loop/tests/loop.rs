@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use karaka_agent::{
-    Agent, Agents, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
-    RequestErrorHooks,
+    Agent, Agents, AssistantStreamFrame, FrameSubscription, HookFuture, Next, RequestError,
+    RequestErrorAction, RequestErrorHandler, RequestErrorHooks, StreamChunk, StreamOutcome,
 };
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
@@ -1709,4 +1709,208 @@ async fn a_handler_can_hand_the_decision_on() {
     assert_eq!(*order.lock().unwrap(), ["first", "second"]);
     assert_eq!(harness.endings(), [TurnEndReason::Completed]);
     assert_eq!(harness.model.requests().len(), 2);
+}
+
+// Live frames. Ported from dsh's `loop.spec.ts` ("publishes one dense live
+// attempt", "settles a failed attempt before retrying with a new dense
+// attempt") and `cancel.spec.ts:1413`.
+
+/// Every frame `agent` publishes from now on, until the subscription goes.
+fn listen(agent: &dyn Agent) -> (Arc<Mutex<Vec<AssistantStreamFrame>>>, FrameSubscription) {
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let noted = Arc::clone(&frames);
+    let subscription = agent.subscribe(Arc::new(move |frame| {
+        noted.lock().unwrap().push(frame.clone());
+    }));
+    (frames, subscription)
+}
+
+/// A frame as text, without its time, so a sequence reads at a glance.
+fn frame_line(frame: &AssistantStreamFrame) -> String {
+    match frame {
+        AssistantStreamFrame::Start {
+            attempt_id,
+            revision,
+            turn,
+            step,
+        } => format!("{revision} start {attempt_id} turn {turn} step {step}"),
+        AssistantStreamFrame::Chunk {
+            attempt_id,
+            revision,
+            index,
+            chunk,
+            ..
+        } => format!("{revision} chunk {attempt_id} #{index} {chunk:?}"),
+        AssistantStreamFrame::End {
+            attempt_id,
+            revision,
+            index,
+            outcome,
+        } => {
+            let outcome = match outcome {
+                StreamOutcome::Committed { event_type, seq } => {
+                    format!("{} at {seq}", event_type.event_type())
+                }
+                StreamOutcome::Abandoned => "abandoned".into(),
+            };
+            format!("{revision} end {attempt_id} after {index}: {outcome}")
+        }
+    }
+}
+
+fn frame_lines(frames: &Mutex<Vec<AssistantStreamFrame>>) -> Vec<String> {
+    frames.lock().unwrap().iter().map(frame_line).collect()
+}
+
+/// dsh: "publishes one dense live attempt and commits one v2 message with
+/// the exact embedded stream" (`loop.spec.ts:76`). The `end` names the seq
+/// the answer was logged at.
+#[tokio::test]
+async fn a_call_publishes_start_chunks_and_a_committed_end() {
+    let harness = Harness::new(vec![text("hello there")]).await;
+    let agent = harness.agent();
+    let (frames, _subscription) = listen(agent.as_ref());
+    harness.say("hi").await;
+
+    assert_eq!(
+        frame_lines(&frames),
+        [
+            "1 start a1:1 turn 1 step 1",
+            r#"2 chunk a1:1 #0 Event(TextDelta("hello there"))"#,
+            r#"3 chunk a1:1 #1 Event(Block(Text("hello there")))"#,
+            "4 chunk a1:1 #2 Event(Done { stop: EndTurn, usage: Usage { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 } })",
+            "5 end a1:1 after 3: assistant/message at 6",
+        ]
+    );
+    assert_eq!(harness.events()[6].event.event_type(), "assistant/message");
+    // Each chunk is stamped with when it arrived.
+    let times: Vec<i64> = frames
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|frame| match frame {
+            AssistantStreamFrame::Chunk { time, .. } => Some(time.0),
+            _ => None,
+        })
+        .collect();
+    assert!(times.windows(2).all(|pair| pair[0] <= pair[1]) && times[0] > 0);
+}
+
+/// dsh: "settles a failed attempt before retrying with a new dense attempt"
+/// (`loop.spec.ts:185`). The failed attempt's last chunk is its failure,
+/// as dsh's is a `finish` chunk of kind `error`; the retry has an id of its
+/// own, and the revisions carry on.
+#[tokio::test]
+async fn a_retried_call_is_a_new_attempt() {
+    let harness = Harness::new(vec![failing(ErrorKind::RateLimited, "busy"), text("ok")]).await;
+    harness
+        .hooks
+        .register(Arc::new(Handler(|_error: &RequestError| {
+            Ok(Some(RequestErrorAction::Retry))
+        })));
+    let agent = harness.agent();
+    let (frames, _subscription) = listen(agent.as_ref());
+    harness.say("go").await;
+
+    let lines = frame_lines(&frames);
+    assert_eq!(
+        lines[..4],
+        [
+            "1 start a1:1 turn 1 step 1",
+            r#"2 chunk a1:1 #0 Failed(ModelError { kind: RateLimited, message: "busy", retry_after: None, refusal: None })"#,
+            "3 end a1:1 after 1: assistant/attempt at 6",
+            "4 start a1:2 turn 1 step 1",
+        ]
+    );
+    assert_eq!(lines[7], "8 end a1:2 after 3: assistant/message at 7");
+    let failure = frames.lock().unwrap()[1].clone();
+    assert!(matches!(
+        failure,
+        AssistantStreamFrame::Chunk {
+            chunk: StreamChunk::Failed(ModelError {
+                kind: ErrorKind::RateLimited,
+                ..
+            }),
+            ..
+        }
+    ));
+}
+
+/// Each step's call is an attempt of its own.
+#[tokio::test]
+async fn each_step_publishes_its_own_attempt() {
+    let ping = call("c1", "echo", r#"{"text":"ping"}"#);
+    let harness = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
+    let agent = harness.agent();
+    let (frames, _subscription) = listen(agent.as_ref());
+    harness.say("use the tool").await;
+
+    let lines = frame_lines(&frames);
+    let starts: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(" start "))
+        .collect();
+    assert_eq!(
+        starts,
+        ["1 start a1:1 turn 1 step 1", "5 start a1:2 turn 1 step 2"]
+    );
+    assert_eq!(lines[3], "4 end a1:1 after 2: assistant/message at 6");
+}
+
+/// dsh: "cancel() mid-stream ends the turn with reason aborted"
+/// (`loop.spec.ts:1413`): the last frame commits the interrupted answer. A
+/// cancel before anything worth keeping commits an attempt instead.
+#[tokio::test]
+async fn a_cancelled_call_ends_with_what_it_settled_as() {
+    for (events, settled) in [
+        (
+            vec![Event::TextDelta("partial".into())],
+            "assistant/message",
+        ),
+        (vec![Event::TextDelta("  ".into())], "assistant/attempt"),
+    ] {
+        let waiting = Arc::new(Notify::new());
+        let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
+        let agent = harness.agent();
+        let (frames, _subscription) = listen(agent.as_ref());
+        agent.followup(user("go"));
+        waiting.notified().await;
+        agent.cancel(CancelCause::User);
+        idle(agent.as_ref()).await;
+
+        let lines = frame_lines(&frames);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[2], format!("3 end a1:1 after 1: {settled} at 6"));
+    }
+}
+
+/// A turn that never reaches a model publishes nothing.
+#[tokio::test]
+async fn a_call_that_never_starts_publishes_nothing() {
+    let harness = Harness::with(Vec::new(), LoopConfig::new("nowhere", MODEL), Vec::new()).await;
+    let agent = harness.agent();
+    let (frames, _subscription) = listen(agent.as_ref());
+    harness.say("hi").await;
+    assert!(frames.lock().unwrap().is_empty());
+}
+
+/// A listener that panics is dropped, and the turn and the other listeners
+/// carry on. A dropped subscription hears nothing.
+#[tokio::test]
+async fn a_broken_listener_doesnt_stop_the_turn() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let agent = harness.agent();
+    let _broken = agent.subscribe(Arc::new(|_frame| panic!("a broken view")));
+    let (frames, _subscription) = listen(agent.as_ref());
+    let (gone, subscription) = listen(agent.as_ref());
+    drop(subscription);
+    harness.say("first").await;
+    harness.say("second").await;
+
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Completed, TurnEndReason::Completed]
+    );
+    assert_eq!(frames.lock().unwrap().len(), 10);
+    assert!(gone.lock().unwrap().is_empty());
 }

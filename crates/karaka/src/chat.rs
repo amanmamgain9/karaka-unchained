@@ -28,8 +28,10 @@ const SESSION: &str = "chat";
 /// How much of a tool's result its line shows.
 const SHORT_RESULT: usize = 80;
 
-/// Runs the chat until stdin ends.
-pub async fn chat(config: Config) -> Result<(), String> {
+/// The plugins `chat` and `ask` both run: the model provider, the tools and
+/// sessions, the agent loop, and the retry plugin, which retries a failed
+/// request as the provider's policy says before the turn gives up.
+pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.system = config.system;
     loop_config.max_tokens = config.max_tokens;
@@ -39,9 +41,13 @@ pub async fn chat(config: Config) -> Result<(), String> {
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
-    // Retries a failed request as the provider's policy says, before the
-    // turn gives up.
     plugins.push(Box::new(RetryPlugin::new()));
+    plugins
+}
+
+/// Runs the chat until stdin ends.
+pub async fn chat(config: Config) -> Result<(), String> {
+    let plugins = loop_plugins(config);
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;

@@ -16,15 +16,22 @@
 //! [`RequestErrorHooks`], which a failed model request runs so a plugin
 //! such as `karaka-retry` can ask for it to be tried again
 //! (`request_error.rs`). Its payload can wait on the turn's
-//! [`Cancellation`] (`cancel.rs`).
+//! [`Cancellation`] (`cancel.rs`). And each agent publishes live
+//! [`AssistantStreamFrame`]s of its model calls, for a view that shows the
+//! answer as it is written (`stream.rs`).
 
 mod cancel;
 mod request_error;
+mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
 pub use request_error::{
     HandlerError, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
     RequestErrorHooks,
+};
+pub use stream::{
+    AssistantStreamFrame, FrameListener, FrameListeners, FrameSubscription, SettledAs, StreamChunk,
+    StreamOutcome,
 };
 
 use std::future::Future;
@@ -67,6 +74,12 @@ pub trait Agent: Send + Sync {
     /// followup sent before the call is waited for, along with every turn
     /// its driver runs.
     fn when_idle(&self) -> WhenIdle<'_>;
+
+    /// Calls `listener` with every live frame of this agent's model calls,
+    /// in order, until the returned subscription is dropped. (dsh: the
+    /// agent-scoped `agent/assistant-stream` event.) See `stream.rs` for
+    /// what a listener may do.
+    fn subscribe(&self, listener: FrameListener) -> FrameSubscription;
 }
 
 /// The future [`Agent::when_idle`] returns. Boxed so the trait works as

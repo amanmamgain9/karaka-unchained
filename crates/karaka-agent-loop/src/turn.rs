@@ -57,10 +57,9 @@
 use std::future::{Future, poll_fn};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use karaka_agent::{RequestError, RequestErrorAction};
+use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
 
 use karaka_model::{
     Block, ErrorKind, Event, Message, Model, ModelError, Request, Response, Role, StopReason,
@@ -75,6 +74,7 @@ use karaka_session::{
 use crate::agent::{Cancel, Inner};
 use crate::answer::Answer;
 use crate::failure::{handler_panicked, model_failure, no_model, other_failure};
+use crate::live::LiveAttempt;
 
 /// Why a step stopped before it finished.
 pub(crate) enum Stop {
@@ -189,17 +189,7 @@ impl Inner {
         input: Option<UserMessage>,
         cancel: &Cancel,
     ) -> Result<Option<TurnEndReason>, Stop> {
-        let (model, response) = self.call_model(turn, step, input, cancel).await?;
-        let config = &self.shared.config;
-        let data = AssistantMessageData::from_response(
-            self.next_id("assistant"),
-            turn,
-            step,
-            model.provider(),
-            &config.model,
-            &response,
-        );
-        self.session.append(SessionEvent::assistant(data))?;
+        let response = self.call_model(turn, step, input, cancel).await?;
 
         // `karaka_model::StopReason::Paused` says to treat a paused answer as
         // unfinished, like one cut off by the limit, until Karaka can resume
@@ -258,7 +248,7 @@ impl Inner {
         step: u64,
         mut input: Option<UserMessage>,
         cancel: &Cancel,
-    ) -> Result<(Arc<dyn Model>, Response), Stop> {
+    ) -> Result<Response, Stop> {
         loop {
             self.update_system_prompt(turn, step)?;
             if let Some(message) = input.take() {
@@ -286,22 +276,51 @@ impl Inner {
                 return Err(Stop::Aborted(cause));
             }
 
-            match stream(model.as_ref(), request, cancel).await {
-                Streamed::Finished(response) => return Ok((model, response)),
+            // Each attempt is one of its own, with an id of its own, for the
+            // live frames (`live.rs`). Each settles by logging its event,
+            // and only then sends its `end` frame.
+            let mut live = LiveAttempt::new(
+                &self.frames,
+                &self.frame_counters,
+                self.session.id().as_str(),
+                turn,
+                step,
+            );
+            match stream(model.as_ref(), request, cancel, &mut live).await {
+                Streamed::Finished(response) => {
+                    let data = AssistantMessageData::from_response(
+                        self.next_id("assistant"),
+                        turn,
+                        step,
+                        model.provider(),
+                        &config.model,
+                        &response,
+                    );
+                    let logged = self.session.append(SessionEvent::assistant(data));
+                    live.settle(SettledAs::AssistantMessage, logged)?;
+                    return Ok(response);
+                }
                 // A call that left no message is logged as an attempt, so the
                 // log shows it was made. (dsh: `agent.ts:489-510`.)
                 Streamed::Failed(error) => {
-                    self.session
-                        .append(SessionEvent::assistant_attempt(turn, step))?;
+                    let logged = self
+                        .session
+                        .append(SessionEvent::assistant_attempt(turn, step));
+                    live.settle(SettledAs::AssistantAttempt, logged)?;
+                    drop(live);
                     self.recover(turn, step, model.as_ref(), model_failure(&error), cancel)
                         .await?;
                 }
                 Streamed::Cancelled(cause, content) => {
                     if content.is_empty() {
-                        self.session
-                            .append(SessionEvent::assistant_attempt(turn, step))?;
+                        let logged = self
+                            .session
+                            .append(SessionEvent::assistant_attempt(turn, step));
+                        live.settle(SettledAs::AssistantAttempt, logged)?;
                     } else {
-                        self.append_interrupted(turn, step, model.provider(), &content)?;
+                        let logged =
+                            self.append_interrupted(turn, step, model.provider(), &content);
+                        live.settle(SettledAs::AssistantMessage, logged)?;
                     }
                     return Err(Stop::Aborted(cause));
                 }
@@ -430,7 +449,7 @@ impl Inner {
         step: u64,
         provider: &str,
         content: &[Block],
-    ) -> Result<(), LogError> {
+    ) -> Result<Seq, LogError> {
         let message = AssistantMessage::from_model(
             self.next_id("assistant"),
             provider,
@@ -446,8 +465,7 @@ impl Inner {
                 usage: None,
                 interrupted: true,
                 extra: Extra::new(),
-            }))?;
-        Ok(())
+            }))
     }
 
     /// Gives a result to every call made since `step_start` that has none,
@@ -478,8 +496,18 @@ impl Inner {
 
 /// Streams one model call to its end, or until a cancel. A cancel drops the
 /// stream, which closes its connection.
-async fn stream(model: &dyn Model, request: Request, cancel: &Cancel) -> Streamed {
+///
+/// `live` sends the call's frames: `start` once the stream is open, then a
+/// `chunk` for each event, before the loop acts on it, and one for the
+/// failure that ends a failed stream.
+async fn stream(
+    model: &dyn Model,
+    request: Request,
+    cancel: &Cancel,
+    live: &mut LiveAttempt<'_>,
+) -> Streamed {
     let mut events = model.stream(request);
+    live.start();
     let mut answer = Answer::default();
     loop {
         // `biased` checks the switch first, so a cancel wins over an event
@@ -489,8 +517,20 @@ async fn stream(model: &dyn Model, request: Request, cancel: &Cancel) -> Streame
             cause = cancel.cancelled() => return Streamed::Cancelled(cause, answer.interrupted()),
             event = poll_fn(|cx| events.as_mut().poll_next(cx)) => event,
         };
+        // Every item goes out as a chunk before the loop acts on it: an
+        // event, or the failure that ends the stream.
+        let event = event.unwrap_or_else(|| {
+            Err(ModelError::new(
+                ErrorKind::Network,
+                "the stream ended before the model finished",
+            ))
+        });
+        live.push(match &event {
+            Ok(event) => StreamChunk::Event(event.clone()),
+            Err(error) => StreamChunk::Failed(error.clone()),
+        });
         match event {
-            Some(Ok(Event::Done { stop, usage })) => {
+            Ok(Event::Done { stop, usage }) => {
                 let message = Message {
                     role: Role::Assistant,
                     content: answer.finish(stop),
@@ -501,14 +541,8 @@ async fn stream(model: &dyn Model, request: Request, cancel: &Cancel) -> Streame
                     usage,
                 });
             }
-            Some(Ok(event)) => answer.push(event),
-            Some(Err(error)) => return Streamed::Failed(error),
-            None => {
-                return Streamed::Failed(ModelError::new(
-                    ErrorKind::Network,
-                    "the stream ended before the model finished",
-                ));
-            }
+            Ok(event) => answer.push(event),
+            Err(error) => return Streamed::Failed(error),
         }
     }
 }

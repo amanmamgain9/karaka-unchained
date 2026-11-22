@@ -1,10 +1,10 @@
 //! `karaka`, the Karaka runtime binary.
 //!
-//! For now it does two things. `karaka ask <question>` starts a runtime with
-//! the model registry and one model provider, asks the model at the
-//! provider's route, and prints the answer as it arrives. `karaka chat`
-//! adds the agent loop, its sessions and one tool, and holds a conversation
-//! read line by line from stdin.
+//! For now it does two things, both through the agent loop, with one model
+//! provider and the retry plugin. `karaka ask <question>` asks one question
+//! in a turn of its own and prints the answer as it is written. `karaka
+//! chat` adds one tool and holds a conversation read line by line from
+//! stdin.
 
 mod answer;
 mod chat;
@@ -16,10 +16,14 @@ use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use karaka_kernel::Runtime;
-use karaka_model::{Message, Model, ModelRegistry, Request};
+use std::sync::{Mutex, PoisonError};
 
-use crate::answer::print_answer;
+use karaka_agent::Agents;
+use karaka_kernel::Runtime;
+use karaka_model::{Model, ModelRegistry};
+use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSource};
+
+use crate::answer::Printer;
 use crate::config::Config;
 
 const USAGE: &str = "\
@@ -28,7 +32,8 @@ Usage: karaka ask <question...>
        karaka chat
 
 ask asks a model one question and prints the answer as it is written.
-With no question, or with -, the question is read from stdin.
+With no question, or with -, the question is read from stdin. A request
+that fails for a reason worth retrying is tried again first.
 
 chat reads messages from stdin, one per line, and answers each through
 the agent loop, which can call one tool, current_time. Each tool call is
@@ -51,10 +56,9 @@ Settings come from the environment:
   KARAKA_EFFORT       low, medium, high, xhigh or max (optional; the
                       provider's default otherwise). deepseek takes only
                       low, high or max, and high is its default
-  KARAKA_MAX_RETRIES  how many times chat retries a request that failed
-                      for a reason worth retrying, such as a rate limit
-                      (optional; 5 otherwise). 0 turns retries off. ask
-                      doesn't retry
+  KARAKA_MAX_RETRIES  how many times a request that failed for a reason
+                      worth retrying, such as a rate limit, is retried
+                      (optional; 5 otherwise). 0 turns retries off
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY
@@ -139,17 +143,47 @@ async fn ask(question: Option<String>) -> Result<(), String> {
         return Err("the question is empty".into());
     }
 
+    // The question is a one-turn chat on a session of its own, so it goes
+    // through the agent loop and is retried as the provider's policy says.
+    // The answer is printed from the loop's live frames as it is written.
     let route = config.provider.route().to_owned();
-    let runtime = Runtime::start(config.provider.plugins())
+    let runtime = Runtime::start(chat::loop_plugins(config))
         .await
         .map_err(|error| error.to_string())?;
-    let model = model_at(&runtime.get::<ModelRegistry>(), &route)?;
+    // Checked before the turn, so an unknown route lists the routes there
+    // are, rather than failing the turn.
+    model_at(&runtime.get::<ModelRegistry>(), &route)?;
 
-    let mut request = Request::new(config.model, vec![Message::user(question)]);
-    request.system = config.system;
-    request.max_tokens = config.max_tokens;
-    request.effort = config.effort;
-    print_answer(model.stream(request)).await
+    let id = SessionId::new("ask");
+    let agent = runtime
+        .get::<dyn Agents>()
+        .open(id.clone())
+        .map_err(|error| error.to_string())?;
+    let printer = Arc::new(Mutex::new(Printer::new(io::stderr().is_terminal())));
+    let printing = Arc::clone(&printer);
+    let _subscription = agent.subscribe(Arc::new(move |frame| {
+        printing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .frame(frame);
+    }));
+    agent.followup(UserMessage::text("user-0", UserSource::user(), question));
+    agent.when_idle().await;
+
+    let ending = runtime
+        .get::<SessionStore>()
+        .events(&id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry.event {
+            SessionEvent::TurnEnd(end) => Some(end.reason),
+            _ => None,
+        });
+    printer
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .finish(ending.as_ref())
 }
 
 /// The model registered under `route`, or an error that lists the routes

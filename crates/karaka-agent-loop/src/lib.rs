@@ -14,6 +14,7 @@
 //!   each model call.
 //! - `answer.rs`: assembling a streamed answer, and what to keep of one
 //!   that was cut short.
+//! - `live.rs`: the live frames of each model call.
 //! - `failure.rs`: a failed model call as the failure a turn ends with.
 //! - `plugin.rs`: the agents port, and the plugin that provides it.
 //!
@@ -23,6 +24,7 @@
 mod agent;
 mod answer;
 mod failure;
+mod live;
 mod plugin;
 mod request;
 mod turn;
