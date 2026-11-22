@@ -2,14 +2,14 @@
 //! and many threads using it at once.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use karaka_model::Message;
 use karaka_session::{
-    AdapterDefaults, CallConfig, Entry, Extra, LogError, RequestContext, RequestHeader,
-    RequestHeaderReason, Seq, SessionError, SessionEvent, SessionId, SessionStore, SurfaceIntent,
-    SurfaceOp, Time, UserMessage, UserSource,
+    AdapterDefaults, CallConfig, Entry, Extra, FlushFuture, LogError, RequestContext,
+    RequestHeader, RequestHeaderReason, Seq, SessionError, SessionEvent, SessionId,
+    SessionListener, SessionStore, SurfaceIntent, SurfaceOp, Time, UserMessage, UserSource,
 };
 
 fn id(name: &str) -> SessionId {
@@ -431,4 +431,101 @@ fn each_surface_replacement_counts() {
         })
         .unwrap();
     assert_eq!(session.surface_generation(), 1);
+}
+
+/// Records what it hears, and keeps (or fails) the sessions it is told to.
+#[derive(Default)]
+struct Recorder {
+    heard: Mutex<Vec<(String, Seq)>>,
+    keeps: Vec<&'static str>,
+    fails: bool,
+}
+
+impl SessionListener for Recorder {
+    fn event(&self, id: &SessionId, entry: &Entry) {
+        self.heard
+            .lock()
+            .unwrap()
+            .push((id.as_str().to_owned(), entry.seq));
+    }
+
+    fn flush(&self, id: &SessionId) -> Option<FlushFuture> {
+        if !self.keeps.contains(&id.as_str()) {
+            return None;
+        }
+        let fails = self.fails;
+        Some(Box::pin(async move {
+            if fails {
+                Err("the disk is full".into())
+            } else {
+                Ok(())
+            }
+        }))
+    }
+}
+
+#[test]
+fn a_listener_hears_appends_in_order_but_not_a_restored_seed() {
+    let store = SessionStore::new();
+    let recorder = Arc::new(Recorder::default());
+    store.listen(recorder.clone());
+
+    store
+        .restore(
+            id("resumed"),
+            [Entry {
+                seq: Seq(0),
+                time: Time(1),
+                ignorable: false,
+                event: SessionEvent::turn_start(1),
+            }],
+        )
+        .unwrap();
+    assert!(recorder.heard.lock().unwrap().is_empty());
+
+    // The turn the seed left open is closed, and the closers are heard.
+    let closers = store.get(&id("resumed")).unwrap().repair().unwrap();
+    assert!(!closers.is_empty());
+
+    let session = store.create(id("fresh")).unwrap();
+    session.append(user("one")).unwrap();
+    session.append_all([user("two"), user("three")]).unwrap();
+
+    let heard = recorder.heard.lock().unwrap().clone();
+    let resumed: Vec<Seq> = heard
+        .iter()
+        .filter(|(name, _)| name == "resumed")
+        .map(|(_, seq)| *seq)
+        .collect();
+    assert_eq!(resumed.first(), Some(&Seq(1)));
+    let fresh: Vec<Seq> = heard
+        .iter()
+        .filter(|(name, _)| name == "fresh")
+        .map(|(_, seq)| *seq)
+        .collect();
+    assert_eq!(
+        fresh,
+        (0..session.len() as u64).map(Seq).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn flush_says_whether_a_listener_keeps_the_session_and_reports_its_failure() {
+    let store = SessionStore::new();
+    assert!(!store.flush(&id("a")).await.unwrap());
+
+    store.listen(Arc::new(Recorder {
+        keeps: vec!["a"],
+        ..Recorder::default()
+    }));
+    assert!(store.flush(&id("a")).await.unwrap());
+    assert!(!store.flush(&id("b")).await.unwrap());
+
+    store.listen(Arc::new(Recorder {
+        keeps: vec!["a"],
+        fails: true,
+        ..Recorder::default()
+    }));
+    let failure = store.flush(&id("a")).await.unwrap_err();
+    assert_eq!(failure.to_string(), "the disk is full");
 }

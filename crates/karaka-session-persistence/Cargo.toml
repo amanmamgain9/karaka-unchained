@@ -1,0 +1,23 @@
+[package]
+name = "karaka-session-persistence"
+description = "The session persistence seam: durable storage for session logs, and the store kept on it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that keeps the store's sessions on a backend.
+karaka-kernel.workspace = true
+# The sessions, headers and events stored.
+karaka-session.workspace = true
+# Stored rows are checked as raw JSON before they are read as events, as
+# dsh checks them.
+serde_json.workspace = true
+# The live write path: a timer task for the batching window, and an async
+# lock so batches are written one at a time.
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

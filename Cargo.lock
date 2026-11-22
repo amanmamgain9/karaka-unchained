@@ -604,6 +604,8 @@ dependencies = [
  "karaka-openai",
  "karaka-retry",
  "karaka-session",
+ "karaka-session-jsonl",
+ "karaka-session-persistence",
  "karaka-tools",
  "serde_json",
  "tokio",
@@ -701,6 +703,27 @@ dependencies = [
  "karaka-kernel",
  "karaka-model",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-session-jsonl"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-session",
+ "karaka-session-persistence",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-session-persistence"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-session",
  "serde_json",
  "tokio",
 ]

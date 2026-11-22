@@ -21,6 +21,9 @@ karaka-agent-loop.workspace = true
 karaka-session.workspace = true
 karaka-tools.workspace = true
 karaka-retry.workspace = true
+# Durable chats: the persistence seam, and its JSONL backend.
+karaka-session-persistence.workspace = true
+karaka-session-jsonl.workspace = true
 # The arguments a tool takes.
 serde_json.workspace = true
 # Writes the time `current_time` answers with.

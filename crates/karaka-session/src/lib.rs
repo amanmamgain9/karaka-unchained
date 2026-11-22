@@ -25,19 +25,24 @@
 //! - `request.rs`: the request header, the route's context and failed
 //!   attempts, which the loop logs around each model call.
 //!
+//! - `header.rs`: the session's header, and the event vocabulary storage
+//!   accepts.
+//!
 //! # Storage
 //!
-//! This crate keeps sessions in memory only, in a [`SessionStore`] that
-//! [`SessionsPlugin`] provides as a port. Durable backends such as Postgres
-//! will be their own plugins, saving these same events. They can rely on
-//! two things: events are only ever appended, and their seqs are contiguous
-//! from 0. A backend follows a session with [`Session::events_since`] and
-//! loads one with [`SessionStore::restore`].
+//! This crate keeps sessions in memory, in a [`SessionStore`] that
+//! [`SessionsPlugin`] provides as a port. Durable storage is its own seam,
+//! `karaka-session-persistence`, with a backend per crate. It follows the
+//! store through a [`SessionListener`], which hears every appended event,
+//! and loads a session with [`SessionStore::restore`]. It can rely on two
+//! things: events are only ever appended, and their seqs are contiguous
+//! from 0.
 
 mod convert;
 mod data;
 mod derive;
 mod event;
+mod header;
 mod json;
 mod log;
 mod message;
@@ -54,6 +59,9 @@ pub use data::{
 };
 pub use derive::History;
 pub use event::{Entry, Passthrough, Seq, SessionEvent, SurfaceIntent, SurfaceOp, Time};
+pub use header::{
+    KNOWN_EVENT_TYPES, Origin, SESSION_FORMAT_VERSION, SessionHeader, is_known_event_type,
+};
 pub use log::{LogError, SessionLog};
 pub use message::{
     AssistantMessage, AssistantRole, ContentBlock, ContextSection, DeveloperMessage, DeveloperRole,
@@ -72,7 +80,7 @@ pub use request::{
     AdapterDefaults, AssistantAttemptData, CallConfig, IN_HISTORY, RequestContext, RequestHeader,
     RequestHeaderData, RequestHeaderReason, call_config_equals, canonical_header, header_equals,
 };
-pub use store::{Session, SessionError, SessionId, SessionStore};
+pub use store::{FlushFuture, Session, SessionError, SessionId, SessionListener, SessionStore};
 pub use stream::{
     StreamAccumulator, StreamError, TimedChunk, chunk_event, chunk_json, expand_stream,
     failure_json, finish_json,

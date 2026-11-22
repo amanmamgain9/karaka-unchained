@@ -40,8 +40,10 @@ karaka-sse = { path = "crates/karaka-sse" }
 karaka-session = { path = "crates/karaka-session" }
 karaka-tools = { path = "crates/karaka-tools" }
 karaka-agent = { path = "crates/karaka-agent" }
+karaka-session-persistence = { path = "crates/karaka-session-persistence" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }
 karaka-agent-loop = { path = "crates/karaka-agent-loop" }
 karaka-retry = { path = "crates/karaka-retry" }
+karaka-session-jsonl = { path = "crates/karaka-session-jsonl" }

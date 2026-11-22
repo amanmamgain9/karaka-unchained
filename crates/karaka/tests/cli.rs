@@ -19,6 +19,9 @@ const VARIABLES: &[&str] = &[
     "KARAKA_MAX_TOKENS",
     "KARAKA_EFFORT",
     "KARAKA_MAX_RETRIES",
+    // Removed too, so no test ever reads or writes a real session store.
+    "KARAKA_SESSIONS",
+    "KARAKA_SESSION",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
@@ -570,6 +573,64 @@ fn chat_runs_the_clock_tool_and_keeps_the_conversation() {
     ] {
         assert!(third.contains(said), "{said}: {third}");
     }
+}
+
+#[test]
+fn a_second_chat_in_a_stored_session_carries_on_the_conversation() {
+    // A fresh directory of its own: no test touches a real session store.
+    let root = std::env::temp_dir().join(format!("karaka-cli-sessions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let settings = |address: std::net::SocketAddr, session: &str| {
+        vec![
+            ("ANTHROPIC_API_KEY", "test-key".to_owned()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            ("KARAKA_SESSIONS", root.display().to_string()),
+            ("KARAKA_SESSION", session.to_owned()),
+        ]
+    };
+
+    let (address, server) = serve(vec![streamed(&anthropic_text("Nice to meet you, Ada."))]);
+    let output = karaka(&["chat"], &settings(address, "notes"), "my name is Ada\n");
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(stderr, "");
+    assert_eq!(text(&output.stdout), "Nice to meet you, Ada.\n");
+    server.join().expect("the server ran");
+
+    // The session is a file under the root, in a directory of its own.
+    let logs: Vec<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flat_map(|project| std::fs::read_dir(project.unwrap().path()).unwrap())
+        .map(|session| session.unwrap().path().join("session.v4.jsonl"))
+        .collect();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].parent().unwrap().ends_with("notes"));
+    let stored = std::fs::read_to_string(&logs[0]).unwrap();
+    assert!(
+        stored.starts_with(r#"{"type":"session","version":4,"id":"notes","#),
+        "{stored}"
+    );
+
+    // A second run in the same session carries the conversation on.
+    let (address, server) = serve(vec![streamed(&anthropic_text("Your name is Ada."))]);
+    let output = karaka(&["chat"], &settings(address, "notes"), "what is my name?\n");
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Your name is Ada.\n");
+    let sent = server.join().expect("the server ran");
+    let carried = body(&sent[0]);
+    assert!(carried.contains("my name is Ada"), "{carried}");
+    assert!(carried.contains("Nice to meet you, Ada."), "{carried}");
+    assert!(carried.contains("what is my name?"), "{carried}");
+
+    // Another session starts fresh.
+    let (address, server) = serve(vec![streamed(&anthropic_text("I don't know."))]);
+    let output = karaka(&["chat"], &settings(address, "other"), "what is my name?\n");
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let sent = server.join().expect("the server ran");
+    assert!(!body(&sent[0]).contains("Ada"), "{}", body(&sent[0]));
+
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

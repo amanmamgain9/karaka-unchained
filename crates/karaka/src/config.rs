@@ -4,6 +4,8 @@
 //! These variables are a stopgap. They will move to the YAML config file,
 //! whose sections fill the plugins' typed configs directly.
 
+use std::path::PathBuf;
+
 use karaka_anthropic::{
     AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
 };
@@ -29,6 +31,11 @@ pub struct Config {
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub effort: Option<Effort>,
+    /// Where `chat` keeps its sessions, so a later chat carries on. Without
+    /// it, a chat lives only as long as the process.
+    pub sessions: Option<PathBuf>,
+    /// The session `chat` runs in.
+    pub session: Option<String>,
 }
 
 /// The model provider, with its plugin's config. Kept apart from the plugin
@@ -243,6 +250,8 @@ impl Config {
             system: var("KARAKA_SYSTEM"),
             max_tokens,
             effort,
+            sessions: var("KARAKA_SESSIONS").map(PathBuf::from),
+            session: var("KARAKA_SESSION"),
         })
     }
 }

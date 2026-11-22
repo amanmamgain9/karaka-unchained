@@ -38,7 +38,9 @@ that fails for a reason worth retrying is tried again first.
 chat reads messages from stdin, one per line, and answers each through
 the agent loop, which can call one tool, current_time. Each tool call is
 printed on a line of its own, then the answer. A request that fails for a
-reason worth retrying, such as a rate limit, is tried again first.
+reason worth retrying, such as a rate limit, is tried again first. With
+KARAKA_SESSIONS set, the chat is stored there, and the next chat in the
+same session carries on the conversation.
 
 Settings come from the environment:
   KARAKA_PROVIDER     anthropic (the default), deepseek or openai. deepseek
@@ -59,6 +61,9 @@ Settings come from the environment:
   KARAKA_MAX_RETRIES  how many times a request that failed for a reason
                       worth retrying, such as a rate limit, is retried
                       (optional; 5 otherwise). 0 turns retries off
+  KARAKA_SESSIONS     a directory chat keeps its sessions in, one file
+                      each (optional; chats are kept in memory otherwise)
+  KARAKA_SESSION      the name of chat's session (optional; chat otherwise)
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY

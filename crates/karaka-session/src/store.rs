@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use karaka_kernel::BoxError;
 use karaka_model::Message;
 
 use crate::derive::History;
@@ -70,6 +73,67 @@ impl From<LogError> for SessionError {
     }
 }
 
+/// What a [`SessionListener`] returns from
+/// [`flush`](SessionListener::flush): the wait until the session's events
+/// are durable.
+pub type FlushFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+/// Hears every event appended to any session of a store, and is asked to
+/// make them durable. (dsh: the `session/event` and `session/flush`
+/// listeners a persistence backend installs.)
+///
+/// A durable backend registers one with [`SessionStore::listen`], and
+/// routes each event to the session's write handle by id, as dsh's backends
+/// do.
+pub trait SessionListener: Send + Sync {
+    /// `entry` has just been appended to the session `id`.
+    ///
+    /// It runs while the session's log is locked, so listeners hear a
+    /// session's events in log order. It must not block, and must not call
+    /// back into the session. Events a session was restored with are not
+    /// heard, as dsh never publishes a session's seed.
+    fn event(&self, id: &SessionId, entry: &Entry);
+
+    /// Starts making the session's events so far durable, or gives `None`
+    /// when this listener keeps nothing for the session. (dsh:
+    /// `session/flush`.)
+    fn flush(&self, id: &SessionId) -> Option<FlushFuture>;
+}
+
+/// The listeners of one store, shared with each of its sessions.
+#[derive(Default)]
+struct Listeners(RwLock<Vec<Arc<dyn SessionListener>>>);
+
+impl Listeners {
+    fn all(&self) -> Vec<Arc<dyn SessionListener>> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Tells every listener about the entries of `log` from `from` on.
+    fn publish(&self, id: &SessionId, log: &SessionLog, from: usize) {
+        let entries = &log.events()[from.min(log.len())..];
+        if entries.is_empty() {
+            return;
+        }
+        let listeners = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        for listener in listeners.iter() {
+            for entry in entries {
+                listener.event(id, entry);
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Listeners {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self.0.read().unwrap_or_else(PoisonError::into_inner).len();
+        write!(f, "{count} listener(s)")
+    }
+}
+
 /// A handle to one session in a store.
 ///
 /// Cloning it is cheap, and every clone reaches the same log. The loop takes
@@ -87,13 +151,15 @@ impl From<LogError> for SessionError {
 pub struct Session {
     id: SessionId,
     log: Arc<Mutex<SessionLog>>,
+    listeners: Arc<Listeners>,
 }
 
 impl Session {
-    fn new(id: SessionId, log: SessionLog) -> Self {
+    fn new(id: SessionId, log: SessionLog, listeners: Arc<Listeners>) -> Self {
         Self {
             id,
             log: Arc::new(Mutex::new(log)),
+            listeners,
         }
     }
 
@@ -103,7 +169,7 @@ impl Session {
 
     /// See [`SessionLog::append`].
     pub fn append(&self, event: SessionEvent) -> Result<Seq, LogError> {
-        self.lock().append(event)
+        self.changing(|log| log.append(event))
     }
 
     /// Appends every event in `events` under one lock, so no other writer's
@@ -113,13 +179,13 @@ impl Session {
         &self,
         events: impl IntoIterator<Item = SessionEvent>,
     ) -> Result<Vec<Seq>, LogError> {
-        self.lock().append_all(events)
+        self.changing(|log| log.append_all(events))
     }
 
     /// Works out and appends the closers for a turn a crash left open,
     /// under one lock. See [`SessionLog::repair`].
     pub fn repair(&self) -> Result<Vec<Entry>, LogError> {
-        self.lock().repair()
+        self.changing(SessionLog::repair)
     }
 
     /// See [`SessionLog::history`].
@@ -171,6 +237,16 @@ impl Session {
         self.lock().is_empty()
     }
 
+    /// Runs `change` on the locked log, then tells the store's listeners
+    /// about every event it added, still under the lock.
+    fn changing<T>(&self, change: impl FnOnce(&mut SessionLog) -> T) -> T {
+        let mut log = self.lock();
+        let before = log.len();
+        let result = change(&mut log);
+        self.listeners.publish(&self.id, &log, before);
+        result
+    }
+
     fn lock(&self) -> MutexGuard<'_, SessionLog> {
         // A lock is "poisoned" when a thread panicked while holding it. Every
         // change to a log is checked before anything is pushed, and a batch
@@ -201,9 +277,18 @@ impl Session {
 ///
 /// The locks are `std::sync` ones, not async ones, because nothing waits
 /// while holding them: no lock is held across an `.await`.
+///
+/// # Listeners
+///
+/// [`listen`](Self::listen) adds a [`SessionListener`], which hears every
+/// appended event, and [`flush`](Self::flush) asks every listener to make a
+/// session durable. That is how a durable backend follows the store, as
+/// dsh's backends follow `session/event`. With no listener, sessions live
+/// in memory only.
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: RwLock<Sessions>,
+    listeners: Arc<Listeners>,
 }
 
 #[derive(Debug, Default)]
@@ -225,7 +310,7 @@ impl SessionStore {
         if sessions.by_id.contains_key(&id) {
             return Err(SessionError::AlreadyExists(id));
         }
-        Ok(sessions.insert(id, SessionLog::new()))
+        Ok(sessions.insert(id, SessionLog::new(), &self.listeners))
     }
 
     /// Adds the session `id` with the events storage gave back for it, every
@@ -246,7 +331,7 @@ impl SessionStore {
         if sessions.by_id.contains_key(&id) {
             return Err(SessionError::AlreadyExists(id));
         }
-        Ok(sessions.insert(id, log))
+        Ok(sessions.insert(id, log, &self.listeners))
     }
 
     /// The session called `id`, started empty if there's none yet.
@@ -262,7 +347,7 @@ impl SessionStore {
         // write lock, so look again.
         match sessions.by_id.get(&id) {
             Some(session) => session.clone(),
-            None => sessions.insert(id, SessionLog::new()),
+            None => sessions.insert(id, SessionLog::new(), &self.listeners),
         }
     }
 
@@ -311,6 +396,42 @@ impl SessionStore {
         self.read().order.clone()
     }
 
+    /// Adds `listener`, which hears every event appended to any session
+    /// from now on.
+    pub fn listen(&self, listener: Arc<dyn SessionListener>) {
+        self.listeners
+            .0
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// Waits until every listener has made the session `id` durable, and
+    /// says whether any listener keeps it. (dsh: `SessionStore.flush`, the
+    /// one entry point for the `session/flush` checkpoint.)
+    ///
+    /// Every listener is waited for; the first failure is returned after.
+    /// With no listener, there is nothing to wait for, and it is `false`.
+    pub async fn flush(&self, id: &SessionId) -> Result<bool, BoxError> {
+        let flushes: Vec<FlushFuture> = self
+            .listeners
+            .all()
+            .iter()
+            .filter_map(|listener| listener.flush(id))
+            .collect();
+        let participated = !flushes.is_empty();
+        let mut failure = None;
+        for flush in flushes {
+            if let Err(error) = flush.await {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(participated),
+        }
+    }
+
     fn session(&self, id: &SessionId) -> Result<Session, SessionError> {
         self.get(id)
             .ok_or_else(|| SessionError::NotFound(id.clone()))
@@ -332,8 +453,8 @@ impl SessionStore {
 impl Sessions {
     /// Adds a new session holding `log`. The caller has checked `id` is
     /// free.
-    fn insert(&mut self, id: SessionId, log: SessionLog) -> Session {
-        let session = Session::new(id.clone(), log);
+    fn insert(&mut self, id: SessionId, log: SessionLog, listeners: &Arc<Listeners>) -> Session {
+        let session = Session::new(id.clone(), log, Arc::clone(listeners));
         self.by_id.insert(id.clone(), session.clone());
         self.order.push(id);
         session

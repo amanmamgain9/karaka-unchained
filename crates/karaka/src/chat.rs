@@ -3,6 +3,11 @@
 //! Each line read from stdin is a followup to one session's agent. Once the
 //! agent is idle, the turn's tool calls are printed one per line, then the
 //! model's final text, all read back from the session's log.
+//!
+//! With `KARAKA_SESSIONS` set, the session is kept in that directory: a
+//! chat in a session already stored there carries on its conversation.
+//! The session is made durable after each turn, and given up when stdin
+//! ends.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -17,12 +22,14 @@ use karaka_session::{
     Entry, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEndReason, UserMessage,
     UserSource,
 };
+use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
+use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_tools::{ToolRegistry, ToolsPlugin};
 
 use crate::config::Config;
 use crate::current_time::CurrentTime;
 
-/// The one session a chat runs in. It lives only as long as the process.
+/// The session a chat runs in, unless `KARAKA_SESSION` names another.
 const SESSION: &str = "chat";
 
 /// How much of a tool's result its line shows.
@@ -47,7 +54,14 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
 
 /// Runs the chat until stdin ends.
 pub async fn chat(config: Config) -> Result<(), String> {
-    let plugins = loop_plugins(config);
+    let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
+    let sessions = config.sessions.clone();
+    let mut plugins = loop_plugins(config);
+    if let Some(root) = sessions.clone() {
+        // The store's sessions kept as JSONL files under the root.
+        plugins.push(Box::new(JsonlPlugin::new(JsonlConfig { root })));
+        plugins.push(Box::new(DurableSessionsPlugin));
+    }
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;
@@ -56,19 +70,45 @@ pub async fn chat(config: Config) -> Result<(), String> {
         .register(Arc::new(CurrentTime))
         .map_err(|error| error.to_string())?;
 
-    let id = SessionId::new(SESSION);
+    // A stored session is resumed, and repaired if a crash left a turn
+    // open, before the agent sees it.
+    let durable = match sessions {
+        Some(_) => {
+            let durable = runtime.get::<DurableSessions>();
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|dir| dir.to_str().map(str::to_owned));
+            durable
+                .open(id.clone(), cwd)
+                .await
+                .map_err(|error| error.to_string())?;
+            Some(durable)
+        }
+        None => None,
+    };
+    let result = converse(&runtime, &id).await;
+    // Whatever happened, what the chat said is written before it exits.
+    if let Some(durable) = durable {
+        durable.close().await.map_err(|error| error.to_string())?;
+    }
+    result
+}
+
+/// Reads lines and answers them until stdin ends.
+async fn converse(runtime: &Runtime, id: &SessionId) -> Result<(), String> {
+    let store = runtime.get::<SessionStore>();
     let agent = runtime
         .get::<dyn Agents>()
         .open(id.clone())
         .map_err(|error| error.to_string())?;
     // Opening the agent started the session, so it is there to read.
-    let session = runtime
-        .get::<SessionStore>()
-        .get(&id)
-        .ok_or("the chat's session wasn't started")?;
+    let session = store.get(id).ok_or("the chat's session wasn't started")?;
 
     let interactive = io::stdin().is_terminal();
     if interactive {
+        if !session.is_empty() {
+            eprintln!("Carrying on session \"{id}\".");
+        }
         eprintln!("Type a message and press Enter. Ctrl-D ends the chat.");
     }
     let mut lines = io::stdin().lock().lines();
@@ -92,6 +132,12 @@ pub async fn chat(config: Config) -> Result<(), String> {
         let message = UserMessage::text(format!("user-{start}"), UserSource::user(), line);
         agent.followup(message);
         agent.when_idle().await;
+        // The turn is durable before its answer shows. Without storage,
+        // there is nothing to wait for.
+        store
+            .flush(id)
+            .await
+            .map_err(|error| format!("couldn't store the turn: {error}"))?;
         print_turn(&session.events_since(start))
             .map_err(|error| format!("couldn't write the answer: {error}"))?;
     }

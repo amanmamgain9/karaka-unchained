@@ -836,3 +836,147 @@ silently.
 - **No stream reader helpers** (first token time, visible content, joined
   text and the like). Nothing in Karaka reads them yet.
 
+
+## Durable sessions, part A: the seam, the raw v4 backend, and the store on it
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-22.*
+
+### What is done
+
+- **`SessionHeader`** (`karaka-session`, `header.rs`; dsh's
+  `core/session/src/types.ts`): id, `createdAt`, cwd, parent, `isSeeded`,
+  origin, delegation depth and agent preset. The version is the constant
+  `SESSION_FORMAT_VERSION`, 4. `KNOWN_EVENT_TYPES` is dsh's generated
+  vocabulary (`known-event-types.ts`): every type dsh v4 defines, modeled
+  by Karaka or not.
+- **The store's feed** (`karaka-session`, `store.rs`). A `SessionListener`
+  hears every appended event, under the session's lock so in log order,
+  and is asked to `flush` a session: dsh's `session/event` and
+  `session/flush`. A restored seed is not heard, as dsh never publishes
+  one; repair's closers are. `SessionStore::flush(id)` is dsh's
+  `sessions.flush`: it waits for every listener and says whether any keeps
+  the session. With no listener, sessions are in memory, as before.
+- **The seam** (`karaka-session-persistence`; dsh's
+  `session/session-persistence`).
+  - `SessionPersistence`: `create`, `open(id, Read | Write)`, `stat`,
+    `list` and the service `flush`. `SessionHandle`: `read(offset,
+    length)`, `append`, `flush`, `close`. Both are object safe, with boxed
+    futures, so the backend is a port chosen at startup.
+  - `PersistenceError` has dsh's kinds and messages: not found, already
+    exists, already owned, read only, ownership lost, handle closed,
+    corruption, format unsupported (naming the raw log), plus I/O, an
+    aggregate, and `Other` for dsh's plain `Error`s.
+  - `contract.rs` is dsh's `storage-contract.ts`: the stored id, a create's
+    header, contiguity, and `validate_stored_events`, which refuses an
+    unknown non-ignorable type or the legacy `fallback` reason on the raw
+    rows, then reads each row as an `Entry` and restores the whole log in a
+    `SessionLog`.
+  - `LiveWriter` (`live.rs`) is the live write path in front of any write
+    handle: a fixed 200 ms window started by the first pending event,
+    `flush` as the barrier, a failed batch kept in order with the window
+    quiet until the next drain, `close` draining first and closing anyway.
+  - `DurableSessions` (`durable.rs`) keeps the store on a backend. Its
+    router is the store listener that sends each event to the session's
+    writer, as dsh's `JsonlBackendTracker.install`. `open(id, cwd)` is the
+    agent loop's `resumeWith` with `restoreOrCreateConfigured`'s fallback:
+    take the write handle, read, restore, repair, flush the closers; or
+    create on not found. `flush` and `close` cover every session.
+    `DurableSessionsPlugin` provides it.
+- **The backend** (`karaka-session-jsonl`; dsh's
+  `session-persistence-jsonl` with `compression: 'none'`).
+  - dsh's layout exactly: `--<project key>--/` or `_no-cwd/`, the session's
+    directory named by the injective `~XXXX` escaping over UTF-16 code
+    units (with `.` and `..` escaped whole), `session.v4.jsonl`, and
+    `session.lock`.
+  - The header line in v4's key order, and one row per event in the
+    lossless source-event form: runs of three or more `sourceEventSeqs`
+    stored as `[start, end]`, expanded back exactly.
+  - The scanner (`format.rs`) is dsh's `SessionLogScanner` with v2's row
+    decoder: it drops an incomplete last line, and everything from a
+    damaged row on unless a later row is a `turn/end`, which refuses the
+    file. `admission.rs` runs v4's structural checks on every row before
+    that recovery, as dsh's scanner does, and the writer runs them too.
+  - Lazy materialization: nothing on disk until the first append or flush,
+    which publishes the header and batch through a synced temporary file
+    and `link`, after syncing each new directory. A creator closed before
+    then leaves no trace.
+  - Each append is written and `fsync`ed; a failed write or sync cuts the
+    file back to its earlier length, and a failed cut is reported with
+    the failure. A write handle cuts a torn tail before its first append.
+  - The lock: `flock` through Rust's `File::try_lock` (no new dependency),
+    with dsh's inode check and bounded retry, taken at write open, or just
+    before a created session's first write. Released by closing; the file
+    is never removed.
+  - Root: required, resolved once, an existing root must be a readable
+    directory. A root holding compressed logs, the old flat layout, an id
+    in two project directories, or a header that doesn't name its own
+    file are refused with dsh's wording.
+- **The CLI.** `KARAKA_SESSIONS` mounts the backend and `DurableSessions`
+  for `chat`; `KARAKA_SESSION` names the session (`chat` otherwise).
+  `chat` resumes the session before the agent opens it, flushes after each
+  turn, before printing its answer, and closes at the end of stdin.
+  Without `KARAKA_SESSIONS`, nothing changes. The CLI tests clear both
+  variables, so no test can reach a real store.
+- **Tests.** dsh's persistence contract suite against this backend; the
+  `jsonl.spec.ts` cases that apply to raw v4 (format helpers, refusals,
+  generations, durability, the scanner, identity, traversal, listing);
+  `current-event-admission.spec.ts`; `load-path.spec.ts` as a plugin
+  test; `lease.spec.ts` with a second backend instance standing for a
+  second process, and a real second process (the test binary started
+  again as the holder, then killed); the v4 fixture written and read back
+  event for event; the live write path on paused time; `DurableSessions`
+  on the real backend; and a CLI chat resumed by a second run.
+
+### Left out of part A
+
+- Zstandard frames, dsh's default, with torn-frame recovery and the
+  storage verifier's stream check: part B. This backend writes raw lines
+  only, and refuses a root holding `.jsonl.zstd` logs, as dsh does with
+  `compression: 'none'`. There is no `compression` setting yet.
+- Historical generations and migration through the catalog: part C. An
+  older log is refused at open with dsh's "older than the supported v4"
+  wording and its raw path, is an existing id for `create`, and is never
+  written: the refusal comes before the lock, so not even `session.lock`
+  appears beside it. `stat` refuses it too, and `list` skips it; dsh would
+  show its translated header.
+- `assertReleasedV4Relationships`, v4's cross-row lifecycle checks (turns,
+  steps, tool calls, retries, compaction). `SessionLog::restore` checks
+  seqs and surface operations; the rest waits for the catalog in part C.
+- The cold-log memo, list concurrency (`listConcurrency`), cancellation
+  signals (a dropped future cancels), `eventState`/frozen reads, Windows
+  (dsh's named semaphore; the crate builds on Unix only), and the logger
+  warnings dsh writes for a torn tail or a failed background batch.
+- The checkpoint policy's per-request barrier
+  (`session-checkpoint-policy`): `chat` flushes per turn instead.
+- `karaka ask` stays in memory: its one-turn session is named `ask`, and
+  storing it would make every ask carry on the last.
+
+### Where part A differs from dsh
+
+- **The batching window is in the seam**, written once around any handle,
+  not inside each backend's handle. dsh calls it "the seam's internal
+  scheduling policy" but writes it in `storage.ts`; the behavior is the
+  same. The window's deadline is set when the first event arrives, as
+  `setTimeout`. Concurrent drains wait for each other rather than sharing
+  one result.
+- **The loop doesn't resume sessions itself.** `Agents::open` is
+  synchronous and storage isn't, so the caller resumes through
+  `DurableSessions::open` first, and the loop finds the session in the
+  store, already repaired. dsh's agent loop does both. Making
+  `Agents::open` async would let the loop own it, as in dsh.
+- **Closers are appended through the session**, not the handle: repair
+  publishes them, the router writes them, and `open` flushes before
+  returning, so they are durable before the session continues, as in dsh.
+- **The session keeps no header.** dsh's `Session` carries one; Karaka's
+  store doesn't need it yet, so it stays with the handle.
+- **Typed decoding is strict and comes after the scan.** dsh's row
+  decoder checks only the envelope, then `adoptSessionEvent` and the
+  catalog validate the whole log. Karaka does the same split, so a row
+  that is valid JSON with a good envelope but doesn't read as its typed
+  event refuses the file as corruption, even at the tail.
+- **A batch is checked and encoded before the lock is taken**, so a
+  refused one leaves nothing on disk; dsh takes the lock first.
+- **A dropped handle frees its claim and its lock** (`Drop`), where dsh
+  relies on `close` or `await using`.
+- **A read handle refuses an unreadable log at open.** dsh's read open of
+  a current log reads it too, so this matches in effect.
