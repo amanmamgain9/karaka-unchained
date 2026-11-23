@@ -282,7 +282,10 @@ fn decode_ranges(value: &Value, max_entries: u64) -> Result<Vec<u64>, String> {
         }
         let start = member(&pair[0], "sourceEventSeqs range start")?;
         let end = member(&pair[1], "sourceEventSeqs range end")?;
-        if start > end || end >= max_entries || end - start + 1 > max_entries - out.len() as u64 {
+        // The room left for this range; none when plain members already
+        // outnumber the seq, where dsh's subtraction goes negative.
+        let room = max_entries.checked_sub(out.len() as u64);
+        if start > end || end >= max_entries || room.is_none_or(|room| end - start + 1 > room) {
             return Err("sourceEventSeqs range exceeds its event seq".into());
         }
         out.extend(start..=end);
@@ -671,6 +674,29 @@ mod tests {
         assert!(decode_ranges(&json!([1, 1]), 3).is_err());
         assert!(decode_ranges(&json!([[0, 1, 2]]), 3).is_err());
         assert!(decode_ranges(&json!({}), 3).is_err());
+    }
+
+    // More plain members than the seq allows, then a range: dsh's check
+    // goes negative and refuses; it must not underflow here.
+    #[test]
+    fn a_range_after_too_many_members_is_refused() {
+        assert_eq!(
+            decode_ranges(&json!([7, 8, 9, [0, 1]]), 2),
+            Err("sourceEventSeqs range exceeds its event seq".into())
+        );
+        let row = json!({
+            "type": "user/message", "seq": 2, "time": 3, "surfaceOp": "append",
+            "sourceEventSeqs": [7, 8, 9, [0, 1]],
+            "data": { "id": "u", "role": "user", "content": [], "source": { "kind": "user" } }
+        });
+        let Err(ScanError::Corrupt(message)) =
+            Scanner::new(format!("{}\n", header("crafted")).as_bytes(), true)
+                .unwrap()
+                .write(format!("{}\n{}\n{}\n", turn_start(0), turn_end(1), row).as_bytes())
+        else {
+            panic!("the crafted row is refused");
+        };
+        assert!(message.contains("range exceeds its event seq"), "{message}");
     }
 
     #[test]

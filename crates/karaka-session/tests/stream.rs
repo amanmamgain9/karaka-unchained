@@ -430,7 +430,7 @@ fn chunks_are_written_as_dshs_json() {
         message: "busy".into(),
         code: "RATE_LIMIT".into(),
         status: None,
-        provider_retry_after_ms: Some(2000),
+        provider_retry_after_ms: Some(2000.into()),
         request_id: None,
         offload_images: None,
     };

@@ -60,11 +60,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
+use karaka_tools::ToolOutput;
 use serde_json::Value;
 
 use karaka_model::{
     Block, BlockAssembler, ErrorKind, FinishReason, Message, Model, ModelError, Request, Response,
-    Role, ToolCall,
+    Role, ToolCall, Usage,
 };
 use karaka_session::{
     AssistantAttemptData, AssistantMessage, AssistantMessageData, CancelCause, CloseCause,
@@ -73,7 +74,7 @@ use karaka_session::{
 };
 
 use crate::agent::{Cancel, Inner};
-use crate::failure::{handler_panicked, model_failure, no_model, other_failure};
+use crate::failure::{handler_panicked, model_failure, no_model, other_failure, panicked};
 use crate::live::LiveAttempt;
 
 /// Why a step stopped before it finished.
@@ -105,8 +106,15 @@ pub(crate) enum Ran {
 enum Streamed {
     Finished(Response),
     Failed(ModelError),
-    /// Cancelled, with what is worth keeping of the answer so far.
-    Cancelled(CancelCause, Vec<Block>),
+    /// Cancelled, with what is worth keeping of the answer so far, and the
+    /// usage if it had come.
+    Cancelled(CancelCause, Vec<Block>, Option<Usage>),
+    /// The model's code panicked, with the panic's message. `started` says
+    /// whether the stream had opened.
+    Panicked {
+        message: String,
+        started: bool,
+    },
 }
 
 impl Inner {
@@ -227,7 +235,11 @@ impl Inner {
             let output = tokio::select! {
                 biased;
                 cause = cancel.cancelled() => return Err(Stop::Aborted(cause)),
-                output = self.shared.tools.execute(call) => output,
+                // A tool that panics gets an error result, as a dsh tool
+                // that throws gets `Error: <message>`
+                // (`core/tools/src/index.ts:1917-1924`).
+                output = CatchUnwind(self.shared.tools.execute(call)) => output
+                    .unwrap_or_else(|Panicked(message)| ToolOutput::error(format!("Error: {message}"))),
             };
             let result = output.into_result(&call.id);
             let data = ToolResultData::new(self.next_id("tool-result"), turn, step, &result);
@@ -315,7 +327,18 @@ impl Inner {
                     self.recover(turn, step, model.as_ref(), model_failure(&error), cancel)
                         .await?;
                 }
-                Streamed::Cancelled(cause, content) => {
+                // A stream that panics fails the turn under `UNKNOWN`, as one
+                // that throws does in dsh, after logging the attempt if the
+                // stream had opened (`agent.ts:462-502`). No handler is asked:
+                // dsh asks only about a failure the model reported.
+                Streamed::Panicked { message, started } => {
+                    if started {
+                        let logged = self.session.append(attempt(turn, step, live.stream(None)));
+                        live.settle(SettledAs::AssistantAttempt, logged)?;
+                    }
+                    return Err(Stop::Failed(panicked(message)));
+                }
+                Streamed::Cancelled(cause, content, usage) => {
                     if content.is_empty() {
                         let logged = self.session.append(attempt(turn, step, live.stream(None)));
                         live.settle(SettledAs::AssistantAttempt, logged)?;
@@ -325,6 +348,7 @@ impl Inner {
                             step,
                             model.provider(),
                             &content,
+                            usage,
                             live.stream(None),
                         );
                         live.settle(SettledAs::AssistantMessage, logged)?;
@@ -371,7 +395,7 @@ impl Inner {
             Ok(Ok(Some(RequestErrorAction::Retry))) => Ok(()),
             Ok(Ok(None)) => Err(Stop::Failed(error.failure)),
             Ok(Err(handler)) => Err(Stop::Failed(other_failure(handler.as_ref()))),
-            Err(Panicked) => Err(Stop::Failed(handler_panicked())),
+            Err(Panicked(_)) => Err(Stop::Failed(handler_panicked())),
         }
     }
 
@@ -447,15 +471,15 @@ impl Inner {
         Ok(())
     }
 
-    /// Logs the part of an answer that arrived before a cancel.
-    /// (dsh: `agent.ts:465-482`.) It has no usage: Karaka's models report
-    /// usage only when they finish.
+    /// Logs the part of an answer that arrived before a cancel, with the
+    /// usage if its chunk had come. (dsh: `agent.ts:465-482`.)
     fn append_interrupted(
         &self,
         turn: u64,
         step: u64,
         provider: &str,
         content: &[Block],
+        usage: Option<Usage>,
         stream: Vec<Value>,
     ) -> Result<Seq, LogError> {
         let message = AssistantMessage::from_model(
@@ -470,7 +494,7 @@ impl Inner {
                 step,
                 message,
                 stream,
-                usage: None,
+                usage: usage.map(Into::into),
                 interrupted: true,
                 extra: Extra::new(),
             }))
@@ -514,7 +538,15 @@ async fn stream(
     cancel: &Cancel,
     live: &mut LiveAttempt<'_>,
 ) -> Streamed {
-    let mut events = model.stream(request);
+    let mut events = match panic::catch_unwind(AssertUnwindSafe(|| model.stream(request))) {
+        Ok(events) => events,
+        Err(payload) => {
+            return Streamed::Panicked {
+                message: panic_message(payload.as_ref()),
+                started: false,
+            };
+        }
+    };
     live.start();
     // dsh's assembler, which `complete` uses too, so the loop keeps the
     // same blocks and drops the same ones (`llm/src/assembler.ts`).
@@ -525,9 +557,18 @@ async fn stream(
         let event = tokio::select! {
             biased;
             cause = cancel.cancelled() => {
-                return Streamed::Cancelled(cause, answer.interrupted_blocks());
+                return Streamed::Cancelled(cause, answer.interrupted_blocks(), answer.usage());
             }
-            event = poll_fn(|cx| events.as_mut().poll_next(cx)) => event,
+            event = CatchUnwind(poll_fn(|cx| events.as_mut().poll_next(cx))) => event,
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(Panicked(message)) => {
+                return Streamed::Panicked {
+                    message,
+                    started: true,
+                };
+            }
         };
         // Every item goes out as a chunk before the loop acts on it: an
         // event, or the failure that ends the stream.
@@ -602,12 +643,23 @@ fn replacing(seq: Seq) -> SurfaceIntent {
     }
 }
 
-/// A handler panicked.
-struct Panicked;
+/// Code the loop called panicked, with the panic's message.
+struct Panicked(String);
+
+/// The text a panic was raised with.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no message".to_owned()
+    }
+}
 
 /// Runs a future, turning a panic in it into [`Panicked`], so a broken
-/// handler fails its turn rather than the agent's driver. The panic message
-/// is still printed by the panic hook.
+/// handler, tool or model fails its call or its turn rather than the
+/// agent's driver. The panic message is still printed by the panic hook.
 struct CatchUnwind<F>(F);
 
 impl<F: Future + Unpin> Future for CatchUnwind<F> {
@@ -620,7 +672,7 @@ impl<F: Future + Unpin> Future for CatchUnwind<F> {
         match panic::catch_unwind(AssertUnwindSafe(|| Pin::new(inner).poll(cx))) {
             Ok(Poll::Ready(output)) => Poll::Ready(Ok(output)),
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(Err(Panicked)),
+            Err(payload) => Poll::Ready(Err(Panicked(panic_message(payload.as_ref())))),
         }
     }
 }

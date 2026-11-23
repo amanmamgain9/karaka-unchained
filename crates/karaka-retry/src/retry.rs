@@ -85,12 +85,19 @@ impl RetryHandler {
         };
 
         let backoff = policy.backoff();
-        let delay_ms = match failure.provider_retry_after_ms.filter(|&wait| wait > 0) {
-            Some(wait) if wait as f64 > backoff.max_delay_ms => match policy {
+        // A fraction of a millisecond is a wait too, as in dsh
+        // (`llm-retry/src/index.ts:227-234`).
+        let provider_wait = failure
+            .provider_retry_after_ms
+            .as_ref()
+            .and_then(serde_json::Number::as_f64)
+            .filter(|wait| wait.is_finite() && *wait > 0.0);
+        let delay_ms = match provider_wait {
+            Some(wait) if wait > backoff.max_delay_ms => match policy {
                 RetryPolicy::Normal { .. } => return delegate(&mut next).await,
                 RetryPolicy::Always { .. } => local_delay(backoff, retry, (self.random)()),
             },
-            Some(wait) => wait as f64,
+            Some(wait) => wait,
             None => local_delay(backoff, retry, (self.random)()),
         };
 

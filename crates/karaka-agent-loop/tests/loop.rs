@@ -50,6 +50,8 @@ enum Reply {
     /// These events, then a wait that never ends, until the stream is
     /// dropped. `waiting` is notified when the wait begins.
     Hang(Vec<Event>, Arc<Notify>),
+    /// These events, then a panic in the stream.
+    Panic(Vec<Event>),
 }
 
 /// Plays one reply per call, in order, and keeps every request it got.
@@ -83,10 +85,17 @@ impl Model for Scripted {
             Some(Reply::Events(events)) => Playback {
                 events: events.into(),
                 hang: None,
+                panic: false,
             },
             Some(Reply::Hang(events, waiting)) => Playback {
                 events: events.into_iter().map(Ok).collect(),
                 hang: Some(waiting),
+                panic: false,
+            },
+            Some(Reply::Panic(events)) => Playback {
+                events: events.into_iter().map(Ok).collect(),
+                hang: None,
+                panic: true,
             },
             // dsh's mock throws "script exhausted".
             None => Playback {
@@ -95,6 +104,7 @@ impl Model for Scripted {
                     "the script is exhausted",
                 ))]),
                 hang: None,
+                panic: false,
             },
         };
         Box::pin(playback)
@@ -104,6 +114,8 @@ impl Model for Scripted {
 struct Playback {
     events: VecDeque<Result<Event, ModelError>>,
     hang: Option<Arc<Notify>>,
+    /// Panics once the events are played.
+    panic: bool,
 }
 
 impl Stream for Playback {
@@ -113,6 +125,9 @@ impl Stream for Playback {
         let this = self.get_mut();
         if let Some(event) = this.events.pop_front() {
             return Poll::Ready(Some(event));
+        }
+        if this.panic {
+            panic!("the stream broke");
         }
         match &this.hang {
             // Never woken: only dropping the stream ends it.
@@ -206,6 +221,19 @@ impl Tool for Broken {
 
     fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
         Box::pin(async { ToolOutput::error("the weather service is down") })
+    }
+}
+
+/// Panics instead of answering.
+struct Panicky;
+
+impl Tool for Panicky {
+    fn schema(&self) -> ToolSchema {
+        schema("panicky")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async { panic!("the tool broke") })
     }
 }
 
@@ -680,6 +708,67 @@ async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
     assert_eq!(second.messages[2].content, [Block::ToolResult(result)]);
 }
 
+/// A tool that panics gets an error result, as a dsh tool that throws gets
+/// `Error: <message>` (`core/tools/src/index.ts:1917-1924`), and the turn
+/// carries on. The agent's next followup runs too.
+#[tokio::test]
+async fn a_tool_that_panics_gets_an_error_result_and_the_agent_carries_on() {
+    let harness = Harness::new(vec![
+        calls(&[call("c1", "panicky", "{}")]),
+        text("it broke"),
+        text("next"),
+    ])
+    .await;
+    harness.tools.register(Arc::new(Panicky)).unwrap();
+    harness.say("try it").await;
+
+    let events = harness.events();
+    let (result, _, _) = tool_result(&events[8]);
+    assert_eq!(
+        result,
+        ToolResult {
+            call_id: "c1".into(),
+            content: "Error: the tool broke".into(),
+            is_error: true
+        }
+    );
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+
+    harness.say("again").await;
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Completed, TurnEndReason::Completed]
+    );
+}
+
+/// A model stream that panics ends its turn with an `UNKNOWN` error, as a
+/// dsh stream that throws does (`agent.ts:375-382`), after logging the
+/// attempt. The agent's next followup runs.
+#[tokio::test]
+async fn a_model_stream_that_panics_fails_its_turn_and_the_agent_carries_on() {
+    let harness = Harness::new(vec![Reply::Panic(vec![delta("hel")]), text("next")]).await;
+    harness.say("try it").await;
+
+    let mut expected = vec!["turn/start"];
+    expected.extend(&ANSWER_STEP[..5]);
+    expected.extend(["assistant/attempt", "step/end", "turn/end"]);
+    assert_eq!(harness.types(), expected);
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("the turn failed: {endings:?}");
+    };
+    assert_eq!(failure.code, "UNKNOWN");
+    assert!(
+        failure.message.contains("the stream broke"),
+        "{}",
+        failure.message
+    );
+
+    harness.say("again").await;
+    assert_eq!(harness.endings().len(), 2);
+    assert_eq!(harness.endings()[1], TurnEndReason::Completed);
+}
+
 /// dsh: "surfaces max-tokens as the turn-end reason when the last step is
 /// cut off" (`loop.spec.ts:1439`) and "does not dispatch tool calls from a
 /// max-tokens-truncated step" (`loop.spec.ts:1530`).
@@ -755,7 +844,7 @@ async fn a_model_error_ends_the_turn_with_a_structured_failure() {
             message: "Slow down.".into(),
             code: "RATE_LIMIT".into(),
             status: None,
-            provider_retry_after_ms: Some(2000),
+            provider_retry_after_ms: Some(2000.into()),
             request_id: None,
             offload_images: None,
         })]
@@ -910,6 +999,28 @@ async fn a_cancel_mid_stream_keeps_the_partial_answer() {
             TurnEndReason::Completed
         ]
     );
+}
+
+/// A cancel after the usage came keeps it on the partial answer, as dsh's
+/// interrupted message carries `live.usage` (`agent.ts:480`).
+#[tokio::test]
+async fn a_cancel_after_the_usage_keeps_it_on_the_partial_answer() {
+    let waiting = Arc::new(Notify::new());
+    let mut events = vec![delta("partial")];
+    events.push(Event::Usage { usage: usage() });
+    let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
+    let agent = harness.agent();
+    agent.followup(user("go"));
+    waiting.notified().await;
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+
+    let events = harness.events();
+    let SessionEvent::AssistantMessage { data, .. } = &events[6].event else {
+        panic!("expected the partial answer, got {:?}", events[6].event);
+    };
+    assert!(data.interrupted);
+    assert_eq!(data.usage, Some(TokenUsage::from(usage())));
 }
 
 /// dsh: "cancel before any visible content finalizes nothing"

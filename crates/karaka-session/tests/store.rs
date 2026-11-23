@@ -529,3 +529,35 @@ async fn flush_says_whether_a_listener_keeps_the_session_and_reports_its_failure
     let failure = store.flush(&id("a")).await.unwrap_err();
     assert_eq!(failure.to_string(), "the disk is full");
 }
+
+/// dsh's DeepSeek transport turns `Retry-After: 1.2345` into
+/// `providerRetryAfterMs: 1234.5` (`llm-deepseek/src/transport.ts:37`), and
+/// the failure is what `turn/end` stores. Such a log loads, the failure is
+/// read as one, and it is written back as it was.
+#[test]
+fn a_fractional_retry_wait_from_dsh_loads_and_round_trips() {
+    let rows = serde_json::json!([
+        { "type": "turn/start", "seq": 0, "time": 1, "data": { "turn": 1 } },
+        { "type": "llm/retry", "seq": 1, "time": 2, "data": {
+            "turn": 1, "step": 1, "provider": "deepseek", "retry": 1, "retryId": "r", "delayMs": 1234.5,
+            "failure": { "message": "slow down", "code": "RATE_LIMIT", "status": 429, "providerRetryAfterMs": 1234.5 }
+        } },
+        { "type": "turn/end", "seq": 2, "time": 3, "data": { "turn": 1, "reason": { "kind": "error", "error": {
+            "message": "slow down", "code": "RATE_LIMIT", "status": 429, "providerRetryAfterMs": 1234.5
+        } } } }
+    ]);
+    let entries: Vec<Entry> = serde_json::from_value(rows.clone()).expect("the rows read");
+    let store = SessionStore::new();
+    let session = store
+        .restore(id("fraction"), entries)
+        .expect("the log restores");
+    let events = session.events();
+    let SessionEvent::TurnEnd(end) = &events[2].event else {
+        panic!("a turn end");
+    };
+    let karaka_session::TurnEndReason::Error(failure) = &end.reason else {
+        panic!("read as a failure, got {:?}", end.reason);
+    };
+    assert_eq!(failure.code, "RATE_LIMIT");
+    assert_eq!(serde_json::to_value(&events).unwrap(), rows);
+}

@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_session::{
     Entry, FlushFuture, Session, SessionError, SessionHeader, SessionId, SessionListener,
-    SessionStore, Time,
+    SessionStore, Time, interrupted_turn_closers,
 };
 
 use crate::{CreateOptions, LiveWriter, PersistenceError, SessionAccess, SessionPersistence};
@@ -143,9 +143,10 @@ impl DurableSessions {
     /// created when none is stored. A new session works in `cwd`.
     ///
     /// Resuming takes the session's write handle first, so no one else can
-    /// write it meanwhile. It restores the stored events, closes a turn a
-    /// crash left open, and makes those closers durable before returning.
-    /// A new session is stored at its first event.
+    /// write it meanwhile. It appends the closers of a turn a crash left
+    /// open through the handle, then restores the session. If either fails,
+    /// the handle is closed and the session not published, so a later
+    /// `open` tries again. A new session is stored at its first event.
     ///
     /// # Panics
     ///
@@ -170,28 +171,35 @@ impl DurableSessions {
         id: SessionId,
         handle: Box<dyn crate::SessionHandle>,
     ) -> Result<Session, DurableError> {
-        let entries = match handle.read(0, None).await {
+        let mut entries = match handle.read(0, None).await {
             Ok(entries) => entries,
             Err(error) => {
                 let _ = handle.close().await;
                 return Err(error.into());
             }
         };
+        // Semantic repair is the reader's. As in dsh, the closers of a turn
+        // a crash left open are appended through the handle before the
+        // session is restored, and if that fails, the handle is given up
+        // and the session never published.
+        let closers = interrupted_turn_closers(&entries);
+        if !closers.is_empty() {
+            if let Err(error) = handle.append(closers.clone()).await {
+                let _ = handle.close().await;
+                return Err(error.into());
+            }
+            entries.extend(closers);
+        }
         let writer = LiveWriter::new(handle);
         self.router.writers().insert(id.clone(), writer.clone());
-        let session = match self.store.restore(id.clone(), entries) {
-            Ok(session) => session,
+        match self.store.restore(id.clone(), entries) {
+            Ok(session) => Ok(session),
             Err(error) => {
                 self.router.writers().remove(&id);
                 let _ = writer.close().await;
-                return Err(error.into());
+                Err(error.into())
             }
-        };
-        // Semantic repair is the reader's, as dsh's resume appends
-        // `interruptedTurnClosers` through the handle before continuing.
-        session.repair().map_err(SessionError::from)?;
-        writer.flush().await?;
-        Ok(session)
+        }
     }
 
     async fn create(&self, id: SessionId, cwd: Option<String>) -> Result<Session, DurableError> {

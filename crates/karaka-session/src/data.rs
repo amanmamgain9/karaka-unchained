@@ -192,8 +192,12 @@ pub struct Failure {
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// How long the provider asked to wait, in milliseconds. A JSON number
+    /// as written, not an integer: dsh's DeepSeek transport turns
+    /// `Retry-After: 1.2345` into `1234.5` (`llm-deepseek/src/transport.ts:37`),
+    /// and its v4 validator takes any finite positive number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_retry_after_ms: Option<u64>,
+    pub provider_retry_after_ms: Option<serde_json::Number>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

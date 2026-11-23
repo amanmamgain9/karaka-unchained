@@ -27,7 +27,8 @@ pub(crate) fn model_failure(error: &ModelError) -> Failure {
         provider_retry_after_ms: error
             .retry_after
             .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
-            .filter(|&millis| millis > 0),
+            .filter(|&millis| millis > 0)
+            .map(Into::into),
         request_id: None,
         offload_images: None,
     }
@@ -52,6 +53,12 @@ pub(crate) fn no_model(route: &str) -> Failure {
 /// model call, it is `UNKNOWN`.
 pub(crate) fn handler_panicked() -> Failure {
     plain("a request-error handler panicked".into(), UNKNOWN)
+}
+
+/// A model's stream panicked. dsh ends a turn whose stream throws with the
+/// error's text under `UNKNOWN`; this is the panic's message.
+pub(crate) fn panicked(message: String) -> Failure {
+    plain(message, UNKNOWN)
 }
 
 fn plain(message: String, code: &str) -> Failure {
@@ -80,7 +87,7 @@ mod tests {
         let failure = model_failure(&error);
         assert_eq!(failure.message, "Slow down.");
         assert_eq!(failure.code, "RATE_LIMIT");
-        assert_eq!(failure.provider_retry_after_ms, Some(1500));
+        assert_eq!(failure.provider_retry_after_ms, Some(1500.into()));
         assert_eq!(failure.status, None);
     }
 

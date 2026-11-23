@@ -964,9 +964,6 @@ silently.
   `DurableSessions::open` first, and the loop finds the session in the
   store, already repaired. dsh's agent loop does both. Making
   `Agents::open` async would let the loop own it, as in dsh.
-- **Closers are appended through the session**, not the handle: repair
-  publishes them, the router writes them, and `open` flushes before
-  returning, so they are durable before the session continues, as in dsh.
 - **The session keeps no header.** dsh's `Session` carries one; Karaka's
   store doesn't need it yet, so it stays with the handle.
 - **Typed decoding is strict and comes after the scan.** dsh's row
@@ -980,3 +977,72 @@ silently.
   relies on `close` or `await using`.
 - **A read handle refuses an unreadable log at open.** dsh's read open of
   a current log reads it too, so this matches in effect.
+
+## Fixes after the contract review
+
+*Checked against dsh tag `dsh-v0.2.1-rc.2`, 2026-11-23. Each suspected bug
+got a test first; only the ones whose test failed were changed.*
+
+1. **A panicking tool or model stream wedged the agent: fixed.** Only
+   request-error handlers and frame listeners were caught. A panic in a
+   tool or a model stream killed the driver task with the turn left open,
+   and `last_turn` didn't advance. The log didn't refuse what came next,
+   as the review expected. It was worse: the next followup appended a
+   second `turn/start` for the same turn number inside the open one,
+   with the panicked tool call never answered. Now, as in dsh:
+   - a tool that panics gets an error result, `Error: <message>`
+     (`core/tools/src/index.ts:1917-1924`), and the turn carries on;
+   - a model stream that panics, opening or mid-stream, ends its turn with
+     `turn/end` error `UNKNOWN` and the panic's message, after an
+     `assistant/attempt` if the stream had opened (`agent.ts:462-502`,
+     `375-382`). The request-error hook isn't asked, as dsh asks it only
+     about failures the model reports.
+
+   Tests: `a_tool_that_panics_gets_an_error_result_and_the_agent_carries_on`
+   and `a_model_stream_that_panics_fails_its_turn_and_the_agent_carries_on`.
+   A panic elsewhere in the loop's own code still kills the driver;
+   nothing in the loop is known to panic.
+2. **A half-open resume: fixed.** If repair or its flush failed,
+   `DurableSessions::open` left the writer registered and the session in
+   the store, so the next `open` returned it with its closers unwritten.
+   Now it follows `resumeWith` (`agent-loop/src/index.ts:875-921`): the
+   closers are appended through the handle before the session is
+   restored. If that fails, the handle is closed and nothing is
+   published, so a later `open` starts over. Test (a backend whose first
+   append fails):
+   `a_resume_whose_closers_fail_to_store_publishes_nothing_and_can_be_retried`.
+3. **Underflow in the `sourceEventSeqs` range check: fixed.** Plain
+   members outnumbering the seq, then a range, panicked in a debug build;
+   a release build wrapped, and a later check refused the row with
+   another message. Now there is no room left, and the row is refused
+   with dsh's "range exceeds its event seq". Test:
+   `a_range_after_too_many_members_is_refused`.
+4. **A fractional `providerRetryAfterMs`: fixed.** dsh does produce one:
+   its DeepSeek transport turns `Retry-After: 1.2345` into `1234.5`
+   (`llm-deepseek/src/transport.ts:37`), and `turn/end` stores the
+   failure. The log loaded, contrary to the review, but the reason fell
+   back to `TurnEndReason::Other`, so Karaka didn't read it as a failure.
+   The field is now a JSON number, kept as written, so it reads as a
+   failure and is written back the same. The retry plugin reads it as a
+   float, as dsh's `llm-retry` does. Test:
+   `a_fractional_retry_wait_from_dsh_loads_and_round_trips`.
+5. **An empty aborted turn between queued turns: not a bug I could make
+   fail.** dsh checks its signal before `turn/start` (`agent.ts:304`)
+   because, in dsh, other code can run in the gap between one turn and the
+   next (`while (await this.turn())`). Karaka's driver has no such gap. From
+   making the next turn's cancel switch to appending its `turn/start`, it
+   never awaits, so no task on the same thread can cancel in between. A
+   cancel from the turn's own `turn/end` hits the old switch, and a
+   followup sent after it runs as the next turn, as in dsh. The cancel
+   that remains is one from another thread landing within those few
+   instructions. A check before `turn/start` wouldn't close that race. It
+   could still land just after the check. And what it would leave is a
+   well-formed `turn/start` and `turn/end` (aborted) with no step. That is
+   the same shape dsh itself logs for a cancel right after a followup,
+   because there `turn/start` is appended synchronously. No code changed.
+
+Also: an interrupted `assistant/message` now carries the usage if its
+chunk came before the cancel, as dsh writes `live.usage` (`agent.ts:480`).
+The comment saying Karaka's models report usage only when they finish
+was wrong since step five, part A. Test:
+`a_cancel_after_the_usage_keeps_it_on_the_partial_answer`.
