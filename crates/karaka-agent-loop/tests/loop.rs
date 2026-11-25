@@ -31,6 +31,10 @@ use karaka_session::{
     TokenUsage, TurnEndReason, UserMessage, UserSource, check_assistant_streams, chunk_event,
     chunk_json, expand_stream,
 };
+use karaka_system_prompt::{
+    HARNESS_IDENTITY, Scope, Section, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
+    TOOL_ORDER_REST,
+};
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -279,6 +283,7 @@ struct Harness {
     tools: Arc<ToolRegistry>,
     hooks: Arc<RequestErrorHooks>,
     agents: Arc<dyn Agents>,
+    prompt: Arc<SystemPrompt>,
     stuck: Arc<Notify>,
     stuck_dropped: Arc<AtomicBool>,
     _runtime: Runtime,
@@ -291,9 +296,14 @@ impl Harness {
 
     /// A harness with `config`, whose store already holds `restored` as the
     /// session [`id`].
-    async fn with(replies: Vec<Reply>, config: LoopConfig, restored: Vec<Entry>) -> Self {
+    async fn with(replies: Vec<Reply>, config: impl Into<Setup>, restored: Vec<Entry>) -> Self {
+        let Setup {
+            loop_config,
+            prompt,
+        } = config.into();
         let runtime = Runtime::start(vec![
-            Box::new(AgentLoopPlugin::new(config)),
+            Box::new(AgentLoopPlugin::new(loop_config)),
+            Box::new(SystemPromptPlugin::new(prompt)),
             Box::new(SessionsPlugin),
             Box::new(ToolsPlugin),
             Box::new(ModelsPlugin),
@@ -326,6 +336,7 @@ impl Harness {
             tools,
             hooks: runtime.get::<RequestErrorHooks>(),
             agents: runtime.get::<dyn Agents>(),
+            prompt: runtime.get::<SystemPrompt>(),
             stuck,
             stuck_dropped,
             _runtime: runtime,
@@ -410,10 +421,37 @@ fn id() -> SessionId {
     SessionId::new("a1")
 }
 
-fn config(system: Option<&str>) -> LoopConfig {
-    let mut config = LoopConfig::new(ROUTE, MODEL);
-    config.system = system.map(str::to_owned);
-    config
+/// How a harness's loop and system prompt are set up.
+struct Setup {
+    loop_config: LoopConfig,
+    prompt: SystemPromptConfig,
+}
+
+/// Without the identity line, so a test's prompt is exactly its persona.
+/// `the_step_prompt_and_tools_come_from_the_registry` covers the default.
+fn quiet(persona: Option<&str>) -> SystemPromptConfig {
+    SystemPromptConfig {
+        include_harness_identity: false,
+        persona_prefix: persona.unwrap_or_default().to_owned(),
+        ..SystemPromptConfig::default()
+    }
+}
+
+impl From<LoopConfig> for Setup {
+    fn from(loop_config: LoopConfig) -> Self {
+        Self {
+            loop_config,
+            prompt: quiet(None),
+        }
+    }
+}
+
+/// A loop at [`ROUTE`] whose prompt is `system`, the persona prefix.
+fn config(system: Option<&str>) -> Setup {
+    Setup {
+        loop_config: LoopConfig::new(ROUTE, MODEL),
+        prompt: quiet(system),
+    }
 }
 
 /// The context the loop logs for `model` at the scripted provider.
@@ -494,8 +532,10 @@ async fn a_plain_answer_logs_one_step() {
     assert!(!data.interrupted);
 
     // The first request logs an `initial` header, naming the provider, the
-    // model and every tool, then the route's context.
-    let all_tools: Vec<ToolSchema> = harness.tools.schemas();
+    // model and every tool, by name as the prompt assembly orders them,
+    // then the route's context.
+    let mut all_tools: Vec<ToolSchema> = harness.tools.schemas();
+    all_tools.sort_by(|a, b| a.name.cmp(&b.name));
     assert_eq!(
         harness.headers(),
         [RequestHeaderData {
@@ -506,7 +546,7 @@ async fn a_plain_answer_logs_one_step() {
         }]
     );
     assert_eq!(
-        serde_json::to_value(&events[4]).unwrap()["data"]["header"]["tools"][0],
+        serde_json::to_value(&events[4]).unwrap()["data"]["header"]["tools"][1],
         serde_json::json!({
             "name": "echo",
             "description": "The echo tool.",
@@ -527,7 +567,7 @@ async fn a_plain_answer_logs_one_step() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(tools, ["echo", "broken", "stuck"]);
+    assert_eq!(tools, ["broken", "echo", "stuck"]);
 
     let history = harness.sessions.history(&id()).unwrap();
     assert_eq!(history.system.as_deref(), Some("Be brief."));
@@ -724,6 +764,133 @@ async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
     assert_eq!(harness.endings(), [TurnEndReason::Completed]);
     let second = &harness.model.requests()[1];
     assert_eq!(second.messages[2].content, [Block::ToolResult(result)]);
+}
+
+/// dsh's loop assembles each step's prompt and tools from the registry,
+/// with `provider` and `model` variables of its own
+/// (`agent-loop/src/index.ts:389-390`, `agent.ts:272` and `407`). The
+/// identity opens it; tools go by name.
+#[tokio::test]
+async fn the_step_prompt_and_tools_come_from_the_registry() {
+    let harness = Harness::with(
+        vec![text("hi")],
+        Setup {
+            loop_config: LoopConfig::new(ROUTE, MODEL),
+            prompt: SystemPromptConfig {
+                persona_prefix: "You run {{model}} at {{provider}}.".into(),
+                ..SystemPromptConfig::default()
+            },
+        },
+        Vec::new(),
+    )
+    .await;
+    let _ = harness
+        .prompt
+        .section(None, Section::new("guidance", 100.0, "Use tools."))
+        .unwrap();
+    harness.say("hi").await;
+    let request = &harness.model.requests()[0];
+    assert_eq!(
+        request.system.as_deref(),
+        Some(format!("{HARNESS_IDENTITY}\n\nYou run {MODEL} at {ROUTE}.\n\nUse tools.").as_str())
+    );
+    let tools: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(tools, ["broken", "echo", "stuck"]);
+    // The header records the same order.
+    let header = &harness.headers()[0];
+    let logged: Vec<&str> = header
+        .header
+        .tools
+        .iter()
+        .flatten()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(logged, ["broken", "echo", "stuck"]);
+}
+
+/// An assembly that fails ends the turn before its step, as dsh's pre-step
+/// assembles before `step/start` (`agent.ts:272`).
+#[tokio::test]
+async fn a_failed_assembly_ends_the_turn_before_its_step() {
+    let mut prompt = quiet(None);
+    prompt.tool_order = Some(vec!["ghost".into(), TOOL_ORDER_REST.into()]);
+    let harness = Harness::with(
+        vec![text("never")],
+        Setup {
+            loop_config: LoopConfig::new(ROUTE, MODEL),
+            prompt,
+        },
+        Vec::new(),
+    )
+    .await;
+    harness.say("hi").await;
+    assert_eq!(harness.types(), ["turn/start", "turn/end"]);
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("the turn failed: {endings:?}");
+    };
+    assert_eq!(failure.code, "UNKNOWN");
+    assert_eq!(
+        failure.message,
+        "toolOrder lists unregistered tool \"ghost\"; known tools: broken, echo, stuck"
+    );
+    assert!(harness.model.requests().is_empty());
+}
+
+/// A prompt that doesn't render fails its step, as dsh renders it at the
+/// step's start (`agent.ts:407`).
+#[tokio::test]
+async fn a_prompt_that_doesnt_render_fails_its_step() {
+    let harness = Harness::with(
+        vec![text("never")],
+        Setup {
+            loop_config: LoopConfig::new(ROUTE, MODEL),
+            prompt: quiet(Some("Hello {{missing}}.")),
+        },
+        Vec::new(),
+    )
+    .await;
+    harness.say("hi").await;
+    assert_eq!(
+        harness.types(),
+        ["turn/start", "step/start", "step/end", "turn/end"]
+    );
+    let endings = harness.endings();
+    let [TurnEndReason::Error(failure)] = endings.as_slice() else {
+        panic!("the turn failed: {endings:?}");
+    };
+    assert!(
+        failure.message.starts_with(
+            "unknown prompt variable \"{{missing}}\" in section \"deployment:persona-prefix\""
+        ),
+        "{}",
+        failure.message
+    );
+    assert!(harness.model.requests().is_empty());
+}
+
+/// A section registered in one session's scope reaches that agent alone.
+#[tokio::test]
+async fn a_section_scoped_to_one_session_reaches_its_agent_only() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let _ = harness
+        .prompt
+        .section(
+            Some(&Scope::new(id().as_str())),
+            Section::new("child:extra", 50.0, "Only a1."),
+        )
+        .unwrap();
+    harness.say("hi").await;
+    let other = harness.agents.open(SessionId::new("b1")).unwrap();
+    other.followup(user("hello"));
+    idle(other.as_ref()).await;
+    let requests = harness.model.requests();
+    assert_eq!(requests[0].system.as_deref(), Some("Only a1."));
+    assert_eq!(requests[1].system, None);
 }
 
 /// The saved-stream check every harness runs when dropped would catch an
@@ -1530,8 +1697,11 @@ async fn a_tool_registered_between_turns_logs_a_change() {
         [RequestHeaderReason::Initial, RequestHeaderReason::Change]
     );
     let tools = harness.headers()[1].header.tools.clone().unwrap();
-    assert_eq!(tools.len(), 4);
-    assert_eq!(tools[3]["name"], "later");
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(names, ["broken", "echo", "later", "stuck"]);
     assert_eq!(harness.contexts().len(), 1);
 }
 

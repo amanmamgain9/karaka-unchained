@@ -52,7 +52,8 @@ Settings come from the environment:
                       name otherwise)
   KARAKA_MODEL        the model's id; by default claude-opus-5-5 for
                       anthropic and deepseek-flash for deepseek
-  KARAKA_SYSTEM       a system prompt (optional)
+  KARAKA_SYSTEM       the deployment's persona: the system prompt after
+                      Karaka's identity line (optional)
   KARAKA_MAX_TOKENS   the most the model may write (optional; deepseek
                       sends 256000 otherwise)
   KARAKA_EFFORT       low, medium, high, xhigh or max (optional; the

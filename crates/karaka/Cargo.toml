@@ -21,6 +21,8 @@ karaka-agent-loop.workspace = true
 karaka-session.workspace = true
 karaka-tools.workspace = true
 karaka-retry.workspace = true
+# The system prompt the loop assembles each step from.
+karaka-system-prompt.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

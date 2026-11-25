@@ -65,13 +65,14 @@ use serde_json::Value;
 
 use karaka_model::{
     Block, BlockAssembler, ErrorKind, FinishReason, Message, Model, ModelError, Request, Response,
-    Role, ToolCall, Usage,
+    Role, ToolCall, ToolSchema, Usage,
 };
 use karaka_session::{
     AssistantAttemptData, AssistantMessage, AssistantMessageData, CancelCause, CloseCause,
     ContentBlock, Extra, Failure, History, LogError, Seq, SessionEvent, SurfaceIntent, SurfaceOp,
     SystemMessage, SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason, UserMessage,
 };
+use karaka_system_prompt::{AssembleContext, PromptAssembly, Scope, render_prompt};
 
 use crate::agent::{Cancel, Inner};
 use crate::failure::{handler_panicked, model_failure, no_model, other_failure, panicked};
@@ -164,9 +165,23 @@ impl Inner {
             } else {
                 None
             };
+            // The step's prompt and tools, assembled once, before the step
+            // starts, as dsh's pre-step does (`agent.ts:272`). A failure
+            // ends the turn with no step.
+            let assembly = self
+                .shared
+                .prompt
+                .assemble(&AssembleContext::scoped(Scope::new(
+                    self.session.id().as_str(),
+                )))
+                .await
+                .map_err(|error| Stop::Failed(other_failure(&error)))?;
+            if let Some(cause) = cancel.cause() {
+                return Err(Stop::Aborted(cause));
+            }
             step += 1;
             let started = self.session.append(SessionEvent::step_start(turn, step))?;
-            let outcome = self.step(turn, step, input, cancel).await;
+            let outcome = self.step(turn, step, input, &assembly, cancel).await;
             if outcome.is_err() {
                 // If these are refused too, the step's own failure is still
                 // the one to report, as in dsh's `AggregateError`.
@@ -195,9 +210,15 @@ impl Inner {
         turn: u64,
         step: u64,
         input: Option<UserMessage>,
+        assembly: &PromptAssembly,
         cancel: &Cancel,
     ) -> Result<Option<TurnEndReason>, Stop> {
-        let response = self.call_model(turn, step, input, cancel).await?;
+        // Rendered once for the step's attempts (`agent.ts:407`).
+        let prompt =
+            render_prompt(assembly).map_err(|error| Stop::Failed(other_failure(&error)))?;
+        let response = self
+            .call_model(turn, step, input, &prompt, &assembly.tools, cancel)
+            .await?;
 
         // `karaka_model::FinishReason::Paused` says to treat a paused answer as
         // unfinished, like one cut off by the limit, until Karaka can resume
@@ -262,10 +283,12 @@ impl Inner {
         turn: u64,
         step: u64,
         mut input: Option<UserMessage>,
+        prompt: &str,
+        tools: &[ToolSchema],
         cancel: &Cancel,
     ) -> Result<Response, Stop> {
         loop {
-            self.update_system_prompt(turn, step)?;
+            self.update_system_prompt(turn, step, prompt)?;
             if let Some(message) = input.take() {
                 self.session.append(SessionEvent::user(message))?;
             }
@@ -280,7 +303,7 @@ impl Inner {
             let History { system, messages } = self.session.history();
             let mut request = Request::new(config.model.clone(), messages);
             request.system = system;
-            request.tools = self.shared.tools.schemas();
+            request.tools = tools.to_vec();
             request.max_tokens = config.max_tokens;
             request.effort = effort;
             self.log_request(call, &request.tools)?;
@@ -399,8 +422,9 @@ impl Inner {
         }
     }
 
-    /// Logs the system prompt when the session has none yet, or when the
-    /// configured one differs from the one in effect.
+    /// Logs the system prompt when the session has none yet, or when
+    /// `wanted`, the step's rendered prompt, differs from the one in
+    /// effect.
     /// (dsh: `SystemPromptProjection.project`, `agent-loop/src/runtime-context.ts:88-103`.)
     ///
     /// The prompt in effect is read from the history, by `karaka-session`'s
@@ -418,8 +442,7 @@ impl Inner {
     ///   surface is replaced by an empty one, the later ones first, as dsh
     ///   clears a prompt. An appended empty message would derive to
     ///   nothing, and leave the old prompt in effect.
-    fn update_system_prompt(&self, turn: u64, step: u64) -> Result<(), LogError> {
-        let wanted = self.shared.config.system.as_deref().unwrap_or("");
+    fn update_system_prompt(&self, turn: u64, step: u64, wanted: &str) -> Result<(), LogError> {
         let events = self.session.events();
         let nodes: Vec<(Seq, String)> = self
             .session

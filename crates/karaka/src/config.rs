@@ -28,6 +28,8 @@ pub struct Config {
     pub provider: Provider,
     /// The model's id at its provider.
     pub model: String,
+    /// The deployment's persona prefix: the system prompt after the
+    /// identity line.
     pub system: Option<String>,
     pub max_tokens: Option<u32>,
     pub effort: Option<Effort>,

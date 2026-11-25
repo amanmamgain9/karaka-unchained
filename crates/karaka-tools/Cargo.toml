@@ -13,6 +13,8 @@ karaka-kernel.workspace = true
 # A tool's schema and the call the model made are the model seam's types,
 # so a tool is described once, in the shape every provider sends.
 karaka-model.workspace = true
+# The registry is a tool source of the system prompt.
+karaka-system-prompt.workspace = true
 # The registry parses the model's arguments before a tool sees them.
 serde_json.workspace = true
 

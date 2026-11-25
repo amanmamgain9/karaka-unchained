@@ -10,6 +10,7 @@ use karaka_agent::{Agent, Agents, RequestErrorHooks};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
 use karaka_session::{SessionError, SessionId, SessionStore};
+use karaka_system_prompt::SystemPrompt;
 use karaka_tools::ToolRegistry;
 
 use crate::agent::LoopAgent;
@@ -27,10 +28,6 @@ pub struct LoopConfig {
     pub route: String,
     /// The model's id at that route. (dsh: `model`.)
     pub model: String,
-    /// The system prompt, as plain text. dsh assembles its prompt from
-    /// sections in the system-prompt plugin; that isn't ported, so the
-    /// whole prompt is given here.
-    pub system: Option<String>,
     /// The most the model may write in one step. (dsh: `maxTokens`.)
     pub max_tokens: Option<u32>,
     /// (dsh: `reasoningEffort`.)
@@ -38,13 +35,12 @@ pub struct LoopConfig {
 }
 
 impl LoopConfig {
-    /// A config with no system prompt, and the provider's own output limit
-    /// and effort.
+    /// A config with the provider's own output limit and effort. The
+    /// system prompt comes from the `SystemPrompt` registry.
     pub fn new(route: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             route: route.into(),
             model: model.into(),
-            system: None,
             max_tokens: None,
             effort: None,
         }
@@ -58,6 +54,8 @@ pub(crate) struct Shared {
     pub(crate) tools: Arc<ToolRegistry>,
     sessions: Arc<SessionStore>,
     pub(crate) hooks: Arc<RequestErrorHooks>,
+    /// Each step's prompt and tool list are assembled from it.
+    pub(crate) prompt: Arc<SystemPrompt>,
 }
 
 /// The default loop's [`Agents`]: one agent per session, made the first
@@ -74,14 +72,15 @@ pub struct AgentLoop {
 
 impl AgentLoop {
     /// A loop that asks the models in `models`, runs the tools in `tools`,
-    /// keeps its sessions in `sessions`, and runs `hooks` when a request
-    /// fails.
+    /// keeps its sessions in `sessions`, runs `hooks` when a request fails,
+    /// and assembles each step's prompt and tools from `prompt`.
     pub fn new(
         config: LoopConfig,
         models: Arc<ModelRegistry>,
         tools: Arc<ToolRegistry>,
         sessions: Arc<SessionStore>,
         hooks: Arc<RequestErrorHooks>,
+        prompt: Arc<SystemPrompt>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -90,6 +89,7 @@ impl AgentLoop {
                 tools,
                 sessions,
                 hooks,
+                prompt,
             }),
             agents: Mutex::new(HashMap::new()),
         }
@@ -137,8 +137,10 @@ impl fmt::Debug for AgentLoop {
 /// `dsh-agent-loop` plugin, which registers its factory with the agent
 /// registry.)
 ///
-/// It requires the model and tool registries and the session store, and
-/// provides the [`RequestErrorHooks`] port beside `Agents`, empty: the loop
+/// It requires the model and tool registries, the session store and the
+/// system prompt, and registers the prompt variables `provider` (its route)
+/// and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
+/// port beside `Agents`, empty: the loop
 /// runs the hook, so it owns the list. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
 ///
@@ -172,17 +174,26 @@ impl Plugin for AgentLoopPlugin {
             PortId::of::<ModelRegistry>(),
             PortId::of::<ToolRegistry>(),
             PortId::of::<SessionStore>(),
+            PortId::of::<SystemPrompt>(),
         ]
     }
 
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
         let hooks = Arc::new(RequestErrorHooks::new());
+        let prompt = ctx.get::<SystemPrompt>();
+        // dsh reads them off each agent's options; one config serves every
+        // agent here. They stay for the life of the runtime.
+        let route = self.config.route.clone();
+        let _ = prompt.variable(None, "provider", move |_| Some(route.clone()))?;
+        let model = self.config.model.clone();
+        let _ = prompt.variable(None, "model", move |_| Some(model.clone()))?;
         let agents: Arc<dyn Agents> = Arc::new(AgentLoop::new(
             self.config.clone(),
             ctx.get::<ModelRegistry>(),
             ctx.get::<ToolRegistry>(),
             ctx.get::<SessionStore>(),
             Arc::clone(&hooks),
+            prompt,
         ));
         ctx.provide(agents);
         ctx.provide(hooks);

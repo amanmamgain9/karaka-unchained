@@ -16,6 +16,8 @@ karaka-model.workspace = true
 karaka-tools.workspace = true
 karaka-session.workspace = true
 karaka-agent.workspace = true
+# Each step's system prompt and tool list are assembled from the registry.
+karaka-system-prompt.workspace = true
 # The compact stream records each settlement embeds are JSON.
 serde_json.workspace = true
 # Each agent drives its turns on a task of its own. `sync` is for the watch

@@ -1,0 +1,18 @@
+[package]
+name = "karaka-system-prompt"
+description = "The system prompt seam: the registry of prompt sections, runtime context, tool schemas and variables, assembled before each model step"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that puts the registry in a runtime.
+karaka-kernel.workspace = true
+# Tool schemas are the model seam's type.
+karaka-model.workspace = true
+
+# Only for running the async tests.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

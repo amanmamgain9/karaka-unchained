@@ -308,7 +308,11 @@ fn asks_anthropic_and_prints_the_answer() {
     );
     assert!(body.contains(r#""model":"claude-opus-5-5""#), "{body}");
     assert!(body.contains(r#""say hello""#), "{body}");
-    assert!(body.contains(r#""Be brief.""#), "{body}");
+    // The identity line opens the prompt, then `KARAKA_SYSTEM`, the persona.
+    assert!(
+        body.contains(r#""You are an AI agent powered by Karaka.\n\nBe brief.""#),
+        "{body}"
+    );
     assert!(body.contains(r#""max_tokens":200"#), "{body}");
     assert!(
         body.contains(r#""output_config":{"effort":"medium"}"#),
@@ -482,7 +486,8 @@ fn asks_deepseek_in_the_messages_format() {
             r#"{"model":"deepseek-flash","stream":true,"#,
             r#""messages":[{"role":"user","content":[{"type":"text","text":"say hello"}]}],"#,
             r#""max_tokens":393216,"thinking":{"type":"enabled"},"#,
-            r#""output_config":{"effort":"max"},"system":"Be brief."}"#
+            r#""output_config":{"effort":"max"},"#,
+            r#""system":"You are an AI agent powered by Karaka.\n\nBe brief."}"#
         )
     );
 }
@@ -620,7 +625,10 @@ fn chat_runs_the_clock_tool_and_keeps_the_conversation() {
     // The first request offers the tool.
     let first = body(&sent[0]);
     assert!(first.contains(r#""name":"current_time""#), "{first}");
-    assert!(first.contains(r#""Be brief.""#), "{first}");
+    assert!(
+        first.contains(r#""You are an AI agent powered by Karaka.\n\nBe brief.""#),
+        "{first}"
+    );
     // The second carries the tool's answer back.
     let second = body(&sent[1]);
     assert!(second.contains(r#""tool_use_id":"toolu_1""#), "{second}");

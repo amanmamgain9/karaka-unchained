@@ -24,6 +24,7 @@ use karaka_session::{
     CancelCause, Entry, Failure, SessionEvent, SessionId, SessionStore, SessionsPlugin,
     TurnEndReason, UserMessage, UserSource,
 };
+use karaka_system_prompt::SystemPromptPlugin;
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -160,6 +161,7 @@ impl Harness {
         let samples = Mutex::new(VecDeque::from(samples));
         let runtime = Runtime::start(vec![
             Box::new(ModelsPlugin),
+            Box::new(SystemPromptPlugin::default()),
             Box::new(ToolsPlugin),
             Box::new(SessionsPlugin),
             Box::new(AgentLoopPlugin::new(LoopConfig::new(ROUTE, "mock-model"))),
@@ -576,6 +578,7 @@ async fn a_cancel_from_an_earlier_handler_stops_the_retry() {
     // its own, before the retry handler.
     let runtime = Runtime::start(vec![
         Box::new(ModelsPlugin),
+        Box::new(SystemPromptPlugin::default()),
         Box::new(ToolsPlugin),
         Box::new(SessionsPlugin),
         Box::new(AgentLoopPlugin::new(LoopConfig::new(ROUTE, "mock-model"))),

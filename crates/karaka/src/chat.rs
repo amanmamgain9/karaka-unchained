@@ -24,6 +24,7 @@ use karaka_session::{
 };
 use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
+use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tools::{ToolRegistry, ToolsPlugin};
 
 use crate::config::Config;
@@ -35,16 +36,23 @@ const SESSION: &str = "chat";
 /// How much of a tool's result its line shows.
 const SHORT_RESULT: usize = 80;
 
-/// The plugins `chat` and `ask` both run: the model provider, the tools and
-/// sessions, the agent loop, and the retry plugin, which retries a failed
+/// The plugins `chat` and `ask` both run: the model provider, the system
+/// prompt, the tools and sessions, the agent loop, and the retry plugin,
+/// which retries a failed
 /// request as the provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
-    loop_config.system = config.system;
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
 
+    // `KARAKA_SYSTEM` is the deployment's persona: after the identity line,
+    // before anything else.
+    let prompt = SystemPromptConfig {
+        persona_prefix: config.system.unwrap_or_default(),
+        ..SystemPromptConfig::default()
+    };
     let mut plugins: Vec<Box<dyn DynPlugin>> = config.provider.plugins();
+    plugins.push(Box::new(SystemPromptPlugin::new(prompt)));
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));

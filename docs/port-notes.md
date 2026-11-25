@@ -1286,3 +1286,144 @@ codecs and the migration verifier are not ported.
   `inheritedEventCount` beyond 0, in the store and `DurableSessions`.
 - **Message projections in general.** Only `image/offload`'s admission is
   ported, and its effect is moot while Karaka sends no images.
+
+## System prompt
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25: `packages/core/system-prompt`
+and its three spec files.*
+
+### What is done
+
+- **One crate, `karaka-system-prompt`**, the seam and its implementation
+  together. dsh's `SystemPrompt` is one concrete registry with nothing
+  behind it to swap: no backend, no second implementation. That is
+  Karaka's session-store shape, not persistence's port-plus-backend.
+  `SystemPromptPlugin` provides the `SystemPrompt` port in the static
+  kernel.
+- **The registry**, with dsh's rules and words:
+  - **Sections:** static or worked out per assembly, ascending `order`,
+    ties by name in UTF-16 code-unit order, as JavaScript compares. A
+    `complete` section is the whole prompt, restored after the listeners,
+    and two fail the assembly. Duplicates and non-finite orders are
+    refused per layer.
+  - **Variables:** `[a-z][a-z0-9_]*`, resolved per assembly, scoped ones
+    shadowing global ones, providers added during an assembly read in it.
+    Rendering is strict: an unknown or valueless reference and a malformed
+    group fail, a lone `{{` is prose, values aren't scanned again, and
+    `interpolate: false` keeps text literal.
+  - **Tool sources:** their schemas taken before any is asked, then
+    ordered by name or by `tool_order`, with a known-names universe for
+    tools hidden in one assembly. The rest entry `<unlisted-tools>` is
+    reserved.
+  - **Runtime context:** order, `required`, suppression (global, scoped,
+    and `include_runtime_context: false`), `refresh_context`, and the
+    snapshot renderers.
+  - **Listeners:** dsh's `system-prompt/assemble` waterfall, as
+    `on_assemble` with a `next` that runs the rest. Scoped listeners shape
+    only their scope's assemblies.
+- **Config:** `include_harness_identity` (true), `include_runtime_context`
+  (true), `persona_prefix` at order 0, `persona_suffix` at 10200, and
+  `tool_order`. A duplicate or a missing rest entry fails at setup; a
+  listed name no source knows fails every assembly.
+- **Agent scoping:** a `Scope` is one agent's, named by its session id. The
+  loop assembles for its session's scope, so a contribution registered
+  there shadows a global one of the same name for that agent alone.
+- **The loop** follows dsh's pre-step and step (`agent.ts:272`, `407-442`):
+  - Each step assembles once, after claiming its input and before
+    `step/start`; a failed assembly ends the turn with no step, under
+    `UNKNOWN`.
+  - It renders the prompt once at the step's start; a failed rendering
+    fails the step.
+  - Every attempt logs that prompt through the existing system-message
+    projection and sends the assembly's tools. The `request/header`
+    records the same tool order.
+  - The loop plugin registers dsh's `provider` and `model` variables
+    (`agent-loop/src/index.ts:389-390`).
+  - `LoopConfig` no longer has a `system` field.
+  - What the log records keeps dsh's shape: `system/message` events and the
+    request header, unchanged apart from their content.
+- **Tools:** `ToolsPlugin` requires the prompt port and registers the
+  registry as a tool source, as dsh's tool runtime does
+  (`core/tools/src/index.ts:857`). So tools now reach the model by name,
+  not in registration order.
+- **The CLI:** `KARAKA_SYSTEM` is the persona prefix, so a request's system
+  prompt is the identity line, a blank line, then the user's text. `ask`
+  and `chat` both get it. No new environment variable.
+- **Tests:**
+  - The three spec files, where they apply: `tests/system_prompt.rs`,
+    `tests/scoped.rs`, `tests/tool_order.rs`, and the renderer's cases in
+    `assembly.rs`.
+  - Loop tests, each failing first: the prompt and tools come from the
+    registry with the identity first and tools by name; a failed assembly
+    ends the turn before its step; a prompt that doesn't render fails its
+    step; a scoped section reaches its own session alone.
+  - Existing loop tests run with the identity off (`quiet`), so their
+    prompts stay exactly their persona.
+
+### Where it differs from dsh
+
+- **The identity line is `You are an AI agent powered by Karaka.`**, at
+  dsh's order of −1000. dsh's names DeepSeek Harness. This is deliberate:
+  Karaka is provider-neutral.
+- **Only the placements of contributors Karaka has are kept**: the
+  identity (−1000), the persona prefix (0) and suffix (10200). There is no
+  context-order table, since no context contributor exists. Listed below.
+- **No `system-prompt/change` event.** Karaka has no event bus, so the
+  specs' change and rollback cases are left out.
+- **A registration is taken back by `Registration::remove`.** dsh's Cordis
+  effects also end when their fiber is disposed. Dropping a registration
+  keeps the contribution.
+- **One level of scope**, one agent's. dsh's scopes nest, farthest first.
+- **`AssembleContext` is only the scope.** dsh's also carries a signal and
+  merge-extensible fields, such as the agent its variables read options
+  from. `provider` and `model` are the loop's one config, the same for
+  every agent.
+- **Listeners run in the order added.** Cordis's `prepend` isn't ported.
+- **The duplicate-name message for a global layer** says to register "in
+  that agent's scope" where dsh's names `agent.ctx`.
+- **Tool schemas have no `deferLoading`.** Karaka's model seam doesn't
+  model it.
+- **Runtime context isn't shown to the model yet.** The registry
+  assembles and refreshes it, but the loop doesn't yet project it as dsh's
+  `RuntimeContextProjection` does: a user-role snapshot appended when it
+  changes, and refreshed per attempt. No contributor of context exists in
+  Karaka.
+
+### dsh's other contributors, not ported
+
+These are section placements dsh allocates (`SECTION_ORDERS`), whose
+contributors are other packages. None is in Karaka.
+
+- `PLAN_POLICY` 500 (plan mode)
+- `TEAM_POLICY` 600
+- `PTC_ONLY` 800 (tools)
+- `FILE_REFERENCE` 900
+- per-tool guidance:
+  - shell: `TOOL_BASH` 1000, `TOOL_PWSH` 1010
+  - files: `TOOL_READ` 1100, `TOOL_WRITE` 1200, `TOOL_EDIT` 1300,
+    `TOOL_GLOB` 1400, `TOOL_GREP` 1500
+  - processes: `TOOL_JOBS` 1600, `TOOL_PTY` 1700
+  - web: `TOOL_WEB_SEARCH` 2000, `TOOL_WEB_FETCH` 2100
+  - `TOOL_LSP` 2200, `TOOL_SESSION_QUERY` 2300, `TOOL_GOAL` 2400
+  - agents and workflows: `TOOL_WORKFLOW` 2600, `TOOL_RALPH` 2700,
+    `TOOL_SUBAGENT` 2800, `TOOL_REPORT` 2900
+  - `TOOL_COMPUTER_USE` 3000
+- `MCP_SERVERS` 3100
+- `TOOLS_SDK` 5000 (tools: the generated SDK and collapse sections)
+- `DELIVERABLE_FILE_REFERENCES` 9000
+- `STRUCTURED_OUTPUT` 9900 (subagents)
+- `HARNESS_SOURCE` 10000, `WEB_SURFACE` 10100 (harness dev context)
+
+And dsh's context placements (`CONTEXT_ORDERS`):
+
+- `WORKING_DIRECTORY` 100
+- `SANDBOX_POLICY` 110
+- `APPROVAL_POLICY` 115
+- `SUBAGENT_DELEGATION` 120
+- `TEAM_IDENTITY` 125
+- `HARNESS_SOURCE` 200
+- `WEB_SURFACE` 210
+
+Personas, presets and skills are separate dsh plugins and are out of
+scope. dsh's assembly pulls in no guidance of its own beyond the identity
+line; all of the above comes from the packages that own those facts.

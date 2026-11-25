@@ -215,16 +215,30 @@ impl Plugin for EchoPlugin {
 
 #[tokio::test]
 async fn a_plugin_registers_its_tool_in_the_port() {
-    let runtime = Runtime::start(vec![Box::new(EchoPlugin), Box::new(ToolsPlugin)])
-        .await
-        .expect("the runtime starts");
-    // The registry's plugin starts first, though it was listed second.
-    assert_eq!(runtime.plugins(), ["tools", "echo"]);
+    let runtime = Runtime::start(vec![
+        Box::new(EchoPlugin),
+        Box::new(ToolsPlugin),
+        Box::new(karaka_system_prompt::SystemPromptPlugin::default()),
+    ])
+    .await
+    .expect("the runtime starts");
+    // The registry's plugin starts before the tool's, though it was listed
+    // second, and after the system prompt it requires.
+    assert_eq!(runtime.plugins(), ["system-prompt", "tools", "echo"]);
 
     let registry = runtime.get::<ToolRegistry>();
     assert_eq!(registry.schemas(), [schema("echo")]);
     let output = registry.execute(&call("echo", "{}")).await;
     assert_eq!(output.content, "call_1 echo {}");
+
+    // The registry is a tool source of the system prompt, as dsh's tool
+    // runtime is.
+    let assembly = runtime
+        .get::<karaka_system_prompt::SystemPrompt>()
+        .assemble(&karaka_system_prompt::AssembleContext::default())
+        .await
+        .unwrap();
+    assert_eq!(assembly.tools, [schema("echo")]);
 }
 
 /// Compiles only if the registry can be shared between threads, as a port
