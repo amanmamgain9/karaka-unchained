@@ -1,0 +1,19 @@
+[package]
+name = "karaka-fs"
+description = "The filesystem seam: stable targets, text reads, raw byte reads, listings, and guarded atomic writes and edits, for one execution world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Traits and small types, with no executor of their own.
+[dependencies]
+# Only `sync`, for the watch channel behind an abort signal. It needs no
+# runtime.
+tokio = { workspace = true, features = ["sync"] }
+# A streamed read is a `Stream` of text chunks.
+futures-core.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

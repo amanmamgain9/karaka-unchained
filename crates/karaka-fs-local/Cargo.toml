@@ -1,0 +1,26 @@
+[package]
+name = "karaka-fs-local"
+description = "The host filesystem behind the filesystem seam: realpath identities, UTF-8 text, and writes staged privately and published atomically"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that provides the port.
+karaka-kernel.workspace = true
+# The port this backend implements.
+karaka-fs.workspace = true
+# `fs` and `io-util` for the file I/O, `sync` for the per-target write locks,
+# `macros` for racing a read against its abort signal.
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "macros"] }
+# A streamed read is a `Stream`, made with `unfold`.
+futures-core.workspace = true
+futures-util.workspace = true
+# Watching, as dsh's chokidar does: inotify on Linux. Pinned to a release some
+# weeks old. No default features: those add macOS's FSEvents.
+notify = { version = "=8.2.1", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

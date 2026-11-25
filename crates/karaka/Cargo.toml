@@ -25,6 +25,8 @@ karaka-retry.workspace = true
 karaka-system-prompt.workspace = true
 # The state domains project from each session's log.
 karaka-session-projection.workspace = true
+# The host's files, behind the filesystem seam.
+karaka-fs-local.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

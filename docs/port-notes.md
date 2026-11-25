@@ -1648,3 +1648,185 @@ and `tests/registry.spec.ts`).*
 - **A restored session has a fresh header** when it comes in through
   `SessionStore::restore(id, entries)`, which is kept for tests and
   fixtures. Storage goes through `restore_with` and the stored header.
+
+## Filesystem
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25: `fs/fs` (`src/index.ts`,
+`src/types.ts`, `tests/service.spec.ts`) and `fs/fs-local` (`src/index.ts`,
+`src/fsio.ts`, and the `filesystem`, `fsio` and `watch` specs).*
+
+### What is done
+
+- **The seam** (`karaka-fs`):
+  - `FileSystem` is the `dyn FileSystem` port. It has:
+    - `resolve`, `process_path`, `process_path_from_host_path` (by
+      default `None`), `file_url` and `contains`;
+    - `stat` and `lstat`;
+    - `read_text`, `stream_text`, `read_bytes` and `read_byte_range`;
+    - `list_dir`;
+    - `write_text` and `edit_text`;
+    - `watch`, which by default refuses with dsh's `FS_IO_ERROR` message.
+  - The vocabulary is all of `types.ts`:
+    - `FsTargetKey`, `FsVersion` and `FsObservation`;
+    - `FsTarget`, `FsInfo`, `FsPathInfo` and `FsDirEntry`;
+    - `FsWriteIntent` (`CreateIfAbsent`, `ReplaceIfVersion`) and
+      `FsWriteOutcome`;
+    - `FsEditRequest` and `FsEditOutcome`;
+    - `FsErrorCode`, with dsh's thirteen names;
+    - `FsError`: a code, a message, and a chained source.
+  - Calls return boxed futures, as the persistence port's do.
+- **Cancellation.** Every call takes an optional `AbortSignal`, made by an
+  `AbortController` (dsh's names). An aborted one ends the call with
+  `FS_ABORTED` and dsh's "`verb` aborted" message, at dsh's check points.
+  The agent seam's `Cancellation` wasn't reused: it carries a turn's
+  `CancelCause`, and the filesystem seam shouldn't depend on the agent
+  seam.
+- **The backend** (`karaka-fs-local`):
+  - `LocalFileSystem` takes `LocalFsConfig { cwd, diff_basis_max_bytes }`.
+    The defaults are the process's directory and 10 MiB.
+  - `LocalFsPlugin` provides the port, and the binary mounts it.
+  - **Resolution.** The key is the realpath. A missing target keys on its
+    nearest real ancestor, with the missing part appended, so the key is
+    the same before and after it is created. A display path with a `..`
+    segment is kept as spelled, so the kernel resolves it physically;
+    `..` through a missing directory is refused. A path under a file is
+    `FS_NOT_FOUND`.
+  - `paths.rs` reimplements Node's POSIX `resolve`, `dirname` and
+    `basename`. `std::path` reads `/a/..` differently, and dsh relies on
+    Node's reading.
+  - **Versions** are dsh's string: `dev:ino:size:mtimeNs:ctimeNs`.
+  - **Reads.**
+    - Text reads refuse a NUL in the first 8 KiB, and invalid UTF-8. A
+      leading BOM is dropped, as Node's `TextDecoder` drops it, and so an
+      edit writes the file back without it, as dsh's does.
+    - `stream_text` decodes across 64 KiB chunks. Its refusals arrive as
+      the stream's first item, as dsh's generator throws on its first
+      step.
+    - `read_bytes` refuses by the stat size, then reads one byte past the
+      cap, so a file that grew since the stat is caught.
+    - `read_byte_range` reads only the window.
+  - **Listing.** Children are in name order. Each target is resolved from
+    the listed directory's own realpath, with metadata only while the
+    child still exists. Errors use dsh's wording (`not found`,
+    `permission denied`, or the I/O error).
+  - **Writes.**
+    - The new content is written to an owner-only (0o600) temp file, in a
+      private (0o700) staging directory beside the target. It is synced,
+      given the existing file's mode, and published with `rename`.
+    - A guarded create publishes with a hard link instead, which never
+      replaces anything. If it fails, the target is inspected to tell
+      dsh's cases apart:
+      - a file there: `FS_NOT_OBSERVED`;
+      - something else there: `FS_NOT_REGULAR_FILE`;
+      - the link reported a collision that has since vanished:
+        `FS_NOT_OBSERVED`;
+      - anything else: `FS_IO_ERROR`.
+    - The staging directory is always removed. A cleanup failure after
+      publication is ignored; one before it is reported with dsh's
+      "write failed (…) and temp cleanup failed (…)".
+    - The overwrite diff basis, `before`, is best-effort. It is read from
+      the opened file itself and declined when either side reaches the
+      limit (in UTF-8 bytes), or when the old file is binary, invalid
+      UTF-8, changed size while read, or gone.
+  - **Edits.**
+    - The freshness check comes before matching, and a missing target is
+      stale either way.
+    - Matching is literal after CRLF is normalized. An empty search or no
+      match is `FS_EDIT_NOT_FOUND`; several matches without `replace_all`
+      are `FS_AMBIGUOUS_EDIT`.
+    - Line endings are detected on the first 4096 UTF-16 units and
+      restored on write-back.
+  - **Turns per target.** Writes and edits of one key take turns through a
+    fair async lock, so of two at one version, one wins and the other is
+    stale. A key's lock is forgotten once no one waits on it.
+  - **Watch** uses `notify` 8.2.1, without default features (inotify on
+    Linux). The lockfile pins `notify-types` to 2.2.0, since 2.3.x is
+    under three weeks old.
+    - A directory is watched itself, and a file through its parent,
+      neither recursively.
+    - A file hears only its own entry. Reads (`Access` events) aren't
+      changes, as chokidar doesn't report them.
+    - Failures are heard as `FS_IO_ERROR`. A watch that can't start is
+      heard and refused.
+    - Nothing is heard once `close` begins.
+- **Tests:**
+  - every `service.spec` case, against an in-memory backend;
+  - every POSIX `filesystem.spec` and `fsio.spec` case that needs no
+    module mock;
+  - the `watch.spec` filtering cases, against synthetic `notify` events,
+    as dsh's spec drives a mocked chokidar;
+  - real-inotify watch cases;
+  - Karaka's own:
+    - a dropped write leaves no staging;
+    - an abort while staging publishes nothing;
+    - BOM handling;
+    - `file_url` escaping;
+    - the per-target locks are released, including after an abort and a
+      race;
+    - the plugin, including that the kernel refuses a second provider of
+      the port.
+
+### Left out
+
+- **Windows** (`win32.ts`, its DACL-preserving replacement, and the
+  drive-relative paths). Karaka targets Unix for now. `karaka-fs-local`
+  fails to compile elsewhere with a `compile_error!` that says why.
+- **Sandboxing.** `sandboxMode` and the `sandboxPolicy` argument of
+  writes and edits come with `fs-sandbox`, which is out of scope, as are
+  the tools, fs-search, fs-observation-policy and fs-ssh.
+- **The `fs/write-intent`, `fs/edit-intent` and `fs/observed` events.**
+  These are the observation policy's, so they come with it.
+  `FsObservation` is kept for it.
+- **Cases that mock Node's modules:**
+  - stat and lstat held mid-probe;
+  - a descriptor that shrinks, grows or stops being regular after its
+    stat;
+  - a forged non-errno fault;
+  - cancellation between a diff read's chunks.
+
+  Rust can't swap `std::fs` out. The code follows dsh's steps there, and
+  the abort checks sit at the same points.
+- **Registration and disposal cases.** These are Cordis's; the kernel has
+  no unload. The "duplicate service" case is the kernel's refusal of a
+  second provider.
+
+### Where it differs from dsh
+
+- **Raw errors are `FsError`s.** Where dsh lets a Node error through (a
+  failed rename, a staging directory that exists, a probe's I/O fault),
+  here it is `FS_PERMISSION_DENIED` for a permission error and
+  `FS_IO_ERROR` otherwise. The message is "cannot `verb` "path": …" and
+  the `io::Error` is the source. The I/O text is Rust's, not Node's.
+- **A dropped call cleans up.** Dropping a write's future removes its
+  staging directory, and dropping any call frees its target's turn. dsh's
+  promises can't be dropped.
+- **Aborts are checked at points**, before and after each step, not inside
+  a syscall as Node's `readFile` and streams can. An abort raised before
+  the future is first polled is caught at the first check, which is what
+  dsh's "aborted while in flight" cases amount to.
+- **Name order is byte order.** dsh sorts a listing with `localeCompare`
+  (ICU collation), which differs for case and accents. Rust has no ICU.
+- **Paths are UTF-8.** A realpath that isn't UTF-8 fails to resolve with
+  `FS_IO_ERROR`, and a listed name that isn't is read lossily. Node reads
+  both lossily.
+- **The diff limit** refuses only 0, with
+  "fs-local: diff_basis_max_bytes must be a positive integer". dsh's other
+  refusals are fractional or unsafe numbers, which a `u64` can't be, and
+  V8's string-allocation ceiling, which has no Rust counterpart.
+- **Test hooks are synchronous closures** (`Internals`), and the Windows
+  hooks are left out. dsh's are async functions on `internals`.
+- **Watching:**
+  - It is `notify`, not chokidar. Notify's watch is active as soon as
+    `watch` returns, so there is no `ready` to wait for.
+  - Init errors are `FsError`s, not dsh's raw rejection.
+  - A missing parent directory is refused by notify; I haven't checked
+    what chokidar does there.
+- **The seam has no plugin.** Its port is a trait that only a backend can
+  provide, as with `SessionPersistence`.
+- **On this machine the real-inotify watch cases skip.** This user's
+  processes hold every inotify instance the system allows
+  (`fs.inotify.max_user_instances`, 128), so `inotify_init` fails with
+  `EMFILE` for any new process, even in a fresh user namespace. The cases
+  say so and return, as dsh's socket case does where sockets are refused.
+  The watch filtering is covered by the synthetic-event unit tests either
+  way.

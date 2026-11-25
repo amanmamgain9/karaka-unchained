@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use karaka_agent::Agents;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
+use karaka_fs_local::LocalFsPlugin;
 use karaka_kernel::{DynPlugin, Runtime};
 use karaka_model::Block;
 use karaka_retry::RetryPlugin;
@@ -38,9 +39,9 @@ const SESSION: &str = "chat";
 const SHORT_RESULT: usize = 80;
 
 /// The plugins `chat` and `ask` both run: the model provider, the system
-/// prompt, the tools and sessions, the sessions' projections, the agent
-/// loop, and the retry plugin, which retries a failed request as the
-/// provider's policy says before the turn gives up.
+/// prompt, the tools and sessions, the sessions' projections, the host's
+/// files, the agent loop, and the retry plugin, which retries a failed
+/// request as the provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
@@ -57,6 +58,8 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
     plugins.push(Box::new(SessionProjectionsPlugin));
+    // The host's files, relative paths from the process's directory.
+    plugins.push(Box::new(LocalFsPlugin::default()));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins
