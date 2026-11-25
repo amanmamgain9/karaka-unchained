@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karaka_session::{Entry, SessionHeader, SessionId};
-use karaka_session_jsonl::{JsonlConfig, JsonlPersistence, generation_path};
+use karaka_session_jsonl::frames::{
+    compress_frame, decompress_frame, decompress_prefix, scan_frames,
+};
+use karaka_session_jsonl::{Compression, JsonlConfig, JsonlPersistence, generation_path};
 use karaka_session_persistence::{CreateOptions, SessionAccess, SessionPersistence};
 use serde_json::{Value, json};
 
@@ -32,22 +35,31 @@ impl TempRoot {
         &self.0
     }
 
-    /// A backend over this root, as another process would start one.
+    /// A backend over this root writing raw lines, as another process
+    /// would start one. The tests that read a log's lines use it.
     pub fn backend(&self) -> JsonlPersistence {
-        JsonlPersistence::new(JsonlConfig {
-            root: self.0.clone(),
-        })
-        .unwrap()
+        self.backend_in(Compression::None)
     }
 
-    /// The current generation's path for a session.
+    /// A backend over this root in `compression`.
+    pub fn backend_in(&self, compression: Compression) -> JsonlPersistence {
+        JsonlPersistence::new(JsonlConfig::new(self.0.clone()).with_compression(compression))
+            .unwrap()
+    }
+
+    /// The current generation's raw path for a session.
     pub fn log(&self, cwd: Option<&str>, id: &str) -> PathBuf {
-        generation_path(&self.0, cwd, id, 4).unwrap()
+        self.log_in(cwd, id, Compression::None)
     }
 
-    /// The path of a session's log in `version`.
+    /// The current generation's path for a session in `compression`.
+    pub fn log_in(&self, cwd: Option<&str>, id: &str, compression: Compression) -> PathBuf {
+        generation_path(&self.0, cwd, id, 4, compression).unwrap()
+    }
+
+    /// The raw path of a session's log in `version`.
     pub fn generation(&self, cwd: Option<&str>, id: &str, version: u64) -> PathBuf {
-        generation_path(&self.0, cwd, id, version).unwrap()
+        generation_path(&self.0, cwd, id, version, Compression::None).unwrap()
     }
 
     /// Writes `content` as a session's log in `version`, making its
@@ -166,4 +178,74 @@ pub fn rows(path: &Path) -> Vec<Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+// --- Zstandard ---
+
+/// The frame magic.
+pub const MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// A checksummed frame holding `rows` as lines.
+pub fn frame_of(rows: &[Value]) -> Vec<u8> {
+    let text: String = rows.iter().map(|row| format!("{row}\n")).collect();
+    compress_frame(text.as_bytes()).unwrap()
+}
+
+/// The plaintext of every frame of a compressed log, which must have no
+/// torn tail. (zstd.spec.ts: `decodeCompleteFrames`.)
+pub fn decode_complete_frames(bytes: &[u8]) -> String {
+    let scan = scan_frames(bytes, None).unwrap();
+    assert_eq!(scan.torn_start, None, "the log has a torn tail");
+    scan.frames
+        .iter()
+        .map(|frame| String::from_utf8(decompress_frame(&bytes[frame.clone()]).unwrap()).unwrap())
+        .collect()
+}
+
+/// How many complete frames a compressed log holds.
+pub fn frame_count(bytes: &[u8]) -> usize {
+    scan_frames(bytes, None).unwrap().frames.len()
+}
+
+/// A frame of `plaintext`, cut so a scan finds it torn and what decodes
+/// from it satisfies `accepts`. (zstd.spec.ts: `tornFrame`.)
+pub fn torn_frame(plaintext: &str, accepts: impl Fn(&str) -> bool) -> Vec<u8> {
+    let frame = compress_frame(plaintext.as_bytes()).unwrap();
+    let length = frame.len();
+    let mut ends = vec![length - 1, length - 4];
+    ends.extend([0.9, 0.75, 0.6, 0.5, 0.4, 0.25].map(|ratio| (length as f64 * ratio) as usize));
+    for end in ends {
+        let candidate = &frame[..end];
+        if scan_frames(candidate, None).unwrap().torn_start != Some(0) {
+            continue;
+        }
+        let decoded = String::from_utf8_lossy(&decompress_prefix(candidate)).into_owned();
+        if accepts(&decoded) {
+            return candidate.to_vec();
+        }
+    }
+    panic!("no cut gives the torn frame asked for");
+}
+
+/// Deterministic text that barely compresses, so a frame spans several
+/// blocks. (zstd.spec.ts: `deterministicNoise`.)
+pub fn noise(length: usize) -> String {
+    let mut state: u32 = 0x1234_5678;
+    (0..length)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            char::from(33 + (state % 90) as u8)
+        })
+        .collect()
+}
+
+/// Appends `bytes` to the file at `path`.
+pub fn append_bytes(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
 }

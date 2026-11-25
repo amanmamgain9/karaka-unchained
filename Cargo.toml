@@ -32,6 +32,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 # Reads the HTTP date a `Retry-After` header can hold. No dependencies.
 httpdate = "1"
+# libzstd, for the JSONL backend's compressed session logs, as dsh writes
+# them. Pinned to a release some weeks old. No default features: those add
+# decoding of pre-1.0 zstd formats and the dictionary builder, which
+# session logs never use.
+zstd = { version = "=0.14.3", default-features = false }
 
 # The workspace's own crates, so each one names its siblings the same way.
 karaka-kernel = { path = "crates/karaka-kernel" }

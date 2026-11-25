@@ -601,14 +601,19 @@ fn a_second_chat_in_a_stored_session_carries_on_the_conversation() {
     let logs: Vec<_> = std::fs::read_dir(&root)
         .unwrap()
         .flat_map(|project| std::fs::read_dir(project.unwrap().path()).unwrap())
-        .map(|session| session.unwrap().path().join("session.v4.jsonl"))
+        .map(|session| session.unwrap().path().join("session.v4.jsonl.zstd"))
         .collect();
     assert_eq!(logs.len(), 1);
     assert!(logs[0].parent().unwrap().ends_with("notes"));
-    let stored = std::fs::read_to_string(&logs[0]).unwrap();
+    // Compressed, the default: the header is the first frame's one line.
+    let stored = std::fs::read(&logs[0]).unwrap();
+    let frames = karaka_session_jsonl::frames::scan_frames(&stored, Some(1)).unwrap();
+    let header =
+        karaka_session_jsonl::frames::decompress_frame(&stored[frames.frames[0].clone()]).unwrap();
+    let header = String::from_utf8(header).unwrap();
     assert!(
-        stored.starts_with(r#"{"type":"session","version":4,"id":"notes","#),
-        "{stored}"
+        header.starts_with(r#"{"type":"session","version":4,"id":"notes","#),
+        "{header}"
     );
 
     // A second run in the same session carries the conversation on.

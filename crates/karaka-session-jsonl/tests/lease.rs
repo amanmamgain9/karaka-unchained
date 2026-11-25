@@ -209,11 +209,11 @@ fn lease_holder_child() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let persistence =
-            karaka_session_jsonl::JsonlPersistence::new(karaka_session_jsonl::JsonlConfig {
-                root: root.into(),
-            })
-            .unwrap();
+        let persistence = karaka_session_jsonl::JsonlPersistence::new(
+            karaka_session_jsonl::JsonlConfig::new(root)
+                .with_compression(karaka_session_jsonl::Compression::None),
+        )
+        .unwrap();
         let handle = persistence
             .create(meta("held", None), CreateOptions::default())
             .await

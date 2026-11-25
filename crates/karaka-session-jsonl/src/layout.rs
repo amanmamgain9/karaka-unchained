@@ -7,7 +7,8 @@
 //! <root>/
 //!   --<normalized-cwd>--/     a readable project directory, or _no-cwd/
 //!     <encoded-id>/           the session's own directory
-//!       session.v4.jsonl      the current generation, raw lines
+//!       session.v4.jsonl.zstd the current generation, zstd frames (the
+//!                             default), or session.v4.jsonl, raw lines
 //!       session.lock          the write lock
 //! ```
 //!
@@ -22,10 +23,55 @@ pub const LOCK_FILENAME: &str = "session.lock";
 /// The project directory of a session with no cwd.
 const NO_CWD: &str = "_no-cwd";
 
-/// What a compressed generation adds to its name. The compressed encoding
-/// isn't ported yet; this backend writes raw lines, and refuses a root that
-/// holds the other encoding, as dsh does.
+/// What a compressed generation adds to its name.
 const ZSTD_SUFFIX: &str = ".zstd";
+
+/// A log's physical encoding. A root holds one: a backend refuses one in
+/// the other encoding. (dsh: `JsonlCompression`, `compression` in the
+/// backend's config.)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Compression {
+    /// Checksummed Zstandard frames: one for the header, one per batch.
+    /// dsh's default. (dsh: `'zstd'`.)
+    #[default]
+    Zstd,
+    /// Newline-delimited UTF-8 lines, which an outside reader can read
+    /// directly. (dsh: `'none'`.)
+    None,
+}
+
+impl Compression {
+    /// Its name in dsh's config, as messages quote it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::None => "none",
+        }
+    }
+
+    /// What its logs end with. (dsh: `logSuffix`.)
+    pub fn log_suffix(self) -> &'static str {
+        match self {
+            Self::Zstd => ".jsonl.zstd",
+            Self::None => ".jsonl",
+        }
+    }
+
+    /// The other encoding.
+    pub(crate) fn opposite(self) -> Self {
+        match self {
+            Self::Zstd => Self::None,
+            Self::None => Self::Zstd,
+        }
+    }
+
+    fn compression_suffix(self) -> &'static str {
+        match self {
+            Self::Zstd => ZSTD_SUFFIX,
+            Self::None => "",
+        }
+    }
+}
 
 /// Whether `unit` (one UTF-16 code unit) may appear as itself.
 fn safe(unit: u16) -> bool {
@@ -118,14 +164,17 @@ pub fn session_dir(root: &Path, cwd: Option<&str>, id: &str) -> Result<PathBuf, 
     Ok(project_dir(root, cwd)?.join(encode_segment(id)?))
 }
 
-/// The raw log's name for one format generation: `session.jsonl` for v0,
-/// `session.vN.jsonl` after. (dsh: `sessionFormatLogFilename`.)
-pub fn generation_filename(version: u64) -> String {
-    if version == 0 {
+/// The log's name for one format generation in `compression`:
+/// `session.jsonl` for v0, `session.vN.jsonl` after, with `.zstd` added
+/// when compressed. (dsh: `generationLogFilename` and
+/// `sessionFormatLogFilename`.)
+pub fn generation_filename(version: u64, compression: Compression) -> String {
+    let raw = if version == 0 {
         "session.jsonl".into()
     } else {
         format!("session.v{version}.jsonl")
-    }
+    };
+    format!("{raw}{}", compression.compression_suffix())
 }
 
 /// The path of a session's log in one generation. (dsh:
@@ -135,26 +184,18 @@ pub fn generation_path(
     cwd: Option<&str>,
     id: &str,
     version: u64,
+    compression: Compression,
 ) -> Result<PathBuf, String> {
-    Ok(session_dir(root, cwd, id)?.join(generation_filename(version)))
-}
-
-/// Which physical encoding a generation file uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Encoding {
-    /// Raw lines, which this backend reads and writes.
-    Raw,
-    /// Zstandard frames, which it doesn't yet.
-    Zstd,
+    Ok(session_dir(root, cwd, id)?.join(generation_filename(version, compression)))
 }
 
 /// The format version a canonical generation filename names, and its
 /// encoding; `None` for any other name, such as a temporary file, `.v0`,
 /// a leading zero or capitals. (dsh: `parseGenerationLogFilename`.)
-pub(crate) fn parse_generation_filename(name: &str) -> Option<(u64, Encoding)> {
+pub(crate) fn parse_generation_filename(name: &str) -> Option<(u64, Compression)> {
     let (raw, encoding) = match name.strip_suffix(ZSTD_SUFFIX) {
-        Some(raw) => (raw, Encoding::Zstd),
-        None => (name, Encoding::Raw),
+        Some(raw) => (raw, Compression::Zstd),
+        None => (name, Compression::None),
     };
     if raw == "session.jsonl" {
         return Some((0, encoding));
@@ -226,19 +267,31 @@ mod tests {
 
     #[test]
     fn only_canonical_generation_names_parse() {
-        assert_eq!(generation_filename(0), "session.jsonl");
-        assert_eq!(generation_filename(4), "session.v4.jsonl");
+        assert_eq!(generation_filename(0, Compression::None), "session.jsonl");
+        assert_eq!(
+            generation_filename(4, Compression::None),
+            "session.v4.jsonl"
+        );
+        assert_eq!(
+            generation_filename(0, Compression::Zstd),
+            "session.jsonl.zstd"
+        );
+        assert_eq!(
+            generation_filename(27, Compression::Zstd),
+            "session.v27.jsonl.zstd"
+        );
+        assert_eq!(Compression::default(), Compression::Zstd);
         assert_eq!(
             parse_generation_filename("session.jsonl"),
-            Some((0, Encoding::Raw))
+            Some((0, Compression::None))
         );
         assert_eq!(
             parse_generation_filename("session.v1.jsonl"),
-            Some((1, Encoding::Raw))
+            Some((1, Compression::None))
         );
         assert_eq!(
             parse_generation_filename("session.v27.jsonl.zstd"),
-            Some((27, Encoding::Zstd))
+            Some((27, Compression::Zstd))
         );
         assert_eq!(
             parse_generation_filename("session.v9007199254740992.jsonl"),

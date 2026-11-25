@@ -37,13 +37,15 @@ use serde_json::Value;
 
 use crate::file;
 use crate::format::{self, ScanError};
-use crate::layout::{self, Encoding};
+use crate::frames;
+use crate::layout::{self, Compression};
 use crate::lease::Lease;
 
 /// The backend's name in its messages. (dsh: `session-persistence-jsonl`.)
 const NAME: &str = "session-persistence-jsonl";
 
-/// The backend's one setting.
+/// The backend's settings. (dsh: its `Config`, without
+/// `listConcurrency`.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JsonlConfig {
     /// Where every session file goes. Required, with no default: a default
@@ -52,11 +54,30 @@ pub struct JsonlConfig {
     /// root must be a readable directory; a missing one is made at the
     /// first write.
     pub root: PathBuf,
+    /// The logs' encoding: Zstandard frames by default, as in dsh, or raw
+    /// lines. A root belongs to one encoding.
+    pub compression: Compression,
+}
+
+impl JsonlConfig {
+    /// Sessions under `root`, in the default encoding.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            compression: Compression::default(),
+        }
+    }
+
+    /// The same, in `compression`.
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
+    }
 }
 
 /// Sessions stored as JSONL files under a root directory, one directory per
-/// session. (dsh: the `session-persistence-jsonl` plugin with
-/// `compression: 'none'`.)
+/// session, compressed or raw. (dsh: the `session-persistence-jsonl`
+/// plugin.)
 #[derive(Clone)]
 pub struct JsonlPersistence {
     backend: Arc<Backend>,
@@ -84,6 +105,7 @@ impl JsonlPersistence {
         Ok(Self {
             backend: Arc::new(Backend {
                 root,
+                compression: config.compression,
                 tracker: Mutex::new(Tracker::default()),
                 root_checked: AtomicBool::new(false),
                 #[cfg(test)]
@@ -148,6 +170,9 @@ struct Stored {
     entries: Vec<Entry>,
     /// Where to cut a torn tail before the next append.
     torn_truncate_to: Option<u64>,
+    /// The complete records a torn last frame gave back, the end of
+    /// `entries`, which the next append writes again as a frame.
+    recovered_tail: Vec<Entry>,
 }
 
 /// A session created here and not yet written.
@@ -169,6 +194,7 @@ struct Tracker {
 
 struct Backend {
     root: PathBuf,
+    compression: Compression,
     tracker: Mutex<Tracker>,
     /// Whether the root was checked for the other encoding.
     root_checked: AtomicBool,
@@ -182,11 +208,13 @@ impl Backend {
         self.tracker.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn encoding_mismatch(path: &Path) -> PersistenceError {
+    fn encoding_mismatch(&self, path: &Path) -> PersistenceError {
         let quoted = Value::from(path.display().to_string()).to_string();
         layout_error(format!(
-            "session artifact {quoted} uses .jsonl.zstd, but this backend is configured for \
-             compression \"none\"; use a separate root or select the matching compression mode"
+            "session artifact {quoted} uses {}, but this backend is configured for compression \
+             \"{}\"; use a separate root or select the matching compression mode",
+            self.compression.opposite().log_suffix(),
+            self.compression.name()
         ))
     }
 
@@ -241,16 +269,17 @@ impl Backend {
         Ok(dirs)
     }
 
-    /// The highest canonical raw generation in `dir`, refusing a
-    /// compressed one. (dsh: `resolveGenerationInDirectory`.)
-    fn generation_in(dir: &Path) -> Result<Option<Generation>, PersistenceError> {
+    /// The highest canonical generation in `dir` in this backend's
+    /// encoding, refusing one in the other. (dsh:
+    /// `resolveGenerationInDirectory`.)
+    fn generation_in(&self, dir: &Path) -> Result<Option<Generation>, PersistenceError> {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if not_found(&error) => return Ok(None),
             Err(error) => return Err(io_error(format!("read {}", dir.display()), error)),
         };
         let mut latest: Option<Generation> = None;
-        let mut compressed: Vec<PathBuf> = Vec::new();
+        let mut opposite: Vec<PathBuf> = Vec::new();
         for entry in entries {
             let entry =
                 entry.map_err(|error| io_error(format!("read {}", dir.display()), error))?;
@@ -261,24 +290,23 @@ impl Backend {
             else {
                 continue;
             };
-            match encoding {
-                Encoding::Zstd => compressed.push(entry.path()),
-                Encoding::Raw => {
-                    if latest
-                        .as_ref()
-                        .is_none_or(|latest| version > latest.version)
-                    {
-                        latest = Some(Generation {
-                            path: entry.path(),
-                            version,
-                        });
-                    }
-                }
+            if encoding != self.compression {
+                opposite.push(entry.path());
+                continue;
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|latest| version > latest.version)
+            {
+                latest = Some(Generation {
+                    path: entry.path(),
+                    version,
+                });
             }
         }
-        compressed.sort();
-        if let Some(path) = compressed.first() {
-            return Err(Self::encoding_mismatch(path));
+        opposite.sort();
+        if let Some(path) = opposite.first() {
+            return Err(self.encoding_mismatch(path));
         }
         Ok(latest)
     }
@@ -291,7 +319,7 @@ impl Backend {
         }
         for project in self.project_dirs()? {
             for dir in Self::session_dirs(&project)? {
-                Self::generation_in(&dir)?;
+                self.generation_in(&dir)?;
             }
         }
         self.root_checked.store(true, Ordering::Release);
@@ -310,7 +338,7 @@ impl Backend {
                     return Err(Self::legacy_layout(&flat));
                 }
             }
-            if let Some(generation) = Self::generation_in(&project.join(&encoded))? {
+            if let Some(generation) = self.generation_in(&project.join(&encoded))? {
                 matches.push(generation);
             }
         }
@@ -346,6 +374,7 @@ impl Backend {
             header.cwd.as_deref(),
             header.id.as_str(),
             version,
+            self.compression,
         )
         .map_err(|_| {
             layout_error(format!(
@@ -369,16 +398,21 @@ impl Backend {
         generation: &Generation,
         expected: Option<&SessionId>,
     ) -> Result<Option<SessionHeader>, PersistenceError> {
-        let line = match file::read_first_line(&generation.path) {
-            Ok(Some(line)) => line,
-            Ok(None) => return Ok(None),
-            Err(error) if not_found(&error) => return Ok(None),
-            Err(error) => {
-                return Err(io_error(
-                    format!("read {}", generation.path.display()),
-                    error,
-                ));
-            }
+        let first = match self.compression {
+            Compression::Zstd => self.first_zstd_line(&generation.path)?,
+            Compression::None => match file::read_first_line(&generation.path) {
+                Ok(line) => line,
+                Err(error) if not_found(&error) => None,
+                Err(error) => {
+                    return Err(io_error(
+                        format!("read {}", generation.path.display()),
+                        error,
+                    ));
+                }
+            },
+        };
+        let Some(line) = first else {
+            return Ok(None);
         };
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             return Ok(None);
@@ -405,12 +439,25 @@ impl Backend {
         Ok(Some(header))
     }
 
-    /// Reads and checks the current log at `path`. (dsh: `readStoredLog` and
-    /// `decodeStoredLog`.)
+    /// Reads and checks the current log at `path`. (dsh: `readStoredLog`,
+    /// `decodeStoredLog` and, compressed, `readZstdPrefix`.)
     fn read_stored(&self, path: &Path, expected: &SessionId) -> Result<Stored, PersistenceError> {
         let (bytes, _) = file::read_stable(path)
             .map_err(|error| io_error(format!("read {}", path.display()), error))?;
-        let scan = format::scan_log(&bytes).map_err(|error| match error {
+        let scanned = match self.compression {
+            Compression::Zstd => format::scan_zstd_log(&bytes),
+            Compression::None => format::scan_log(&bytes).map(|scan| {
+                // A torn raw tail is one incomplete line, which holds no
+                // complete record to recover.
+                let torn =
+                    (scan.committed_bytes < bytes.len() as u64).then_some(format::TornFrame {
+                        start: scan.committed_bytes,
+                        recovered: 0,
+                    });
+                (scan, torn)
+            }),
+        };
+        let (scan, torn) = scanned.map_err(|error| match error {
             ScanError::Unsupported(reason) => {
                 PersistenceError::unsupported(reason, Some(location(path)))
             }
@@ -422,14 +469,84 @@ impl Backend {
         self.assert_stored_identity(path, SESSION_FORMAT_VERSION, &scan.header, Some(expected))?;
         assert_stored_id(expected, &scan.header)?;
         let entries = validate_stored_events(&scan.header, scan.rows, Some(&location(path)))?;
-        let torn_truncate_to =
-            (scan.committed_bytes < bytes.len() as u64).then_some(scan.committed_bytes);
+        let recovered = torn.as_ref().map_or(0, |torn| torn.recovered);
+        let recovered_tail = entries[entries.len() - recovered..].to_vec();
         Ok(Stored {
             header: scan.header,
             inherited_event_count: scan.inherited_event_count,
             entries,
-            torn_truncate_to,
+            torn_truncate_to: torn.map(|torn| torn.start),
+            recovered_tail,
         })
+    }
+
+    /// The first line of a compressed log: its header frame's one line.
+    /// `None` when no complete frame has arrived. Reads only as far as the
+    /// first frame. (dsh: `readFirstZstdLine`.)
+    fn first_zstd_line(&self, path: &Path) -> Result<Option<Vec<u8>>, PersistenceError> {
+        use std::io::Read;
+        let read_error = |error| io_error(format!("read {}", path.display()), error);
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if not_found(&error) => return Ok(None),
+            Err(error) => return Err(read_error(error)),
+        };
+        let mut content = Vec::new();
+        let mut chunk = [0; 8192];
+        loop {
+            let read = file.read(&mut chunk).map_err(read_error)?;
+            if read == 0 {
+                return Ok(None);
+            }
+            content.extend_from_slice(&chunk[..read]);
+            let header = frames::scan_frames(&content, Some(1)).and_then(|scan| {
+                let Some(first) = scan.frames.first() else {
+                    return Ok(None);
+                };
+                let plaintext = frames::decompress_frame(&content[first.clone()])
+                    .map_err(|error| error.to_string())?;
+                format::assert_header_frame(&plaintext)?;
+                Ok(Some(plaintext[..plaintext.len() - 1].to_vec()))
+            });
+            match header {
+                Ok(Some(line)) => return Ok(Some(line)),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(PersistenceError::Corruption(format!(
+                        "corrupt Zstandard session log: header frame failed validation: {reason} \
+                         (raw log: {})",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// `plaintext` in this backend's encoding: as it is, or as one
+    /// checksummed frame. (dsh: `encodeEventBatch`.)
+    fn encode(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, PersistenceError> {
+        match self.compression {
+            Compression::None => Ok(plaintext),
+            Compression::Zstd => frames::compress_frame(&plaintext)
+                .map_err(|error| io_error("compress a Zstandard frame", error)),
+        }
+    }
+
+    /// A new log's first bytes: the header line, then the first batch, in
+    /// frames of their own when compressed. (dsh: `encodeMaterialization`.)
+    fn first_bytes(
+        &self,
+        header: &SessionHeader,
+        inherited: u64,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, PersistenceError> {
+        let mut line = format::header_line(header, inherited)?.into_bytes();
+        line.push(b'\n');
+        let mut content = self.encode(line)?;
+        if !body.is_empty() {
+            content.extend(self.encode(body)?);
+        }
+        Ok(content)
     }
 
     /// The refusal for a selected generation this build doesn't read.
@@ -482,7 +599,7 @@ impl Backend {
     fn acquire_lease(&self, header: &SessionHeader) -> Result<Lease, PersistenceError> {
         let dir = layout::session_dir(&self.root, header.cwd.as_deref(), header.id.as_str())
             .map_err(layout_error)?;
-        Self::generation_in(&dir)?;
+        self.generation_in(&dir)?;
         Lease::acquire(&dir, &header.id)
     }
 
@@ -493,6 +610,7 @@ impl Backend {
             header.cwd.as_deref(),
             header.id.as_str(),
             SESSION_FORMAT_VERSION,
+            self.compression,
         )
         .map_err(layout_error)
     }
@@ -503,7 +621,7 @@ impl Backend {
             layout::project_dir(&self.root, header.cwd.as_deref()).map_err(layout_error)?;
         let dir = layout::session_dir(&self.root, header.cwd.as_deref(), header.id.as_str())
             .map_err(layout_error)?;
-        Self::generation_in(&dir)?;
+        self.generation_in(&dir)?;
         file::materialize(
             &self.root,
             &project,
@@ -556,6 +674,9 @@ struct State {
     /// Whether the session has a file yet.
     materialized: bool,
     torn_truncate_to: Option<u64>,
+    /// Records recovered from a torn frame, to write again before the next
+    /// batch; cleared once they land.
+    recovered_tail: Vec<Entry>,
     /// The log a write open read, served until the first append.
     primed: Option<Vec<Entry>>,
     /// The longest log a read has seen.
@@ -665,15 +786,13 @@ impl Core {
         // The batch is checked and encoded before the lock, so a refused
         // one leaves no trace on disk.
         assert_contiguous(&self.id, &events, state.cursor)?;
-        let mut content = Vec::new();
-        for entry in &events {
-            content.extend_from_slice(format::event_line(entry)?.as_bytes());
-            content.push(b'\n');
-        }
+        let body = lines(&events)?;
         self.ensure_lease(&mut state).await?;
         let path = self.backend.log_path(&self.header)?;
-        // A torn tail is cut first, and the cut forgotten only once it
-        // lands, so a failed one is retried at the next append.
+        // A torn tail is repaired first, each step forgotten only once it
+        // lands, so a failed one is retried at the next append: the torn
+        // bytes are cut, then the records recovered from them written
+        // again, as a frame of their own. (dsh: `persistContiguous`.)
         if let Some(offset) = state.torn_truncate_to {
             let torn = path.clone();
             blocking(move || {
@@ -683,27 +802,21 @@ impl Core {
             .await?;
             state.torn_truncate_to = None;
         }
-        let backend = Arc::clone(&self.backend);
+        if !state.recovered_tail.is_empty() {
+            let content = self.backend.encode(lines(&state.recovered_tail)?)?;
+            self.write(&path, content).await?;
+            state.recovered_tail.clear();
+        }
         if state.materialized {
-            blocking(move || {
-                file::append(
-                    &path,
-                    &content,
-                    |file, content| backend.write_batch(file, content),
-                    file::truncate,
-                )
-            })
-            .await?;
+            let content = self.backend.encode(body)?;
+            self.write(&path, content).await?;
         } else {
+            let content =
+                self.backend
+                    .first_bytes(&self.header, self.inherited_event_count, body)?;
+            let backend = Arc::clone(&self.backend);
             let header = self.header.clone();
-            let inherited = self.inherited_event_count;
-            blocking(move || {
-                let mut first = format::header_line(&header, inherited)?.into_bytes();
-                first.push(b'\n');
-                first.extend_from_slice(&content);
-                backend.materialize(&header, &first)
-            })
-            .await?;
+            blocking(move || backend.materialize(&header, &content)).await?;
             self.backend.tracker().pending.remove(&self.id);
         }
         state.cursor += events.len() as u64;
@@ -711,6 +824,21 @@ impl Core {
         state.primed = None;
         state.observed = usize::try_from(state.cursor).unwrap_or(usize::MAX);
         Ok(())
+    }
+
+    /// Appends `content`, synced, rolling back on failure.
+    async fn write(&self, path: &Path, content: Vec<u8>) -> Result<(), PersistenceError> {
+        let backend = Arc::clone(&self.backend);
+        let path = path.to_owned();
+        blocking(move || {
+            file::append(
+                &path,
+                &content,
+                |file, content| backend.write_batch(file, content),
+                file::truncate,
+            )
+        })
+        .await
     }
 
     async fn flush(&self) -> Result<(), PersistenceError> {
@@ -723,15 +851,12 @@ impl Core {
             return Ok(());
         }
         self.ensure_lease(&mut state).await?;
+        let content =
+            self.backend
+                .first_bytes(&self.header, self.inherited_event_count, Vec::new())?;
         let backend = Arc::clone(&self.backend);
         let header = self.header.clone();
-        let inherited = self.inherited_event_count;
-        blocking(move || {
-            let mut line = format::header_line(&header, inherited)?.into_bytes();
-            line.push(b'\n');
-            backend.materialize(&header, &line)
-        })
-        .await?;
+        blocking(move || backend.materialize(&header, &content)).await?;
         self.backend.tracker().pending.remove(&self.id);
         state.materialized = true;
         Ok(())
@@ -751,6 +876,16 @@ impl Core {
             self.backend.release(&self.id, self.access);
         }
     }
+}
+
+/// `events` as rows, a newline after each.
+fn lines(events: &[Entry]) -> Result<Vec<u8>, PersistenceError> {
+    let mut content = Vec::new();
+    for entry in events {
+        content.extend_from_slice(format::event_line(entry)?.as_bytes());
+        content.push(b'\n');
+    }
+    Ok(content)
 }
 
 /// The handle [`JsonlPersistence`] hands out. (dsh: `JsonlSessionHandle`.)
@@ -871,6 +1006,7 @@ impl JsonlPersistence {
             cursor: 0,
             materialized: false,
             torn_truncate_to: None,
+            recovered_tail: Vec::new(),
             primed: None,
             observed: 0,
             lease: None,
@@ -898,6 +1034,7 @@ impl JsonlPersistence {
                     cursor: 0,
                     materialized: false,
                     torn_truncate_to: None,
+                    recovered_tail: Vec::new(),
                     primed: None,
                     observed: 0,
                     lease: None,
@@ -912,6 +1049,7 @@ impl JsonlPersistence {
                 cursor: 0,
                 materialized: true,
                 torn_truncate_to: None,
+                recovered_tail: Vec::new(),
                 primed: None,
                 observed: 0,
                 lease: None,
@@ -960,6 +1098,7 @@ impl JsonlPersistence {
             cursor: stored.entries.len() as u64,
             materialized: true,
             torn_truncate_to: stored.torn_truncate_to,
+            recovered_tail: stored.recovered_tail,
             observed: stored.entries.len(),
             primed: Some(stored.entries),
             lease: Some(lease),
@@ -1006,7 +1145,7 @@ impl JsonlPersistence {
             let mut snapshots: Vec<SessionSnapshot> = Vec::new();
             for project in backend.project_dirs()? {
                 for dir in Backend::session_dirs(&project)? {
-                    let Some(generation) = Backend::generation_in(&dir)? else {
+                    let Some(generation) = backend.generation_in(&dir)? else {
                         continue;
                     };
                     // An unreadable or unsupported header is skipped, not a
@@ -1136,8 +1275,10 @@ impl SessionPersistence for JsonlPersistence {
 #[cfg(test)]
 mod tests {
     use karaka_session::{Seq, SessionEvent, Time};
+    use serde_json::json;
 
     use super::*;
+    use crate::frames::{compress_frame, decompress_frame, decompress_prefix, scan_frames};
 
     fn entry(seq: u64, event: SessionEvent) -> Entry {
         Entry {
@@ -1148,50 +1289,150 @@ mod tests {
         }
     }
 
-    // jsonl.spec.ts: "a failed appendLines truncates partial bytes so a
-    // retry has no seq gap"
-    #[tokio::test]
-    async fn a_failed_append_rolls_back_so_a_retry_has_no_seq_gap() {
+    /// A fresh directory for one test, emptied first.
+    fn scratch(name: &str, compression: Compression) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "karaka-jsonl-backend-rollback-{}",
+            "karaka-jsonl-backend-{name}-{}-{}",
+            compression.name(),
             std::process::id()
         ));
-        let persistence = JsonlPersistence::new(JsonlConfig { root: root.clone() }).unwrap();
-        let header = SessionHeader::new(SessionId::new("truncate-retry"), 1000);
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    fn seqs(entries: &[Entry]) -> Vec<u64> {
+        entries.iter().map(|entry| entry.seq.0).collect()
+    }
+
+    // jsonl.spec.ts: "a failed appendLines truncates partial bytes so a
+    // retry has no seq gap", and zstd.spec.ts: "rolls back a checksummed
+    // append frame when fsync fails"
+    #[tokio::test]
+    async fn a_failed_append_rolls_back_so_a_retry_has_no_seq_gap() {
+        for compression in [Compression::None, Compression::Zstd] {
+            let root = scratch("rollback", compression);
+            let persistence =
+                JsonlPersistence::new(JsonlConfig::new(&root).with_compression(compression))
+                    .unwrap();
+            let header = SessionHeader::new(SessionId::new("truncate-retry"), 1000);
+            let path = persistence.backend.log_path(&header).unwrap();
+            let handle = persistence
+                .create(header, CreateOptions::default())
+                .await
+                .unwrap();
+            handle
+                .append(vec![
+                    entry(0, SessionEvent::turn_start(1)),
+                    entry(1, SessionEvent::step_start(1, 1)),
+                ])
+                .await
+                .unwrap();
+            let before = fs::read(&path).unwrap();
+
+            let batch = vec![
+                entry(2, SessionEvent::step_end(1, 1)),
+                entry(3, SessionEvent::turn_start(2)),
+            ];
+            persistence.fail_next_sync();
+            let failure = handle.append(batch.clone()).await.unwrap_err();
+            assert!(failure.to_string().contains("simulated fsync ENOSPC"));
+            // Back to the last complete batch, and the cursor didn't move.
+            assert_eq!(fs::read(&path).unwrap(), before, "{compression:?}");
+
+            handle.append(batch).await.unwrap();
+            assert_eq!(seqs(&handle.read(0, None).await.unwrap()), [0, 1, 2, 3]);
+            handle.close().await.unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    // zstd.spec.ts: "retries the torn-tail rewrite when its first durable
+    // write fails"
+    #[tokio::test]
+    async fn a_failed_rewrite_of_a_recovered_tail_is_retried_once() {
+        let root = scratch("retry-torn-rewrite", Compression::Zstd);
+        let persistence = JsonlPersistence::new(JsonlConfig::new(&root)).unwrap();
+        let header = SessionHeader::new(SessionId::new("retry-torn-rewrite"), 1000);
         let path = persistence.backend.log_path(&header).unwrap();
-        let handle = persistence
+        let writer = persistence
             .create(header, CreateOptions::default())
             .await
             .unwrap();
-        handle
-            .append(vec![
-                entry(0, SessionEvent::turn_start(1)),
-                entry(1, SessionEvent::step_start(1, 1)),
-            ])
+        writer
+            .append(vec![entry(0, SessionEvent::turn_start(1))])
             .await
             .unwrap();
-        let size = fs::metadata(&path).unwrap().len();
+        writer.close().await.unwrap();
 
-        let batch = vec![
-            entry(2, SessionEvent::step_end(1, 1)),
-            entry(3, SessionEvent::turn_start(2)),
+        // A batch torn after its first two records were flushed.
+        let rows = [
+            json!({ "type": "step/start", "seq": 1, "time": 2, "data": { "turn": 1, "step": 1 } }),
+            json!({ "type": "step/end", "seq": 2, "time": 3, "data": { "turn": 1, "step": 1 } }),
+            json!({ "type": "assistant/attempt", "seq": 3, "time": 4, "data": {
+                "turn": 1, "step": 2,
+                "stream": [{ "type": "text-chunks", "time0": 4, "index": 0, "dt": [],
+                             "texts": [noise(300_000)] }]
+            } }),
         ];
-        persistence.fail_next_sync();
-        let failure = handle.append(batch.clone()).await.unwrap_err();
-        assert!(failure.to_string().contains("simulated fsync ENOSPC"));
-        // The partial bytes are gone, and the cursor didn't move.
-        assert_eq!(fs::metadata(&path).unwrap().len(), size);
+        let plaintext: String = rows.iter().map(|row| format!("{row}\n")).collect();
+        let frame = compress_frame(plaintext.as_bytes()).unwrap();
+        let torn = (1..frame.len())
+            .rev()
+            .map(|end| &frame[..end])
+            .find(|cut| {
+                let decoded = decompress_prefix(cut);
+                scan_frames(cut, None).unwrap().torn_start == Some(0)
+                    && decoded.iter().filter(|byte| **byte == b'\n').count() >= 2
+                    && decoded.last() != Some(&b'\n')
+            })
+            .expect("a cut that keeps two records");
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut file, torn).unwrap();
+        drop(file);
 
-        handle.append(batch).await.unwrap();
-        let seqs: Vec<u64> = handle
-            .read(0, None)
+        let handle = persistence
+            .open(&SessionId::new("retry-torn-rewrite"), SessionAccess::Write)
             .await
-            .unwrap()
-            .iter()
-            .map(|entry| entry.seq.0)
-            .collect();
-        assert_eq!(seqs, [0, 1, 2, 3]);
+            .unwrap();
+        assert_eq!(seqs(&handle.read(0, None).await.unwrap()), [0, 1, 2]);
+        let closers = vec![entry(3, SessionEvent::turn_start(2))];
+        // The rewrite of the recovered records fails first; the retry
+        // rewrites them exactly once.
+        persistence.fail_next_sync();
+        assert!(handle.append(closers.clone()).await.is_err());
+        handle.append(closers).await.unwrap();
         handle.close().await.unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let scan = scan_frames(&bytes, None).unwrap();
+        assert_eq!(scan.torn_start, None);
+        let text: String = scan
+            .frames
+            .iter()
+            .map(|frame| {
+                String::from_utf8(decompress_frame(&bytes[frame.clone()]).unwrap()).unwrap()
+            })
+            .collect();
+        let logged: Vec<u64> = text
+            .lines()
+            .skip(1)
+            .map(|line| {
+                serde_json::from_str::<Value>(line).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(logged, [0, 1, 2, 3]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn noise(length: usize) -> String {
+        let mut state: u32 = 0x1234_5678;
+        (0..length)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                char::from(33 + (state % 90) as u8)
+            })
+            .collect()
     }
 }

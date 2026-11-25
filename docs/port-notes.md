@@ -1046,3 +1046,123 @@ chunk came before the cancel, as dsh writes `live.usage` (`agent.ts:480`).
 The comment saying Karaka's models report usage only when they finish
 was wrong since step five, part A. Test:
 `a_cancel_after_the_usage_keeps_it_on_the_partial_answer`.
+
+## Durable sessions, part B: Zstandard frames, the default
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25.*
+
+### What is done
+
+- **The setting.** `JsonlConfig::compression` is `Compression::Zstd` by
+  default, or `Compression::None`, dsh's `'zstd' | 'none'`
+  (`DEFAULT_COMPRESSION`, `JsonlCompressionSchema`). The filename rule is
+  dsh's `generationLogFilename`: `session.v4.jsonl.zstd`, or
+  `session.v4.jsonl` raw. `JsonlConfig::new(root)` takes the default; the
+  CLI uses it, so `KARAKA_SESSIONS` now writes compressed logs.
+- **A log in the other encoding**, checked as dsh does it, is not "not
+  found": dsh refuses it loudly (`encodingMismatch`, from
+  `resolveGenerationInDirectory`, the whole-root `ensureRootEncoding`, and
+  `rejectOppositeArtifact` before a create's first write). Karaka does the
+  same in both directions, with dsh's text: `uses .jsonl, but this backend
+  is configured for compression "zstd"` and the reverse.
+- **Frames** (`frames.rs`, dsh's `zstd.ts`).
+  - `compress_frame` makes one independent frame with the checksum flag, at
+    zstd's default level, as Node's `zstdCompress` does.
+  - `scan_frames` is the structural scanner: magic, frame header, blocks
+    and checksum, with no decompression. A frame the bytes end inside gives
+    `torn_start`. It refuses an invalid magic, a reserved frame-header bit
+    or a reserved block type with dsh's text and byte offset. `max_frames`
+    is kept: the header-only read uses it to stop after the first frame.
+  - `decompress_frame` decodes one complete frame and checks its checksum
+    (libzstd's streaming decoder does by default).
+  - `decompress_prefix` reads the streaming decoder until it errors or the
+    input ends, keeping what it emitted. That is every block that arrived
+    whole. Tested: a 300 KB batch cut mid-frame gives back its first blocks,
+    with the records flushed into them, and a frame cut inside its header
+    gives nothing.
+  - The module is public, for tools and tests that inspect a stored log.
+- **Writing.** The header line is a frame of its own, and each durable
+  batch is one more frame: the lazy create publishes header frame plus
+  first-batch frame, a flushed empty session is the header frame alone
+  (`encodeMaterialization`, `encodeEventBatch`). Frames go through the same
+  append as raw lines, so fsync per batch and rollback are unchanged: a
+  failed write or sync cuts the file back to the end of the last complete
+  frame.
+- **Reading** (`format.rs`, `scan_zstd_log`; dsh's `readZstdPrefix`).
+  - The first frame must be exactly one header line
+    (`assertZstdHeaderFrame`).
+  - Every complete frame is decoded and fed, in order, to the same scanner
+    raw logs use, so the admission and v4 checks run unchanged on the
+    decoded text.
+  - Every complete frame must end on a record boundary, or the log is
+    refused ("complete frame contains a torn JSONL record").
+  - A torn last frame contributes the complete records its prefix decodes
+    to, or nothing when it doesn't decode.
+  - A frame that fails to decode, its checksum included, is refused as dsh
+    words it: "frame at byte N failed validation".
+  - `stat` and `list` read only the header frame (`readFirstZstdLine`). A
+    damaged one refuses `stat` ("header frame failed validation") and is
+    skipped by `list`.
+- **Repair** (dsh's `persistContiguous` with `truncateTornTail`). A write
+  open keeps the torn frame's start and its recovered records. The first
+  append cuts the file there, then writes the recovered records again as a
+  frame of their own, then the batch. Each step is forgotten only once it
+  lands, so a failed rewrite is retried exactly once at the next append. A
+  raw log has the same shape, with nothing to recover: a torn raw tail is
+  one incomplete line.
+- **The dependency.** The `zstd` crate (libzstd), pinned to `=0.14.3`
+  (2026-10-16), without default features (pre-1.0 formats and the
+  dictionary builder). The lockfile pins `zstd-safe` 8.2.0 and `zstd-sys`
+  2.1.2 (libzstd 1.5.7), released with it. The newest at the time
+  (0.14.5, libzstd 1.6.0) were a day old.
+- **Tests.**
+  - The seam contract now runs in both encodings (`tests/contract.rs` and
+    `tests/contract/cases.rs`), as dsh runs it for `jsonl-none` and
+    `jsonl-zstd`, each with its own torn tail.
+  - `zstd.spec.ts`'s structure cases (`frames.rs`), and its backend cases
+    (`tests/zstd.rs`): the default and its name, one frame per header and
+    per batch, round trips, a frame torn mid-batch, one torn at its
+    checksum, one cut inside its header, a torn frame with no complete
+    record, a complete frame ending mid-record, bad magic and reserved
+    bits, a checksum mismatch, damaged header frames, and encoding
+    mismatch both ways.
+  - The rollback and the retried rewrite of a recovered tail, as unit
+    tests with the injected sync failure.
+  - `DurableSessions` and the CLI now run on the default encoding.
+- **Bytes from dsh's encoder.** dsh's tests ship no zstd fixture; they
+  make frames at run time with `compressZstdFrame`, which is exactly
+  `zlib.zstdCompress(input, { params: { ZSTD_c_checksumFlag: 1 } })`.
+  `tests/fixtures/node-zstd-session.jsonl.zstd` is a two-turn synthetic
+  session written by that same Node call
+  (`tests/fixtures/generate-node-zstd-session.mjs`, standalone, importing
+  nothing from dsh). Node writes single-segment frames with a content
+  size, unlike the Rust encoder, so the test covers the other header
+  form. Karaka reads it, lists it, and appends its own frame after Node's
+  bytes. Running dsh's own TypeScript to write the fixture wasn't
+  possible here.
+
+### Left out of part B
+
+- **The saved-stream check**: expanding each embedded stream and
+  assembling it against its message. dsh runs it only in
+  `verifyCurrentGeneration`, on a migrated generation (`index.ts:713`),
+  so it belongs with migration in part C.
+- **Making `Agents::open` async**, still out of scope.
+- **dsh's Node-private multi-frame decoder, its decode time slices, and
+  frame-by-frame cancellation.** Each frame is decoded on the blocking
+  pool, and a dropped future doesn't stop it.
+- **The torn-tail warning** dsh logs on repair: Karaka has no logger yet,
+  as in part A.
+
+### Where part B differs from dsh
+
+- **libzstd through the `zstd` crate, not Node's zlib.** The frames are
+  standard and interchange both ways. The Rust encoder writes frames
+  without a content size (multi-segment, a window descriptor); Node
+  writes single-segment ones. Both are dsh-valid.
+- **The header-only read refuses with dsh's message, minus JavaScript's
+  `Error: ` prefix** that `String(error)` adds inside it.
+- **A torn last frame whose prefix doesn't decode recovers nothing,** as
+  in dsh. The prefix is read with a streaming decoder rather than
+  `ZSTD_e_flush`, which yields the same whole blocks.
+- **A failed frame decode keeps dsh's message, without its cause.**

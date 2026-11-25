@@ -17,6 +17,8 @@ karaka-session-persistence.workspace = true
 # Rows are JSON. `preserve_order` keeps the keys of a stored row in the
 # order they were written, so a row is rewritten the same way.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Checksummed Zstandard frames, one per header and one per batch.
+zstd.workspace = true
 # File work runs on Tokio's blocking pool, and each handle runs its
 # operations one at a time behind an async lock.
 tokio = { workspace = true, features = ["rt", "sync"] }

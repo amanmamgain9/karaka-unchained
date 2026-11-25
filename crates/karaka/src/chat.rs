@@ -59,7 +59,7 @@ pub async fn chat(config: Config) -> Result<(), String> {
     let mut plugins = loop_plugins(config);
     if let Some(root) = sessions.clone() {
         // The store's sessions kept as JSONL files under the root.
-        plugins.push(Box::new(JsonlPlugin::new(JsonlConfig { root })));
+        plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root))));
         plugins.push(Box::new(DurableSessionsPlugin));
     }
     let runtime = Runtime::start(plugins)

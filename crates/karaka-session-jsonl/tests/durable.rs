@@ -1,6 +1,6 @@
 //! The session store kept on this backend: live events routed to the
 //! session's writer, flush as the barrier, resume with repair, and one
-//! writer across instances. (dsh: `runLiveWritePathContract` as
+//! writer across instances. They use the default encoding, Zstandard. (dsh: `runLiveWritePathContract` as
 //! `jsonl.spec.ts` runs it, and the agent loop's `resumeWith`.)
 
 mod common;
@@ -13,7 +13,7 @@ use karaka_kernel::Runtime;
 use karaka_session::{
     Entry, SessionEvent, SessionStore, SessionsPlugin, TurnEndReason, UserMessage, UserSource,
 };
-use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
+use karaka_session_jsonl::{Compression, JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{
     BATCH_WINDOW, DurableError, DurableSessions, DurableSessionsPlugin, PersistenceError,
     SessionPersistence,
@@ -22,7 +22,8 @@ use karaka_session_persistence::{
 /// A store kept on a fresh backend over `root`, as one process has it.
 fn durable(root: &TempRoot) -> (Arc<SessionStore>, DurableSessions) {
     let store = Arc::new(SessionStore::new());
-    let persistence: Arc<dyn SessionPersistence> = Arc::new(root.backend());
+    let persistence: Arc<dyn SessionPersistence> =
+        Arc::new(root.backend_in(Compression::default()));
     let durable = DurableSessions::new(Arc::clone(&store), persistence);
     (store, durable)
 }
@@ -37,7 +38,9 @@ fn user(text: &str) -> SessionEvent {
 
 /// What another process reading the root sees.
 async fn stored(root: &TempRoot, name: &str) -> Vec<Entry> {
-    read_all(&root.backend(), name).await.unwrap()
+    read_all(&root.backend_in(Compression::default()), name)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -120,7 +123,7 @@ async fn resuming_closes_a_turn_a_crash_left_open_and_stores_the_closers() {
     let root = TempRoot::new("repair");
     // A crash after the turn started: the stored log ends inside it.
     write_log(
-        &root.backend(),
+        &root.backend_in(Compression::default()),
         meta("repair", None),
         entries(serde_json::json!([
             { "type": "turn/start", "seq": 0, "time": 1, "data": { "turn": 1 } },
@@ -197,9 +200,7 @@ async fn the_plugins_keep_the_store_on_the_backend() {
     let root = TempRoot::new("plugins");
     let runtime = Runtime::start(vec![
         Box::new(SessionsPlugin),
-        Box::new(JsonlPlugin::new(JsonlConfig {
-            root: root.path().to_owned(),
-        })),
+        Box::new(JsonlPlugin::new(JsonlConfig::new(root.path()))),
         Box::new(DurableSessionsPlugin),
     ])
     .await

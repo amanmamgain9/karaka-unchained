@@ -23,6 +23,9 @@
 //! a later committed turn end means the damage is inside committed data,
 //! and the file is refused. Rows that fail the v4 admission checks refuse
 //! the file wherever they are.
+//!
+//! A compressed log goes through the same scanner, frame by frame
+//! ([`scan_zstd_log`]): the rows are the same, and so are the checks.
 
 use std::path::Path;
 
@@ -31,6 +34,7 @@ use karaka_session_persistence::{PersistenceError, format_version_refusal};
 use serde_json::{Map, Value};
 
 use crate::admission::{self, Refusal, count};
+use crate::frames;
 
 /// Why a file couldn't be scanned.
 #[derive(Debug, PartialEq, Eq)]
@@ -421,6 +425,12 @@ impl Scanner {
         Ok(())
     }
 
+    /// How far the scan has got: the bytes taken, the bytes up to the last
+    /// accepted row, and the rows accepted. (dsh: `checkpoint`.)
+    pub(crate) fn checkpoint(&self) -> (u64, u64, usize) {
+        (self.input_bytes, self.committed_bytes, self.rows.len())
+    }
+
     /// Ends the scan; an incomplete last line is a torn tail.
     pub(crate) fn finish(mut self) -> Result<Scan, ScanError> {
         self.finished = true;
@@ -512,6 +522,79 @@ pub(crate) fn scan_log(bytes: &[u8]) -> Result<Scan, ScanError> {
     let mut scanner = Scanner::new(&bytes[..=header_end], false)?;
     scanner.write(&bytes[header_end + 1..])?;
     scanner.finish()
+}
+
+/// A compressed log's torn last frame.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TornFrame {
+    /// Where it starts: where the next append cuts the file.
+    pub(crate) start: u64,
+    /// How many of the scan's rows came from it, complete, to be written
+    /// again as a frame of their own.
+    pub(crate) recovered: usize,
+}
+
+/// The first frame holds exactly the header line. (dsh:
+/// `assertZstdHeaderFrame`.)
+pub(crate) fn assert_header_frame(plaintext: &[u8]) -> Result<(), String> {
+    if plaintext.is_empty()
+        || plaintext.iter().position(|byte| *byte == b'\n') != Some(plaintext.len() - 1)
+    {
+        return Err(
+            "corrupt Zstandard session log: first frame is not exactly one header line".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Scans a compressed log: the header frame, then every complete frame,
+/// each of which must end on a record boundary. A torn last frame gives
+/// back its complete records, or nothing when it can't be decoded at all.
+/// The rows go through the same scanner, admission checks included, as a
+/// raw log's. (dsh: `readZstdPrefix`.)
+pub(crate) fn scan_zstd_log(bytes: &[u8]) -> Result<(Scan, Option<TornFrame>), ScanError> {
+    let found = frames::scan_frames(bytes, None).map_err(ScanError::Corrupt)?;
+    let mut complete = found.frames.iter();
+    let Some(first) = complete.next() else {
+        return Err(ScanError::Corrupt(
+            "empty or header-less Zstandard session log".into(),
+        ));
+    };
+    let decode = |frame: &std::ops::Range<usize>| {
+        frames::decompress_frame(&bytes[frame.clone()]).map_err(|_| {
+            ScanError::Corrupt(format!(
+                "corrupt Zstandard session log: frame at byte {} failed validation",
+                frame.start
+            ))
+        })
+    };
+    let header = decode(first)?;
+    assert_header_frame(&header).map_err(ScanError::Corrupt)?;
+    let mut scanner = Scanner::new(&header, false)?;
+    for frame in complete {
+        scanner.write(&decode(frame)?)?;
+    }
+    let (input, committed, complete_rows) = scanner.checkpoint();
+    if committed != input {
+        return Err(ScanError::Corrupt(
+            "corrupt Zstandard session log: complete frame contains a torn JSONL record".into(),
+        ));
+    }
+    let Some(start) = found.torn_start else {
+        return Ok((scanner.finish()?, None));
+    };
+    // The torn frame's append never resolved, but its complete records
+    // were emitted events: they are kept, and rewritten by the next append.
+    scanner.write(&frames::decompress_prefix(&bytes[start..]))?;
+    let scan = scanner.finish()?;
+    let recovered = scan.rows.len() - complete_rows;
+    Ok((
+        scan,
+        Some(TornFrame {
+            start: start as u64,
+            recovered,
+        }),
+    ))
 }
 
 #[cfg(test)]

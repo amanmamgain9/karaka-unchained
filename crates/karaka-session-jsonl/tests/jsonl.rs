@@ -43,9 +43,9 @@ fn start() -> Value {
 #[tokio::test]
 async fn the_plugin_provides_the_port() {
     let root = TempRoot::new("plugin");
-    let runtime = Runtime::start(vec![Box::new(JsonlPlugin::new(JsonlConfig {
-        root: root.path().to_owned(),
-    }))])
+    let runtime = Runtime::start(vec![Box::new(JsonlPlugin::new(JsonlConfig::new(
+        root.path(),
+    )))])
     .await
     .unwrap();
     assert_eq!(runtime.plugins(), ["session-persistence-jsonl"]);
@@ -58,16 +58,13 @@ fn a_root_that_is_not_a_directory_is_refused() {
     let root = TempRoot::new("file-root");
     let file = root.path().join("not-a-dir");
     fs::write(&file, "x").unwrap();
-    let refusal = JsonlPersistence::new(JsonlConfig { root: file }).unwrap_err();
+    let refusal = JsonlPersistence::new(JsonlConfig::new(file)).unwrap_err();
     assert!(matches!(refusal, PersistenceError::Io { .. }));
 }
 
 #[test]
 fn a_relative_root_is_resolved_once() {
-    let persistence = JsonlPersistence::new(JsonlConfig {
-        root: "relative-sessions".into(),
-    })
-    .unwrap();
+    let persistence = JsonlPersistence::new(JsonlConfig::new("relative-sessions")).unwrap();
     assert!(persistence.root().is_absolute());
     assert!(persistence.root().ends_with("relative-sessions"));
 }
@@ -154,10 +151,7 @@ async fn sessions_are_listed_across_project_directories() {
     listed.sort();
     assert_eq!(listed, ["one", "three", "two"]);
     // A missing root has no sessions.
-    let missing = JsonlPersistence::new(JsonlConfig {
-        root: root.path().join("absent"),
-    })
-    .unwrap();
+    let missing = JsonlPersistence::new(JsonlConfig::new(root.path().join("absent"))).unwrap();
     assert!(missing.list().await.unwrap().is_empty());
 }
 
@@ -542,6 +536,60 @@ async fn an_explicitly_flushed_empty_session_is_its_header_line() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+/// jsonl.spec.ts: "a torn crash tail is served as the committed prefix
+/// and repaired only by the write path".
+#[tokio::test]
+async fn complete_rows_after_the_last_turn_end_are_served_and_only_the_fragment_is_cut() {
+    let root = TempRoot::new("torn");
+    write_log(&root.backend(), meta("torn", Some("/work")), one_turn_log()).await;
+    let path = root.log(Some("/work"), "torn");
+    let committed = std::fs::read(&path).unwrap();
+    // A crash in the middle of a second turn: two complete rows past the
+    // turn end, and a torn fragment with no newline.
+    let tail = format!(
+        "{}\n{}\n{}",
+        json!({ "type": "turn/start", "seq": 6, "time": 8, "data": { "turn": 2 } }),
+        json!({ "type": "step/start", "seq": 7, "time": 9, "data": { "turn": 2, "step": 1 } }),
+        "{\"type\":\"assistant/chunk\",\"seq\":8,\"ti"
+    );
+    append_bytes(&path, tail.as_bytes());
+
+    // A reader serves the complete rows, not the fragment, and repairs
+    // nothing.
+    let reader = root.backend();
+    assert_eq!(
+        seqs(&read_all(&reader, "torn").await.unwrap()),
+        [0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        [committed.clone(), tail.into_bytes()].concat()
+    );
+
+    // The write path cuts the fragment before its first append.
+    let writer = reader
+        .open(&id("torn"), SessionAccess::Write)
+        .await
+        .unwrap();
+    writer
+        .append(entries(json!([
+            { "type": "step/end", "seq": 8, "time": 10, "data": { "turn": 2, "step": 1 } },
+            { "type": "turn/end", "seq": 9, "time": 11, "data": { "turn": 2, "reason": { "kind": "interrupted" } } }
+        ])))
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    let repaired = std::fs::read_to_string(&path).unwrap();
+    assert!(repaired.as_bytes().starts_with(&committed));
+    assert!(!repaired.contains("assistant/chunk"));
+
+    let verify = root.backend();
+    assert_eq!(
+        seqs(&read_all(&verify, "torn").await.unwrap()),
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
 }
 
