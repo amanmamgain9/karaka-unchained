@@ -24,6 +24,7 @@ use karaka_session::{
 };
 use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
+use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tools::{ToolRegistry, ToolsPlugin};
 
@@ -37,9 +38,9 @@ const SESSION: &str = "chat";
 const SHORT_RESULT: usize = 80;
 
 /// The plugins `chat` and `ask` both run: the model provider, the system
-/// prompt, the tools and sessions, the agent loop, and the retry plugin,
-/// which retries a failed
-/// request as the provider's policy says before the turn gives up.
+/// prompt, the tools and sessions, the sessions' projections, the agent
+/// loop, and the retry plugin, which retries a failed request as the
+/// provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
@@ -55,6 +56,7 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     plugins.push(Box::new(SystemPromptPlugin::new(prompt)));
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
+    plugins.push(Box::new(SessionProjectionsPlugin));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins

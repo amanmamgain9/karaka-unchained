@@ -23,6 +23,8 @@ karaka-tools.workspace = true
 karaka-retry.workspace = true
 # The system prompt the loop assembles each step from.
 karaka-system-prompt.workspace = true
+# The state domains project from each session's log.
+karaka-session-projection.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

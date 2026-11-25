@@ -7,8 +7,8 @@ use std::thread;
 
 use karaka_model::Message;
 use karaka_session::{
-    AdapterDefaults, CallConfig, Entry, Extra, FlushFuture, LogError, RequestContext,
-    RequestHeader, RequestHeaderReason, Seq, SessionError, SessionEvent, SessionId,
+    AdapterDefaults, Appended, CallConfig, Entry, Extra, FlushFuture, LogError, RequestContext,
+    RequestHeader, RequestHeaderReason, Seq, SessionError, SessionEvent, SessionHeader, SessionId,
     SessionListener, SessionStore, SurfaceIntent, SurfaceOp, Time, UserMessage, UserSource,
 };
 
@@ -442,11 +442,11 @@ struct Recorder {
 }
 
 impl SessionListener for Recorder {
-    fn event(&self, id: &SessionId, entry: &Entry) {
+    fn event(&self, session: &Appended<'_>, entry: &Entry) {
         self.heard
             .lock()
             .unwrap()
-            .push((id.as_str().to_owned(), entry.seq));
+            .push((session.id().as_str().to_owned(), entry.seq));
     }
 
     fn flush(&self, id: &SessionId) -> Option<FlushFuture> {
@@ -560,4 +560,108 @@ fn a_fractional_retry_wait_from_dsh_loads_and_round_trips() {
     };
     assert_eq!(failure.code, "RATE_LIMIT");
     assert_eq!(serde_json::to_value(&events).unwrap(), rows);
+}
+
+fn turn_entries(count: u64) -> Vec<Entry> {
+    (0..count)
+        .map(|seq| Entry {
+            seq: Seq(seq),
+            time: Time(seq as i64 + 1),
+            ignorable: false,
+            event: if seq % 2 == 0 {
+                SessionEvent::turn_start(seq / 2 + 1)
+            } else {
+                SessionEvent::turn_end(seq / 2 + 1, karaka_session::TurnEndReason::Completed)
+            },
+        })
+        .collect()
+}
+
+// dsh's Session carries its header and the exact fork-inherited cut, which
+// projections start from (`core/session/src/index.ts`).
+#[test]
+fn a_session_keeps_the_header_it_was_created_or_restored_with() {
+    let store = SessionStore::new();
+
+    let plain = store.create(id("plain")).unwrap();
+    assert_eq!(plain.header().id, id("plain"));
+    assert!(
+        plain.header().created_at > 0,
+        "stamped with the time it was made"
+    );
+    assert_eq!(plain.header().cwd, None);
+    assert_eq!(plain.inherited_event_count(), 0);
+
+    let header = SessionHeader::new(id("worked"), 7).with_cwd("/work");
+    let worked = store.create_with(header.clone()).unwrap();
+    assert_eq!(worked.header(), &header);
+    assert_eq!(store.get(&id("worked")).unwrap().header(), &header);
+    assert!(matches!(
+        store.create_with(header),
+        Err(SessionError::AlreadyExists(_))
+    ));
+
+    let mut seeded = SessionHeader::new(id("seeded"), 9);
+    seeded.is_seeded = true;
+    let forked = store
+        .restore_with(seeded.clone(), 2, turn_entries(3))
+        .unwrap();
+    assert_eq!(forked.header(), &seeded);
+    assert_eq!(forked.inherited_event_count(), 2);
+    assert_eq!(forked.len(), 3);
+
+    let resumed = store.restore(id("resumed"), turn_entries(2)).unwrap();
+    assert_eq!(resumed.header().id, id("resumed"));
+    assert_eq!(resumed.inherited_event_count(), 0);
+}
+
+/// What [`LogWatcher`] hears of one event: the session's cwd and inherited
+/// count, the event's seq, and how long the log it was shown is.
+type Watched = (Option<String>, u64, Seq, usize);
+
+/// Records what it is shown of each event.
+#[derive(Default)]
+struct LogWatcher {
+    heard: Mutex<Vec<Watched>>,
+}
+
+impl SessionListener for LogWatcher {
+    fn event(&self, session: &Appended<'_>, entry: &Entry) {
+        assert_eq!(session.events().last(), Some(entry));
+        self.heard.lock().unwrap().push((
+            session.header().cwd.clone(),
+            session.inherited_event_count(),
+            entry.seq,
+            session.events().len(),
+        ));
+    }
+
+    fn flush(&self, _: &SessionId) -> Option<FlushFuture> {
+        None
+    }
+}
+
+#[test]
+fn a_listener_sees_the_session_and_its_log_as_of_each_event() {
+    let store = SessionStore::new();
+    let watcher = Arc::new(LogWatcher::default());
+    store.listen(watcher.clone());
+
+    let session = store
+        .create_with(SessionHeader::new(id("a"), 1).with_cwd("/work"))
+        .unwrap();
+    session.append(user("one")).unwrap();
+    // Each event of a batch is shown the log up to itself, not the batch's
+    // later events.
+    session.append_all([user("two"), user("three")]).unwrap();
+
+    let cwd = Some("/work".to_owned());
+    assert_eq!(
+        *watcher.heard.lock().unwrap(),
+        [
+            (cwd.clone(), 0, Seq(0), 1),
+            (cwd.clone(), 0, Seq(1), 2),
+            (cwd, 0, Seq(2), 3),
+        ]
+    );
 }

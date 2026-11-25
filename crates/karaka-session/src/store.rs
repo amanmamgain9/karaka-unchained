@@ -9,7 +9,8 @@ use karaka_kernel::BoxError;
 use karaka_model::Message;
 
 use crate::derive::History;
-use crate::event::{Entry, Seq, SessionEvent};
+use crate::event::{Entry, Seq, SessionEvent, Time};
+use crate::header::SessionHeader;
 use crate::log::{LogError, SessionLog};
 use crate::request::{RequestContext, RequestHeader};
 
@@ -78,6 +79,40 @@ impl From<LogError> for SessionError {
 /// are durable.
 pub type FlushFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
 
+/// The session an event was just appended to, as a [`SessionListener`]
+/// hears it: what dsh's `session/event` passes, the `Session` itself.
+///
+/// The log is locked meanwhile, so this is the session's log read in place,
+/// not a copy.
+#[derive(Clone, Copy, Debug)]
+pub struct Appended<'a> {
+    id: &'a SessionId,
+    meta: &'a Meta,
+    events: &'a [Entry],
+}
+
+impl<'a> Appended<'a> {
+    pub fn id(&self) -> &'a SessionId {
+        self.id
+    }
+
+    /// See [`Session::header`].
+    pub fn header(&self) -> &'a SessionHeader {
+        &self.meta.header
+    }
+
+    /// See [`Session::inherited_event_count`].
+    pub fn inherited_event_count(&self) -> u64 {
+        self.meta.inherited_event_count
+    }
+
+    /// The log as of the event: every event up to it, ending with it. In a
+    /// batch, the batch's later events aren't in it yet.
+    pub fn events(&self) -> &'a [Entry] {
+        self.events
+    }
+}
+
 /// Hears every event appended to any session of a store, and is asked to
 /// make them durable. (dsh: the `session/event` and `session/flush`
 /// listeners a persistence backend installs.)
@@ -86,13 +121,14 @@ pub type FlushFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>
 /// routes each event to the session's write handle by id, as dsh's backends
 /// do.
 pub trait SessionListener: Send + Sync {
-    /// `entry` has just been appended to the session `id`.
+    /// `entry` has just been appended to `session`.
     ///
     /// It runs while the session's log is locked, so listeners hear a
     /// session's events in log order. It must not block, and must not call
-    /// back into the session. Events a session was restored with are not
-    /// heard, as dsh never publishes a session's seed.
-    fn event(&self, id: &SessionId, entry: &Entry);
+    /// back into the session: what it needs of the session, `session`
+    /// shows. Events a session was restored with are not heard, as dsh
+    /// never publishes a session's seed.
+    fn event(&self, session: &Appended<'_>, entry: &Entry);
 
     /// Starts making the session's events so far durable, or gives `None`
     /// when this listener keeps nothing for the session. (dsh:
@@ -113,15 +149,20 @@ impl Listeners {
     }
 
     /// Tells every listener about the entries of `log` from `from` on.
-    fn publish(&self, id: &SessionId, log: &SessionLog, from: usize) {
-        let entries = &log.events()[from.min(log.len())..];
-        if entries.is_empty() {
+    fn publish(&self, id: &SessionId, meta: &Meta, log: &SessionLog, from: usize) {
+        let events = log.events();
+        if from >= events.len() {
             return;
         }
         let listeners = self.0.read().unwrap_or_else(PoisonError::into_inner);
         for listener in listeners.iter() {
-            for entry in entries {
-                listener.event(id, entry);
+            for end in from + 1..=events.len() {
+                let appended = Appended {
+                    id,
+                    meta,
+                    events: &events[..end],
+                };
+                listener.event(&appended, &events[end - 1]);
             }
         }
     }
@@ -150,14 +191,23 @@ impl fmt::Debug for Listeners {
 #[derive(Clone, Debug)]
 pub struct Session {
     id: SessionId,
+    meta: Arc<Meta>,
     log: Arc<Mutex<SessionLog>>,
     listeners: Arc<Listeners>,
 }
 
+/// What a session is, apart from its log, fixed when it is made.
+#[derive(Debug)]
+struct Meta {
+    header: SessionHeader,
+    inherited_event_count: u64,
+}
+
 impl Session {
-    fn new(id: SessionId, log: SessionLog, listeners: Arc<Listeners>) -> Self {
+    fn new(meta: Meta, log: SessionLog, listeners: Arc<Listeners>) -> Self {
         Self {
-            id,
+            id: meta.header.id.clone(),
+            meta: Arc::new(meta),
             log: Arc::new(Mutex::new(log)),
             listeners,
         }
@@ -165,6 +215,19 @@ impl Session {
 
     pub fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    /// The session's metadata, fixed when it was made. (dsh:
+    /// `Session.header`.)
+    pub fn header(&self) -> &SessionHeader {
+        &self.meta.header
+    }
+
+    /// How many events at the start of the log a fork inherited: the exact
+    /// cut, never worked out from a `session/end-seed` marker. 0 for a
+    /// session that isn't seeded. (dsh: `Session.inheritedEventCount`.)
+    pub fn inherited_event_count(&self) -> u64 {
+        self.meta.inherited_event_count
     }
 
     /// See [`SessionLog::append`].
@@ -243,7 +306,7 @@ impl Session {
         let mut log = self.lock();
         let before = log.len();
         let result = change(&mut log);
-        self.listeners.publish(&self.id, &log, before);
+        self.listeners.publish(&self.id, &self.meta, &log, before);
         result
     }
 
@@ -304,34 +367,64 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Starts an empty session called `id`.
+    /// Starts an empty session called `id`, with a fresh header made now.
+    /// (dsh: `sessions.create(id)`.)
     pub fn create(&self, id: SessionId) -> Result<Session, SessionError> {
-        let mut sessions = self.write();
-        if sessions.by_id.contains_key(&id) {
-            return Err(SessionError::AlreadyExists(id));
-        }
-        Ok(sessions.insert(id, SessionLog::new(), &self.listeners))
+        self.create_with(fresh_header(id))
+    }
+
+    /// Starts an empty session with `header`, which names it. (dsh:
+    /// `sessions.create(id, { meta })`.)
+    pub fn create_with(&self, header: SessionHeader) -> Result<Session, SessionError> {
+        self.add(header, 0, SessionLog::new())
     }
 
     /// Adds the session `id` with the events storage gave back for it, every
-    /// seq and time kept. Fails if the id is taken or an event doesn't fit;
-    /// either way the store is unchanged. See [`SessionLog::restore`].
-    ///
-    /// Nothing is repaired here. The code that resumes the session calls
-    /// [`Session::repair`] before it continues the session.
+    /// seq and time kept, and a fresh header made now. See
+    /// [`restore_with`](Self::restore_with), which a stored session's header
+    /// goes through.
     pub fn restore(
         &self,
         id: SessionId,
         entries: impl IntoIterator<Item = Entry>,
     ) -> Result<Session, SessionError> {
+        self.restore_with(fresh_header(id), 0, entries)
+    }
+
+    /// Adds the session `header` names, with the events storage gave back
+    /// for it, every seq and time kept, and how many of them a fork
+    /// inherited. Fails if the id is taken or an event doesn't fit; either
+    /// way the store is unchanged. See [`SessionLog::restore`].
+    ///
+    /// Nothing is repaired here. The code that resumes the session calls
+    /// [`Session::repair`] before it continues the session.
+    pub fn restore_with(
+        &self,
+        header: SessionHeader,
+        inherited_event_count: u64,
+        entries: impl IntoIterator<Item = Entry>,
+    ) -> Result<Session, SessionError> {
         // The log is checked before the map is locked, so a long log never
         // holds up other sessions.
         let log = SessionLog::restore(entries)?;
+        self.add(header, inherited_event_count, log)
+    }
+
+    fn add(
+        &self,
+        header: SessionHeader,
+        inherited_event_count: u64,
+        log: SessionLog,
+    ) -> Result<Session, SessionError> {
         let mut sessions = self.write();
-        if sessions.by_id.contains_key(&id) {
-            return Err(SessionError::AlreadyExists(id));
+        if sessions.by_id.contains_key(&header.id) {
+            return Err(SessionError::AlreadyExists(header.id));
         }
-        Ok(sessions.insert(id, log, &self.listeners))
+        let meta = Meta {
+            header,
+            inherited_event_count,
+        };
+        Ok(sessions.insert(meta, log, &self.listeners))
     }
 
     /// The session called `id`, started empty if there's none yet.
@@ -347,7 +440,14 @@ impl SessionStore {
         // write lock, so look again.
         match sessions.by_id.get(&id) {
             Some(session) => session.clone(),
-            None => sessions.insert(id, SessionLog::new(), &self.listeners),
+            None => sessions.insert(
+                Meta {
+                    header: fresh_header(id),
+                    inherited_event_count: 0,
+                },
+                SessionLog::new(),
+                &self.listeners,
+            ),
         }
     }
 
@@ -450,11 +550,18 @@ impl SessionStore {
     }
 }
 
+/// The header of a session made here, rather than read from storage: made
+/// now, by a person, unseeded. (dsh: the header `sessions.create` makes.)
+fn fresh_header(id: SessionId) -> SessionHeader {
+    SessionHeader::new(id, u64::try_from(Time::now().0).unwrap_or(0))
+}
+
 impl Sessions {
-    /// Adds a new session holding `log`. The caller has checked `id` is
+    /// Adds a new session holding `log`. The caller has checked its id is
     /// free.
-    fn insert(&mut self, id: SessionId, log: SessionLog, listeners: &Arc<Listeners>) -> Session {
-        let session = Session::new(id.clone(), log, Arc::clone(listeners));
+    fn insert(&mut self, meta: Meta, log: SessionLog, listeners: &Arc<Listeners>) -> Session {
+        let id = meta.header.id.clone();
+        let session = Session::new(meta, log, Arc::clone(listeners));
         self.by_id.insert(id.clone(), session.clone());
         self.order.push(id);
         session

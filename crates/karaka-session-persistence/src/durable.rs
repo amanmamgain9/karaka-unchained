@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_session::{
-    Entry, FlushFuture, Passthrough, Seq, Session, SessionError, SessionEvent, SessionHeader,
-    SessionId, SessionListener, SessionStore, Time, interrupted_turn_closers,
+    Appended, Entry, FlushFuture, Passthrough, Seq, Session, SessionError, SessionEvent,
+    SessionHeader, SessionId, SessionListener, SessionStore, Time, interrupted_turn_closers,
 };
 
 /// The marker a resume leaves where the stored log ends. (dsh:
@@ -100,8 +100,8 @@ impl Router {
 }
 
 impl SessionListener for Router {
-    fn event(&self, id: &SessionId, entry: &Entry) {
-        if let Some(writer) = self.writers().get(id) {
+    fn event(&self, session: &Appended<'_>, entry: &Entry) {
+        if let Some(writer) = self.writers().get(session.id()) {
             writer.enqueue(entry);
         }
     }
@@ -210,9 +210,14 @@ impl DurableSessions {
             return Err(error.into());
         }
         entries.extend(suffix);
+        let header = handle.header().clone();
+        let inherited_event_count = handle.inherited_event_count();
         let writer = LiveWriter::new(handle);
         self.router.writers().insert(id.clone(), writer.clone());
-        match self.store.restore(id.clone(), entries) {
+        match self
+            .store
+            .restore_with(header, inherited_event_count, entries)
+        {
             Ok(session) => Ok(session),
             Err(error) => {
                 self.router.writers().remove(&id);
@@ -228,11 +233,11 @@ impl DurableSessions {
         header.cwd = cwd;
         let handle = self
             .persistence
-            .create(header, CreateOptions::default())
+            .create(header.clone(), CreateOptions::default())
             .await?;
         let writer = LiveWriter::new(handle);
         self.router.writers().insert(id.clone(), writer.clone());
-        match self.store.create(id.clone()) {
+        match self.store.create_with(header) {
             Ok(session) => Ok(session),
             Err(error) => {
                 self.router.writers().remove(&id);

@@ -964,8 +964,9 @@ silently.
   `DurableSessions::open` first, and the loop finds the session in the
   store, already repaired. dsh's agent loop does both. Making
   `Agents::open` async would let the loop own it, as in dsh.
-- **The session keeps no header.** dsh's `Session` carries one; Karaka's
-  store doesn't need it yet, so it stays with the handle.
+- **The session kept no header** at this step; it stayed with the handle.
+  "Session projections" below gives every live session its header, as
+  dsh's does.
 - **Typed decoding is strict and comes after the scan.** dsh's row
   decoder checks only the envelope, then `adoptSessionEvent` and the
   catalog validate the whole log. Karaka does the same split, so a row
@@ -1501,3 +1502,149 @@ in `agent.ts`.*
   `session/event`.
 - **No context contributor exists yet.** The CLI sends no snapshot until
   the working-directory service is ported.
+
+## Session projections
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25:
+`session/session-projection` (`src/index.ts`, `src/types.ts`, the README,
+and `tests/registry.spec.ts`).*
+
+### What is done
+
+- **The crate** `karaka-session-projection`, with
+  `SessionProjectionsPlugin`. The plugin requires the `SessionStore` port
+  and provides the `SessionProjections` port. The binary mounts it after
+  the sessions plugin. No unit is registered yet; working-directory will
+  be the first.
+- **A unit** is a `Projection`:
+  - `KEY`;
+  - `state_version()`;
+  - `init(header, inherited_event_count)`;
+  - `apply(state, entry) -> Option<State>`, where `None` means unchanged.
+
+  A unit that also implements `ClientView` (`type View`, `view(state)`) is
+  client-visible. It is registered with `register`. A unit without one is
+  host-only and is registered with `register_host_only`. These are dsh's
+  two `register` overloads.
+- **The drive.** The registry follows the store as a `SessionListener`,
+  dsh's `session/event`. Every appended event passes every unit, in
+  registration order.
+  - A cell is built when first needed, folding the log from `init`. This
+    covers a unit registered after events flowed, and a session restored
+    from storage, whose seed is never heard, as in dsh.
+  - When `apply` says unchanged, no view is worked out.
+  - A view is worked out only while someone listens. It is heard only when
+    it differs from the last view worked out.
+  - A change no one heard leaves nothing to compare the next view with, so
+    that next view is heard. This is dsh's two-slot buffer, and all 960
+    cases of dsh's identity sweep pass.
+- **The reads:**
+  - `snapshot(session, keys)` gives `{asOfSeq, values}`: client-visible
+    views only, every unit folded first.
+  - `on_changed(listener)` gives the session id, key, view JSON and the
+    seq of the event that changed it.
+  - `state_of::<P>(session)` returns the state as a read-only `Arc`, with
+    no view worked out.
+  - `checkpoint(session)` gives every unit's `{ver, seq, val}` row as
+    detached JSON.
+  - `restore_floor(checkpoint)`, `restore(checkpoint, events, base_seq,
+    header, inherited_event_count)` and `view_checkpoint(checkpoint, keys)`
+    follow dsh's rules: the one-below anchor, a row usable only at its
+    version and within the supplied end, "re-read from seq 0", the gap
+    refusal, and rows that no longer read back being left out of views.
+  - A seq before the first event is written -1, as dsh's
+    `SessionSeqCursor`.
+- **Keys.**
+  - A second registrant of a key at the same state version shares the
+    unit and its cells.
+  - A different version is refused, with dsh's message.
+  - Each registration is a handle. When the last registrant calls
+    `remove`, the key and its cells go; re-registering folds the log
+    again.
+  - `ChangeSubscription::remove` stops a listener.
+  - Dropping either handle keeps what it registered, as in the
+    system-prompt crate.
+- **One cut under threads.** dsh's cut is one synchronous tick. Here:
+  - The drive runs under the session's log lock, then takes the
+    registry's.
+  - A read copies only the events its cells haven't seen, with the
+    registry unlocked, then locks the registry.
+  - If an append drove the cells past that copy meanwhile, the read goes
+    again.
+  - So every value reflects exactly the events up to `asOfSeq`. A test
+    snapshots while another thread appends.
+- **Sessions carry their header** (`karaka-session`):
+  - `Session::header()` and `Session::inherited_event_count()`, which dsh's
+    `Session` has and `init` needs.
+  - `SessionStore::create(id)` stamps a fresh header with the current
+    time, as dsh's `create` does.
+  - `create_with(header)` and `restore_with(header, inherited_event_count,
+    entries)` take a stored one.
+  - `DurableSessions` now passes the backend's header, both when it
+    creates a session and when it resumes one, so a resumed session keeps
+    its stored cwd.
+- **Listeners see the session** (`karaka-session`). `SessionListener::event`
+  now takes an `Appended`: the session's id, header, inherited count, and
+  its log up to and including the event, read in place under the lock.
+  That is what dsh's `session/event` passes (the `Session`). The drive
+  needs it to build a cell mid-stream without calling back into the
+  locked session.
+- **Tests:**
+  - every `registry.spec.ts` case that Rust can express (see below);
+  - a second registrant with another state type;
+  - `snapshot` with keys;
+  - a restore over a gap;
+  - a restored session folded on first read, then followed;
+  - one cut during concurrent appends;
+  - the plugin;
+  - sessions keeping their header in the store and through `DurableSessions`;
+  - a listener shown the log as of each event of a batch.
+
+### Left out
+
+- **`hydrate` and `cachedSnapshot`.** Both serve the projection cache and
+  session listing. They come with the cache plugin, which is out of scope.
+- **Cases Rust rules out.** A non-integer or negative `stateVersion` can't
+  be written (`u64`). A view that returns a Promise can't either, so
+  "fails loud when a unit view violates its own schema" has no Rust form.
+- **Cordis fibers.** "Removes registrations and change listeners when
+  their owning fiber unloads" is ported as the two handles' `remove`.
+  "Keeps a yielded registration live until the composite finishes using it"
+  has no equivalent, because Karaka has no effect composites.
+- **The `session/created` hook.** dsh builds a new session's cells at
+  creation. Here they are built at its first event or read, which gives
+  the same state. The only difference is when `init` runs.
+
+### Where it differs from dsh
+
+- **"Unchanged" is a value, not a reference.**
+  - `apply` returns `None` for unchanged, where dsh returns the same
+    reference.
+  - Views are compared with `PartialEq`, where dsh uses `Object.is`. So a
+    new view equal to the last one is not heard, where dsh publishes a
+    structurally equal new object. A unit no longer has to reuse a
+    reference to stay quiet.
+  - The identity sweep gives each view identity a distinct value.
+- **States are typed.** Each unit's state is its own Rust type behind an
+  erased cell, so there is no `stateSchema`:
+  - restore reads a row back with `Deserialize` and refuses one that
+    doesn't fit, as dsh's schema parse does;
+  - views and checkpoints go to JSON with `Serialize`. A value that
+    doesn't serialize is the unit's bug, and the registry panics naming
+    the key, as dsh's parse throws.
+  - A key can't be shared across state types; dsh has no types to compare
+    at runtime.
+- **`state_of` names the unit's type**, `state_of::<P>(session)`, where
+  dsh names the key and its type table. It returns an `Arc` of the live
+  state rather than the live object.
+- **Change listeners get the session id**, not the session. They run with
+  the session's log locked, after the registry is unlocked. So, like
+  units, they must not call back into the session or the registry.
+- **Cells are keyed by session id**, where dsh uses a `WeakMap` by
+  session. Karaka's store never drops a session, so neither does a cell
+  until its key is removed.
+- **The in-memory store doesn't check the inherited count** against the
+  log or the header's `is_seeded`. The JSONL format does, at write time.
+- **A restored session has a fresh header** when it comes in through
+  `SessionStore::restore(id, entries)`, which is kept for tests and
+  fixtures. Storage goes through `restore_with` and the stored header.

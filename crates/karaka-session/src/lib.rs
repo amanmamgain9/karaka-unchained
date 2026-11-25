@@ -86,7 +86,9 @@ pub use request::{
     AdapterDefaults, AssistantAttemptData, CallConfig, IN_HISTORY, RequestContext, RequestHeader,
     RequestHeaderData, RequestHeaderReason, call_config_equals, canonical_header, header_equals,
 };
-pub use store::{FlushFuture, Session, SessionError, SessionId, SessionListener, SessionStore};
+pub use store::{
+    Appended, FlushFuture, Session, SessionError, SessionId, SessionListener, SessionStore,
+};
 pub use stream::{
     StreamAccumulator, StreamError, TimedChunk, chunk_event, chunk_json, expand_stream,
     failure_json, finish_json,

@@ -1,0 +1,23 @@
+[package]
+name = "karaka-session-projection"
+description = "The session projection seam: per-session state folded from each session's log, read whole and followed by change"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that puts the registry in a runtime.
+karaka-kernel.workspace = true
+# The events a unit folds, and the store whose sessions it follows.
+karaka-session.workspace = true
+# A unit's state is checkpointed, and its view served, as JSON.
+serde.workspace = true
+# `preserve_order` keeps a snapshot's values in registration order, as dsh's
+# object keys are.
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+# Only for running the async plugin test.
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,11 +1,12 @@
 //! What a session is, apart from its events: the header storage keeps
 //! beside the log. (dsh v4: `SessionHeader` in `core/session/src/types.ts`.)
 //!
-//! The in-memory store doesn't need a header, so [`SessionStore`] keeps
-//! none. A durable backend writes it as the first line of the session's
-//! file, and lists sessions by reading only that line.
+//! Every [`Session`] in the store carries one, as dsh's does, for the code
+//! that starts from it, such as session projections. A durable backend
+//! writes it as the first line of the session's file, and lists sessions by
+//! reading only that line.
 //!
-//! [`SessionStore`]: crate::SessionStore
+//! [`Session`]: crate::Session
 
 use crate::SessionId;
 

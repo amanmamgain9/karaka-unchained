@@ -606,6 +606,7 @@ dependencies = [
  "karaka-session",
  "karaka-session-jsonl",
  "karaka-session-persistence",
+ "karaka-session-projection",
  "karaka-system-prompt",
  "karaka-tools",
  "serde_json",
@@ -728,6 +729,17 @@ version = "0.1.0"
 dependencies = [
  "karaka-kernel",
  "karaka-session",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-session-projection"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-session",
+ "serde",
  "serde_json",
  "tokio",
 ]

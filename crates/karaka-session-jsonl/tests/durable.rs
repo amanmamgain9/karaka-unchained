@@ -318,3 +318,33 @@ async fn the_plugins_keep_the_store_on_the_backend() {
     assert_eq!(stored(&root, "plugged").await, session.events());
     durable.close().await.unwrap();
 }
+
+// A live session carries its stored header, as dsh's Session does, so code
+// that starts from it, such as a projection's `init`, sees the cwd the
+// session was created in, not a fresh one.
+#[tokio::test]
+async fn a_session_carries_the_header_it_is_stored_with() {
+    let root = TempRoot::new("header");
+    let created = {
+        let (store, durable) = durable(&root);
+        let session = durable
+            .open(id("header"), Some("/work".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.header().cwd.as_deref(), Some("/work"));
+        session.append(SessionEvent::turn_start(1)).unwrap();
+        assert!(store.flush(&id("header")).await.unwrap());
+        durable.close().await.unwrap();
+        session.header().clone()
+    };
+
+    let (_store, durable) = durable(&root);
+    // The cwd a resume is asked for doesn't replace the stored one.
+    let session = durable
+        .open(id("header"), Some("/elsewhere".into()))
+        .await
+        .unwrap();
+    assert_eq!(session.header(), &created);
+    assert_eq!(session.inherited_event_count(), 0);
+    durable.close().await.unwrap();
+}
