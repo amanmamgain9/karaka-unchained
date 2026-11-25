@@ -161,7 +161,8 @@ fn the_fields_play_this_life_reads_are_typed() {
     assert_eq!((data.turn, data.step), (1, 1));
     let usage = data.usage.as_ref().expect("the answer has usage");
     assert_eq!((usage.input_tokens, usage.output_tokens), (40, 12));
-    assert_eq!(data.stream.len(), 4);
+    // The deltas, then the usage and the finish with its replay state.
+    assert_eq!(data.stream.len(), 6);
 
     let SessionEvent::ToolCall(call) = &entries[10].event else {
         panic!("seq 10 starts call-a");
@@ -337,4 +338,11 @@ fn every_embedded_stream_expands_and_packs_back() {
         checked += 1;
     }
     assert_eq!(checked, 3);
+}
+
+/// Every answer and attempt in the fixture is what its stream assembles to,
+/// by dsh's saved-stream check.
+#[test]
+fn every_embedded_stream_assembles_to_its_answer() {
+    assert_eq!(karaka_session::check_assistant_streams(&entries()), Ok(()));
 }

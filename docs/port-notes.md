@@ -1166,3 +1166,123 @@ was wrong since step five, part A. Test:
   in dsh. The prefix is read with a streaming decoder rather than
   `ZSTD_e_flush`, which yields the same whole blocks.
 - **A failed frame decode keeps dsh's message, without its cause.**
+
+## Durable sessions, part C: closing the v4 gaps
+
+*Checked against dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25. Each reported gap
+got a test first. Only the ones whose test failed were changed.*
+
+### Decision: no migration of older formats
+
+dsh's v0-to-v4 migrations are about 8,000 lines. Karaka has only ever
+written v4, and Play This Life keeps its sessions in Postgres, not in
+JSONL files. The user decided to drop migration. Karaka keeps refusing an
+older generation with dsh's "older than the supported v4" wording and the
+raw log's path. It treats one as an existing id for `create`, and never
+writes it: no successor, no lock. The format catalog, the historical
+codecs and the migration verifier are not ported.
+
+### The gaps
+
+1. **A second open of an open session: not a gap.** dsh refuses in
+   exactly these cases, and Karaka matches each:
+   - a second write handle in one backend instance (the contract's "write
+     ownership is single-holder per instance");
+   - a writer in another process or instance, through the `flock`;
+   - an agent-loop `resume` while a writer is held, as `session/writer-held`
+     in the session controller.
+
+   The controller first hands back a live agent, and shares one resume
+   between concurrent callers (`api/session-controller/src/agent.ts:213-249`).
+   `DurableSessions::open` is that layer: it returns a session already
+   live and stored, and one open at a time runs. A writer held elsewhere,
+   in this process or another, is refused as `AlreadyOwned`. The new test
+   `a_writer_held_elsewhere_in_this_process_is_refused_as_owned` passed
+   before any change.
+2. **`session/end-seed` on resume: fixed.** Not fork-only. dsh's Session,
+   built from a stored log, appends an untagged `session/end-seed {}`
+   unless the log already ends with one (`core/session/src/index.ts:694-698`),
+   and the agent loop stores it with the unstored suffix. A fork's marker,
+   `{ inherited: true }`, is the only fork part (`fork.ts`); forks aren't
+   ported. `DurableSessions::open` now appends the closers and the marker
+   through the handle before restoring the session. Test:
+   `each_resume_stores_an_end_seed_marker_unless_the_log_ends_with_one`.
+3. **Surface fields and `image/offload`: fixed** (`checks.rs`,
+   `surface.rs`, `json.rs`).
+   - **Surface fields.** A known event that can't join the surface, such
+     as `approval/asked`, or an unknown one not marked ignorable, may not
+     carry `surfaceOp` or `sourceEventSeqs`. Only an unknown ignorable
+     event keeps them opaque. The refusal names the one field, as dsh's
+     `surfaceOpOf` does; Karaka's lifecycle types had joined both into one
+     message.
+   - **`image/offload`.** dsh's stored-log reader always installs the
+     image-offload projection (`session-format-catalog/src/message-projections.ts`),
+     so a valid offload is admitted and a malformed one refused in its
+     words: targets, a current surface node, a user message or tool
+     result, strictly increasing indexes, an image that exists and isn't
+     offloaded already, counting earlier offloads. Karaka sends no images
+     to models, so the offload changes no derived history; only admission
+     follows dsh.
+
+   Tests: `tests/admission.rs`.
+4. **Developer messages: fixed** (`checks.rs`, `json.rs`; dsh's
+   `validateSessionEventData` and `assertDeveloperHeader`):
+   - tool-change blocks only in developer messages;
+   - a nonempty `toolName`;
+   - no inline tool definition;
+   - `headerSeq` exactly when tools are added, naming an earlier
+     `request/header`;
+   - each added tool defined once and whole there, `deferLoading` true
+     when present.
+
+   These were only in the JSONL backend's row admission; now the session
+   log checks them for every append and restore. The developer role and
+   event go together with dsh's message, checked on the raw JSON before
+   the typed reader's own refusal. A derive test that added a tool
+   without a header now removes one instead. Tests: `tests/admission.rs`.
+5. **The saved-stream check: ported**, as
+   `karaka_session::check_assistant_streams` (`verify.rs`; dsh's
+   `assertCurrentAssistantStreams`, in its words).
+   - What it checks: every stream must expand. Each answer's content must
+     be what the `BlockAssembler` makes of the stream (the interrupted
+     blocks for an interrupted answer), and its usage and replay state
+     must be what the stream wrote.
+   - Where it runs: as in dsh, not on an open. Every agent-loop harness
+     runs it on every session when dropped, and every CLI `chat` run now
+     stores its sessions in a fresh temporary root and checks each log.
+     The v4 fixture is checked too. A loop test edits a logged answer, to
+     show the check isn't vacuous.
+   - What it found: no disagreement in Karaka's writer. It did find that
+     the hand-written fixture broke dsh's rule: its first answer had usage
+     and replay state its stream never wrote. Its stream now ends with the
+     usage and the finish a writer would have logged.
+
+### Where part C differs from dsh
+
+- **Content is compared through Karaka's types.** dsh's assembler builds
+  v4 content blocks straight from the chunks. Karaka assembles its own
+  blocks and turns them into v4 content with the writer's converter. For
+  Karaka's logs the two agree. A dsh log whose blocks carry fields
+  Karaka's converter doesn't write could be refused by this check where
+  dsh's passes. Usage and replay state are compared as the stream wrote
+  them, as dsh does.
+- **The resume's closers and marker are one batch.** dsh appends the
+  closers, then the marker with the rest of the unstored suffix.
+- **The checks' messages carry Karaka's subject**, `session event at seq
+  N: ...`. dsh's subject varies with the caller: `session event at seq N`,
+  `seed TYPE at index N`, or `developer/message at seq N`.
+- **`image/offload` is admitted as dsh's reader admits it.** A dsh Session
+  without the image-offload plugin refuses one live ("requires a message
+  projection"); Karaka never writes one.
+
+### Still different, and not small
+
+- **v4's cross-row relationship checks** (`assertReleasedV4Relationships`):
+  lifecycle nesting, tool-call lifecycles, retries, compaction, titles,
+  commands, catalogs and deliveries.
+- **Full payload adoption** (`adoptSessionEvent` and message validation).
+  Karaka's typed reader checks the shapes it models, in its own words.
+- **Forks and seeded sessions**: the tagged inherited marker, and
+  `inheritedEventCount` beyond 0, in the store and `DurableSessions`.
+- **Message projections in general.** Only `image/offload`'s admission is
+  ported, and its effect is moot while Karaka sends no images.

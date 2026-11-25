@@ -22,9 +22,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_session::{
-    Entry, FlushFuture, Session, SessionError, SessionHeader, SessionId, SessionListener,
-    SessionStore, Time, interrupted_turn_closers,
+    Entry, FlushFuture, Passthrough, Seq, Session, SessionError, SessionEvent, SessionHeader,
+    SessionId, SessionListener, SessionStore, Time, interrupted_turn_closers,
 };
+
+/// The marker a resume leaves where the stored log ends. (dsh:
+/// `session/end-seed`, without `inherited`, which only a fork's marker has.)
+const END_SEED: &str = "session/end-seed";
 
 use crate::{CreateOptions, LiveWriter, PersistenceError, SessionAccess, SessionPersistence};
 
@@ -181,15 +185,31 @@ impl DurableSessions {
         // Semantic repair is the reader's. As in dsh, the closers of a turn
         // a crash left open are appended through the handle before the
         // session is restored, and if that fails, the handle is given up
-        // and the session never published.
-        let closers = interrupted_turn_closers(&entries);
-        if !closers.is_empty() {
-            if let Err(error) = handle.append(closers.clone()).await {
-                let _ = handle.close().await;
-                return Err(error.into());
-            }
-            entries.extend(closers);
+        // and the session never published. (dsh appends the closers, then
+        // the marker, as two batches; here they are one.)
+        let mut suffix = interrupted_turn_closers(&entries);
+        // Then the resume marker: dsh's session appends an untagged
+        // `session/end-seed` whenever it is built from a stored log, unless
+        // the log already ends with one (`core/session/src/index.ts:694-698`).
+        let last = suffix.last().or(entries.last());
+        if last.is_none_or(|entry| entry.event.event_type() != END_SEED) {
+            suffix.push(Entry {
+                seq: Seq((entries.len() + suffix.len()) as u64),
+                time: Time::now(),
+                ignorable: false,
+                event: SessionEvent::Passthrough(Passthrough {
+                    event_type: END_SEED.into(),
+                    data: serde_json::json!({}),
+                    surface_op: None,
+                    source_event_seqs: None,
+                }),
+            });
         }
+        if let Err(error) = handle.append(suffix.clone()).await {
+            let _ = handle.close().await;
+            return Err(error.into());
+        }
+        entries.extend(suffix);
         let writer = LiveWriter::new(handle);
         self.router.writers().insert(id.clone(), writer.clone());
         match self.store.restore(id.clone(), entries) {

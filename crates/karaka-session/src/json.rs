@@ -121,6 +121,7 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
         source_event_seqs,
         ignorable,
     } = envelope;
+    check_developer_role(&event_type, &data)?;
     let event = match event_type.as_str() {
         "system/message" => SessionEvent::SystemMessage {
             data: from_json(data)?,
@@ -153,11 +154,8 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
         },
         "turn/start" | "turn/end" | "step/start" | "step/end" | "tool/call" | "request/header"
         | "request/context" | "assistant/attempt" => {
-            if surface_op.is_some() || source_event_seqs.is_some() {
-                return Err(format!(
-                    "session event \"{event_type}\" is not surface-eligible and cannot \
-                     carry surfaceOp or sourceEventSeqs"
-                ));
+            if let Some(field) = surface_field(&surface_op, &source_event_seqs) {
+                return Err(not_surface_eligible(&event_type, field));
             }
             match event_type.as_str() {
                 "turn/start" => SessionEvent::TurnStart(from_json(data)?),
@@ -183,6 +181,48 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
         ignorable,
         event,
     })
+}
+
+/// The surface field an event carries, if any: `surfaceOp` first, as dsh
+/// checks it first.
+pub(crate) fn surface_field(
+    surface_op: &Option<Value>,
+    source_event_seqs: &Option<Value>,
+) -> Option<&'static str> {
+    if surface_op.is_some() {
+        Some("surfaceOp")
+    } else if source_event_seqs.is_some() {
+        Some("sourceEventSeqs")
+    } else {
+        None
+    }
+}
+
+/// dsh v4's refusal of a surface field on an event that can't join the
+/// surface (`surfaceOpOf` in `surface.ts`).
+pub(crate) fn not_surface_eligible(event_type: &str, field: &str) -> String {
+    format!("session event \"{event_type}\" is not surface-eligible and cannot carry {field}")
+}
+
+/// A developer message, and only a developer message, has the developer
+/// role. (dsh v4: `validateSessionEventData` in `surface.ts`.) Checked on
+/// the raw JSON, so the refusal is v4's rather than the typed reader's.
+fn check_developer_role(event_type: &str, data: &Value) -> Result<(), String> {
+    let message = match event_type {
+        "user/message" => data,
+        "system/message" | "developer/message" | "assistant/message" | "tool/result" => {
+            &data["message"]
+        }
+        _ => return Ok(()),
+    };
+    if !message.is_object() {
+        return Ok(());
+    }
+    let developer_role = message.get("role") == Some(&Value::from("developer"));
+    if (event_type == "developer/message") != developer_role {
+        return Err("developer/message and developer role must occur together".into());
+    }
+    Ok(())
 }
 
 fn intent_of(

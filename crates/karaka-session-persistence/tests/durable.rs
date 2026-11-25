@@ -137,9 +137,14 @@ async fn a_resume_whose_closers_fail_to_store_publishes_nothing_and_can_be_retri
     let session = durable.open(id.clone(), None).await.unwrap();
     let stored = memory.stored.lock().unwrap().clone();
     assert!(stored.len() > 1);
+    // The closers, then the resume's `session/end-seed` marker.
     assert!(matches!(
-        stored.last().unwrap().event,
+        stored[stored.len() - 2].event,
         SessionEvent::TurnEnd(_)
     ));
+    assert_eq!(
+        stored.last().unwrap().event.event_type(),
+        "session/end-seed"
+    );
     assert_eq!(session.events(), stored);
 }

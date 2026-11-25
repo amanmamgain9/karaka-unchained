@@ -7,8 +7,14 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
+
+use karaka_session::check_assistant_streams;
+use karaka_session_jsonl::{JsonlConfig, JsonlPersistence};
+use karaka_session_persistence::{SessionAccess, SessionPersistence};
 
 /// Every variable the binary reads. Each test starts with none of them set.
 const VARIABLES: &[&str] = &[
@@ -35,7 +41,62 @@ const VARIABLES: &[&str] = &[
 
 /// Runs `karaka` with `args`, `env` as its only settings, and `stdin` as its
 /// input.
+///
+/// A `chat` stores its sessions: in a fresh temporary directory, unless the
+/// test names one with `KARAKA_SESSIONS`. Every log in that fresh directory
+/// is then held to dsh's saved-stream rule, so each answer the binary logs
+/// is what its stream assembles to, and the directory is removed.
 fn karaka(args: &[&str], env: &[(&str, String)], stdin: &str) -> Output {
+    let stored = (args.first() == Some(&"chat")
+        && !env.iter().any(|(name, _)| *name == "KARAKA_SESSIONS"))
+    .then(fresh_sessions);
+    let mut env = env.to_vec();
+    if let Some(root) = &stored {
+        env.push(("KARAKA_SESSIONS", root.display().to_string()));
+    }
+    let output = run(args, &env, stdin);
+    if let Some(root) = stored {
+        check_stored_streams(&root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    output
+}
+
+/// A temporary directory of this test's own for a chat's sessions.
+fn fresh_sessions() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("karaka-cli-chat-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    root
+}
+
+/// Reads every session stored under `root` and checks each against its
+/// streams, failing the test on the first that disagrees.
+fn check_stored_streams(root: &Path) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to read the sessions");
+    runtime.block_on(async {
+        let persistence = JsonlPersistence::new(JsonlConfig::new(root)).expect("the root reads");
+        for snapshot in persistence.list().await.expect("the sessions list") {
+            let id = snapshot.header.id;
+            let handle = persistence
+                .open(&id, SessionAccess::Read)
+                .await
+                .expect("the session opens");
+            let events = handle.read(0, None).await.expect("the session reads");
+            handle.close().await.expect("the handle closes");
+            if let Err(error) = check_assistant_streams(&events) {
+                panic!("session \"{id}\" disagrees with its streams: {error}");
+            }
+        }
+    });
+}
+
+/// Runs the binary with `env` as its only settings.
+fn run(args: &[&str], env: &[(&str, String)], stdin: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_karaka"));
     command
         .args(args)
@@ -635,6 +696,7 @@ fn a_second_chat_in_a_stored_session_carries_on_the_conversation() {
     let sent = server.join().expect("the server ran");
     assert!(!body(&sent[0]).contains("Ada"), "{}", body(&sent[0]));
 
+    check_stored_streams(&root);
     std::fs::remove_dir_all(&root).unwrap();
 }
 

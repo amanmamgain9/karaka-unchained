@@ -3,10 +3,11 @@ use std::fmt;
 
 use karaka_model::Message;
 
+use crate::checks;
 use crate::derive::{self, History};
 use crate::event::{Entry, Seq, SessionEvent, Time};
 use crate::repair;
-use crate::request::{self, RequestContext, RequestHeader, canonical_header};
+use crate::request::{RequestContext, RequestHeader, canonical_header};
 use crate::surface::SurfaceFold;
 
 /// One session's events, in the order they happened. (dsh v4: `Session`.)
@@ -62,8 +63,9 @@ impl SessionLog {
     /// time kept, nothing added. Fails on the first entry that doesn't fit.
     ///
     /// v4 appends a `session/end-seed` marker when it replays a stored log;
-    /// that belongs to the code that resumes a session, so nothing is added
-    /// here. Repair is separate too: see [`repair`](Self::repair).
+    /// the code that resumes a session from storage adds it
+    /// (`DurableSessions` in `karaka-session-persistence`), so nothing is
+    /// added here. Repair is separate too: see [`repair`](Self::repair).
     pub fn restore(entries: impl IntoIterator<Item = Entry>) -> Result<Self, LogError> {
         let mut log = Self::new();
         for entry in entries {
@@ -120,7 +122,7 @@ impl SessionLog {
             seq: entry.seq,
             reason,
         };
-        check_event(&entry.event).map_err(invalid)?;
+        checks::check_entry(&self.entries, &entry).map_err(invalid)?;
         self.surface.admit(&self.entries, &entry).map_err(invalid)?;
         let seq = entry.seq;
         self.entries.push(entry);
@@ -229,19 +231,6 @@ impl SessionLog {
 
 /// Checks the parts of one event that v4 checks on its own, apart from the
 /// log (dsh v4: `validateSessionEventData` in `surface.ts`).
-fn check_event(event: &SessionEvent) -> Result<(), String> {
-    if let SessionEvent::RequestHeader(data) = event {
-        request::check_header(data)?;
-    }
-    if let SessionEvent::ToolResult { data, .. } = event
-        && data.error.is_some()
-        && data.message.is_error != Some(true)
-    {
-        return Err("error requires message.isError === true".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{LogError, SessionLog};

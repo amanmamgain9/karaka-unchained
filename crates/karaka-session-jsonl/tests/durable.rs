@@ -109,12 +109,15 @@ async fn a_restarted_process_carries_on_the_stored_session() {
 
     let (store, durable) = durable(&root);
     let session = durable.open(id("restart"), None).await.unwrap();
-    // The same events, every seq and time kept, and nothing to repair.
-    assert_eq!(session.events(), first);
+    // The same events, every seq and time kept, nothing to repair, and the
+    // resume's marker after them.
+    let resumed = session.events();
+    assert_eq!(resumed[..3], first[..]);
+    assert_eq!(types(&resumed[3..]), ["session/end-seed"]);
     session.append(SessionEvent::turn_start(2)).unwrap();
     assert!(store.flush(&id("restart")).await.unwrap());
     let read = stored(&root, "restart").await;
-    assert_eq!(seqs(&read), [0, 1, 2, 3]);
+    assert_eq!(seqs(&read), [0, 1, 2, 3, 4]);
     durable.close().await.unwrap();
 }
 
@@ -135,11 +138,13 @@ async fn resuming_closes_a_turn_a_crash_left_open_and_stores_the_closers() {
     let (_store, durable) = durable(&root);
     let session = durable.open(id("repair"), None).await.unwrap();
     let events = session.events();
-    assert!(events.len() > 2);
+    assert!(events.len() > 3);
+    // The closers end with the turn's end, then comes the resume's marker.
     assert!(matches!(
-        events.last().map(|entry| &entry.event),
-        Some(SessionEvent::TurnEnd(_))
+        events[events.len() - 2].event,
+        SessionEvent::TurnEnd(_)
     ));
+    assert_eq!(types(&events[events.len() - 1..]), ["session/end-seed"]);
     // The closers are durable before the session carries on.
     assert_eq!(stored(&root, "repair").await, events);
     durable.close().await.unwrap();
@@ -168,6 +173,101 @@ async fn another_instance_cannot_take_a_session_this_one_writes() {
     assert_eq!(events[..1], session.events()[..]);
     assert!(matches!(events[1].event, SessionEvent::TurnEnd(_)));
     second.close().await.unwrap();
+}
+
+/// dsh's session controller hands back a live agent, and refuses a resume
+/// only when the writer is held elsewhere, as `session/writer-held`
+/// (`api/session-controller/src/agent.ts:217-249`). A write handle held by
+/// another part of this process, with no live session, is refused the same
+/// way here.
+#[tokio::test]
+async fn a_writer_held_elsewhere_in_this_process_is_refused_as_owned() {
+    let root = TempRoot::new("held-here");
+    let persistence: Arc<dyn SessionPersistence> =
+        Arc::new(root.backend_in(Compression::default()));
+    write_log(
+        &root.backend_in(Compression::default()),
+        meta("held-here", None),
+        one_turn_log(),
+    )
+    .await;
+    let holder = persistence
+        .open(
+            &id("held-here"),
+            karaka_session_persistence::SessionAccess::Write,
+        )
+        .await
+        .unwrap();
+    let store = Arc::new(SessionStore::new());
+    let durable = DurableSessions::new(Arc::clone(&store), Arc::clone(&persistence));
+    let refusal = durable.open(id("held-here"), None).await.unwrap_err();
+    assert!(matches!(
+        refusal,
+        DurableError::Persistence(PersistenceError::AlreadyOwned(_))
+    ));
+    assert!(store.get(&id("held-here")).is_none());
+    holder.close().await.unwrap();
+    durable.open(id("held-here"), None).await.unwrap();
+    durable.close().await.unwrap();
+}
+
+fn types(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| entry.event.event_type().to_owned())
+        .collect()
+}
+
+/// dsh's session appends an untagged `session/end-seed` when it is built
+/// from a stored log, unless the log already ends with one
+/// (`core/session/src/index.ts:694-698`), and the agent loop stores it
+/// with the rest of the unstored suffix. It comes after a crash's closers.
+#[tokio::test]
+async fn each_resume_stores_an_end_seed_marker_unless_the_log_ends_with_one() {
+    let root = TempRoot::new("end-seed");
+    write_log(
+        &root.backend_in(Compression::default()),
+        meta("end-seed", None),
+        entries(serde_json::json!([
+            { "type": "turn/start", "seq": 0, "time": 1, "data": { "turn": 1 } }
+        ])),
+    )
+    .await;
+
+    let (_store, first) = durable(&root);
+    let session = first.open(id("end-seed"), None).await.unwrap();
+    let events = session.events();
+    assert_eq!(
+        types(&events).last().map(String::as_str),
+        Some("session/end-seed")
+    );
+    assert_eq!(types(&events)[..2], ["turn/start", "turn/end"]);
+    let marker = serde_json::to_value(events.last().unwrap()).unwrap();
+    assert_eq!(marker["data"], serde_json::json!({}));
+    assert_eq!(stored(&root, "end-seed").await, events);
+    first.close().await.unwrap();
+
+    // Resumed again with nothing in between: no second marker.
+    let (_store, second) = durable(&root);
+    let again = second.open(id("end-seed"), None).await.unwrap();
+    assert_eq!(again.events(), events);
+    // After a new event, the next resume marks the seed again.
+    again.append(SessionEvent::turn_start(2)).unwrap();
+    second.close().await.unwrap();
+    let (_store, third) = durable(&root);
+    let resumed = third.open(id("end-seed"), None).await.unwrap();
+    let markers = types(&resumed.events())
+        .iter()
+        .filter(|kind| *kind == "session/end-seed")
+        .count();
+    assert_eq!(markers, 2);
+    third.close().await.unwrap();
+
+    // A new session has none.
+    let (_store, fresh) = durable(&root);
+    let created = fresh.open(id("brand-new"), None).await.unwrap();
+    assert!(created.is_empty());
+    fresh.close().await.unwrap();
 }
 
 #[tokio::test]

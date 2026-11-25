@@ -621,7 +621,7 @@ mod tests {
         let log = log_of(vec![
             system("lead"),
             developer(vec![ContentBlock::Other(
-                json!({ "type": "tool-addition", "toolName": "search" }),
+                json!({ "type": "tool-removal", "toolName": "search" }),
             )]),
             system("later"),
             user("hi"),

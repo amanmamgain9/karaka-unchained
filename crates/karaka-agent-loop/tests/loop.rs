@@ -28,7 +28,8 @@ use karaka_session::{
     CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
     RequestHeaderData, RequestHeaderReason, Seq, SessionEvent, SessionId, SessionStore,
     SessionsPlugin, SurfaceIntent, SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TimedChunk,
-    TokenUsage, TurnEndReason, UserMessage, UserSource, chunk_event, chunk_json, expand_stream,
+    TokenUsage, TurnEndReason, UserMessage, UserSource, check_assistant_streams, chunk_event,
+    chunk_json, expand_stream,
 };
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
@@ -388,6 +389,23 @@ impl Harness {
     }
 }
 
+/// Every log a test leaves is held to dsh's saved-stream rule: each answer
+/// is what its embedded stream assembles to. A test that panicked already
+/// failed, so its logs aren't checked again.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        for session in self.sessions.list() {
+            let events = self.sessions.events(&session).expect("the session exists");
+            if let Err(error) = check_assistant_streams(&events) {
+                panic!("session \"{session}\" disagrees with its streams: {error}");
+            }
+        }
+    }
+}
+
 fn id() -> SessionId {
     SessionId::new("a1")
 }
@@ -706,6 +724,32 @@ async fn a_tool_that_fails_gets_an_error_result_and_the_turn_carries_on() {
     assert_eq!(harness.endings(), [TurnEndReason::Completed]);
     let second = &harness.model.requests()[1];
     assert_eq!(second.messages[2].content, [Block::ToolResult(result)]);
+}
+
+/// The saved-stream check every harness runs when dropped would catch an
+/// answer that its stream doesn't assemble to: here, one edited after it
+/// was logged.
+#[tokio::test]
+async fn the_stream_check_catches_an_answer_its_stream_doesnt_give() {
+    let harness = Harness::new(vec![text("hello")]).await;
+    harness.say("hi").await;
+    let mut events = harness.events();
+    assert_eq!(check_assistant_streams(&events), Ok(()));
+    let at = events
+        .iter()
+        .position(|entry| matches!(entry.event, SessionEvent::AssistantMessage { .. }))
+        .unwrap();
+    let SessionEvent::AssistantMessage { data, .. } = &mut events[at].event else {
+        unreachable!()
+    };
+    assert!(!data.stream.is_empty());
+    data.message.content = vec![karaka_session::ContentBlock::text("edited")];
+    assert_eq!(
+        check_assistant_streams(&events),
+        Err(format!(
+            "seed assistant/message at index {at} content disagrees with its embedded stream"
+        ))
+    );
 }
 
 /// A tool that panics gets an error result, as a dsh tool that throws gets

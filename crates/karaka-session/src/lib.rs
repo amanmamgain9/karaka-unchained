@@ -24,6 +24,10 @@
 //!   embeds.
 //! - `request.rs`: the request header, the route's context and failed
 //!   attempts, which the loop logs around each model call.
+//! - `checks.rs`: what an event must satisfy to join a log, beyond its seq
+//!   and surface operation.
+//! - `verify.rs`: the saved-stream check, which tests and tools run on a
+//!   whole log.
 //!
 //! - `header.rs`: the session's header, and the event vocabulary storage
 //!   accepts.
@@ -38,6 +42,7 @@
 //! things: events are only ever appended, and their seqs are contiguous
 //! from 0.
 
+mod checks;
 mod convert;
 mod data;
 mod derive;
@@ -52,6 +57,7 @@ mod request;
 mod store;
 mod stream;
 mod surface;
+mod verify;
 
 pub use data::{
     AssistantMessageData, CancelCause, DeveloperMessageData, Failure, Step, SystemMessageData,
@@ -85,3 +91,4 @@ pub use stream::{
     StreamAccumulator, StreamError, TimedChunk, chunk_event, chunk_json, expand_stream,
     failure_json, finish_json,
 };
+pub use verify::check_assistant_streams;

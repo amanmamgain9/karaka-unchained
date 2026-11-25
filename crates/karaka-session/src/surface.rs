@@ -15,6 +15,8 @@
 //! Each event is checked as it joins, so a log that was admitted always
 //! folds. The checks ported from v4 are listed on [`SurfaceFold::admit`].
 
+use std::collections::{BTreeSet, HashMap};
+
 use serde_json::Value;
 
 use crate::event::{Entry, Seq, SessionEvent, SurfaceOp};
@@ -26,6 +28,9 @@ pub(crate) struct SurfaceFold {
     /// How many replacements were admitted. (dsh v4: `contentGeneration`,
     /// which also counts plugin projections Karaka doesn't have.)
     generation: u64,
+    /// The images each `image/offload` has marked, by the surface node that
+    /// holds them, as indexes among the message's image blocks.
+    offloaded: HashMap<Seq, BTreeSet<u64>>,
 }
 
 impl SurfaceFold {
@@ -53,7 +58,15 @@ impl SurfaceFold {
     ///   its content (`assertToolResultRewrite`).
     /// - While node 0 is a system prompt, only a system message over exactly
     ///   that node may replace it (`assertSystemHeadRewrite`).
+    ///
+    /// And an `image/offload` must name images on the surface, as dsh's
+    /// stored-log reader projects it (`imageOffloadProjection`).
     pub(crate) fn admit(&mut self, log: &[Entry], entry: &Entry) -> Result<(), String> {
+        if let SessionEvent::Passthrough(passthrough) = &entry.event
+            && passthrough.event_type == IMAGE_OFFLOAD
+        {
+            return self.offload(log, &passthrough.data);
+        }
         let Some((op, sources)) = intent(&entry.event) else {
             return Ok(());
         };
@@ -117,6 +130,115 @@ impl SurfaceFold {
         self.generation += 1;
         Ok(())
     }
+}
+
+/// The one event type whose effect on messages dsh projects: images taken
+/// out of the history. (dsh v4: `MESSAGE_PROJECTION_EVENT_TYPES`.)
+const IMAGE_OFFLOAD: &str = "image/offload";
+
+impl SurfaceFold {
+    /// Checks one `image/offload` and records the images it marks, all or
+    /// nothing. (dsh: `imageOffloadProjection.project` and
+    /// `offloadMessageImages`, in its words.)
+    ///
+    /// Karaka sends no images to models, so the marks change no history;
+    /// only what the log admits follows dsh.
+    fn offload(&mut self, log: &[Entry], data: &Value) -> Result<(), String> {
+        let targets = data
+            .as_object()
+            .filter(|data| data.len() == 1)
+            .and_then(|data| data.get("targets"))
+            .and_then(Value::as_array)
+            .filter(|targets| !targets.is_empty())
+            .ok_or("image/offload: data must contain a nonempty targets array")?;
+        let mut marks: HashMap<Seq, BTreeSet<u64>> = HashMap::new();
+        for target in targets {
+            let shape = target.as_object().filter(|target| target.len() == 2);
+            let seq = shape.and_then(|target| index(target.get("seq")));
+            let indexes = shape
+                .and_then(|target| target.get("imageIndexes"))
+                .and_then(Value::as_array)
+                .filter(|indexes| !indexes.is_empty());
+            let (Some(seq), Some(indexes)) = (seq, indexes) else {
+                return Err(
+                    "image/offload: each target must contain a seq and nonempty imageIndexes"
+                        .into(),
+                );
+            };
+            let seq = Seq(seq);
+            if marks.contains_key(&seq) {
+                return Err(format!("image/offload: duplicate target seq {seq}"));
+            }
+            if !self.nodes.contains(&seq) {
+                return Err(format!(
+                    "image/offload: target seq {seq} is not a current surface node"
+                ));
+            }
+            let message = match event_at(log, seq) {
+                Some(SessionEvent::UserMessage { message, .. }) => serde_json::to_value(message),
+                Some(SessionEvent::ToolResult { data, .. }) => serde_json::to_value(&data.message),
+                _ => {
+                    return Err(format!(
+                        "image/offload: target seq {seq} must be user/message or tool/result"
+                    ));
+                }
+            }
+            .unwrap_or(Value::Null);
+            let mut chosen = Vec::new();
+            for value in indexes {
+                match index(Some(value)) {
+                    Some(image) if chosen.last().is_none_or(|last| image > *last) => {
+                        chosen.push(image)
+                    }
+                    _ => {
+                        return Err("image/offload: imageIndexes must be strictly increasing \
+                                    non-negative safe integers"
+                            .into());
+                    }
+                }
+            }
+            // The message's image blocks, in order, and whether each is
+            // offloaded already, in the log or by an earlier offload.
+            let earlier = self.offloaded.get(&seq);
+            let images: Vec<bool> = message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+                .enumerate()
+                .map(|(image, block)| {
+                    block.get("offloaded") == Some(&Value::Bool(true))
+                        || earlier.is_some_and(|marked| marked.contains(&(image as u64)))
+                })
+                .collect();
+            for image in &chosen {
+                match usize::try_from(*image).ok().and_then(|at| images.get(at)) {
+                    None => {
+                        return Err(format!("image/offload: image index {image} does not exist"));
+                    }
+                    Some(true) => {
+                        return Err(format!(
+                            "image/offload: image index {image} is already offloaded"
+                        ));
+                    }
+                    Some(false) => {}
+                }
+            }
+            marks.insert(seq, chosen.into_iter().collect());
+        }
+        for (seq, images) in marks {
+            self.offloaded.entry(seq).or_default().extend(images);
+        }
+        self.generation += 1;
+        Ok(())
+    }
+}
+
+/// A canonical index or seq: a non-negative safe integer.
+fn index(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|index| *index < (1 << 53))
 }
 
 /// How a surface event joins the surface, or `None` for any other event.
