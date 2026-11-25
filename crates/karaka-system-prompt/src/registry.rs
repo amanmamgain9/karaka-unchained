@@ -54,6 +54,24 @@ impl SectionOrder {
     }
 }
 
+/// Where a runtime context of a contributor coming to Karaka goes. dsh
+/// allocates more, for contributors not ported. (dsh: `CONTEXT_ORDERS` and
+/// `getContextOrder`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextOrder {
+    /// The working-directory service's context.
+    WorkingDirectory,
+}
+
+impl ContextOrder {
+    /// Its place among runtime contexts.
+    pub fn order(self) -> f64 {
+        match self {
+            Self::WorkingDirectory => 100.0,
+        }
+    }
+}
+
 /// Whose contributions an assembly takes, besides the global ones: one
 /// agent's, by the id of its session. (dsh: `ScopeKey`.)
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -950,6 +968,11 @@ mod tests {
         // U+FF5E sorts before U+1F600 in UTF-16, after it in UTF-8.
         assert_eq!(compare_names("\u{FF5E}", "\u{1F600}"), Ordering::Greater);
         assert_eq!(compare_names("zeta", "äther"), Ordering::Less);
+    }
+
+    #[test]
+    fn the_working_directorys_context_goes_where_dshs_does() {
+        assert_eq!(ContextOrder::WorkingDirectory.order(), 100.0);
     }
 
     #[test]

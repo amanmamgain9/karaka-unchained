@@ -38,8 +38,8 @@ pub use assembly::{
 };
 pub use plugin::SystemPromptPlugin;
 pub use registry::{
-    AssembleContext, AssembleFuture, AssembleListener, AssembleNext, HARNESS_IDENTITY,
-    HARNESS_IDENTITY_SECTION, PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION, PromptContext,
-    Registration, Scope, Section, SectionOrder, SystemPrompt, SystemPromptConfig, TOOL_ORDER_REST,
-    Text, ToolProviderResult,
+    AssembleContext, AssembleFuture, AssembleListener, AssembleNext, ContextOrder,
+    HARNESS_IDENTITY, HARNESS_IDENTITY_SECTION, PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION,
+    PromptContext, Registration, Scope, Section, SectionOrder, SystemPrompt, SystemPromptConfig,
+    TOOL_ORDER_REST, Text, ToolProviderResult,
 };

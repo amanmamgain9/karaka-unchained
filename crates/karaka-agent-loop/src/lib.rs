@@ -13,6 +13,8 @@
 //! - `request.rs`: the request header and route context logged before
 //!   each model call.
 //! - `live.rs`: the live frames of each model call.
+//! - `runtime_context.rs`: the runtime-context snapshot, sent when it
+//!   changes.
 //! - `failure.rs`: a failed model call as the failure a turn ends with.
 //! - `plugin.rs`: the agents port, and the plugin that provides it.
 //!
@@ -24,6 +26,7 @@ mod failure;
 mod live;
 mod plugin;
 mod request;
+mod runtime_context;
 mod turn;
 
 pub use plugin::{AgentLoop, AgentLoopPlugin, LoopConfig};

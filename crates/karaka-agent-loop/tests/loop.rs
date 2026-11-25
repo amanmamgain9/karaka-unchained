@@ -7,7 +7,7 @@
 use std::collections::VecDeque;
 use std::future::pending;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -32,8 +32,8 @@ use karaka_session::{
     chunk_json, expand_stream,
 };
 use karaka_system_prompt::{
-    HARNESS_IDENTITY, Scope, Section, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
-    TOOL_ORDER_REST,
+    HARNESS_IDENTITY, PromptContext, Scope, Section, SystemPrompt, SystemPromptConfig,
+    SystemPromptPlugin, TOOL_ORDER_REST, Text,
 };
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
@@ -2397,4 +2397,422 @@ async fn a_cancelled_call_embeds_what_streamed() {
             [&json!({ "type": "text-delta", "index": 0, "text": kept })]
         );
     }
+}
+
+// Runtime context. Ported from dsh's `agent-loop/tests/loop.spec.ts`
+// (its runtime-context cases without a pre-step hook, which isn't ported)
+// and `runtime-context.spec.ts`.
+
+const SNAPSHOT: &str =
+    "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.";
+const CLEARED: &str =
+    "Current runtime context: none. Earlier runtime-context snapshots no longer apply.";
+
+/// The runtime-context messages in the log, with their seqs.
+fn context_messages(events: &[Entry]) -> Vec<(Seq, UserMessage)> {
+    events
+        .iter()
+        .filter_map(|entry| match &entry.event {
+            SessionEvent::UserMessage { message, .. }
+                if matches!(message.source, UserSource::RuntimeContext(_)) =>
+            {
+                Some((entry.seq, message.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The text of each runtime-context message in the log.
+fn snapshots(harness: &Harness) -> Vec<String> {
+    context_messages(&harness.events())
+        .iter()
+        .map(|(_, message)| {
+            message
+                .blocks()
+                .iter()
+                .filter_map(|block| match block {
+                    Block::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// Whether a request showed the model a runtime-context snapshot holding
+/// `text`.
+fn shows(request: &Request, text: &str) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| message.role == Role::User && message.text().contains(text))
+}
+
+/// Replaces the surface node `seq` with a summary of another kind, as
+/// compaction would.
+fn compact(harness: &Harness, seq: Seq) {
+    let summary = UserMessage::text(
+        format!("summary-{seq}"),
+        UserSource::Other(serde_json::json!({ "kind": "test-compaction" })),
+        "compacted summary",
+    );
+    harness
+        .sessions
+        .append(
+            &id(),
+            SessionEvent::UserMessage {
+                message: summary,
+                surface: SurfaceIntent {
+                    op: SurfaceOp::Replace {
+                        start: seq,
+                        end: seq,
+                    },
+                    sources: vec![seq],
+                },
+            },
+        )
+        .unwrap();
+}
+
+fn policy(harness: &Harness, mode: &Arc<Mutex<String>>) -> karaka_system_prompt::Registration {
+    let mode = Arc::clone(mode);
+    harness
+        .prompt
+        .context(
+            None,
+            PromptContext::new(
+                "policy",
+                0.0,
+                Text::dynamic(move |_| format!("Mode: {}.", mode.lock().unwrap())),
+            ),
+        )
+        .unwrap()
+}
+
+/// dsh: "materializes changed runtime context at the history tail without
+/// rewriting the system header" (`loop.spec.ts:686`).
+#[tokio::test]
+async fn runtime_context_is_sent_when_it_changes_and_cleared_when_it_goes() {
+    let replies = (0..5).map(|n| text(&format!("answer {n}"))).collect();
+    let harness = Harness::with(replies, config(Some("Be brief.")), Vec::new()).await;
+    let mode = Arc::new(Mutex::new("read-only".to_owned()));
+    let registration = policy(&harness, &mode);
+
+    harness.say("first").await;
+    assert_eq!(
+        snapshots(&harness),
+        [format!("{SNAPSHOT}\n\nMode: read-only.")]
+    );
+    // After the prompt and the input, before the request's header: as dsh
+    // admits it.
+    let mut expected = vec![
+        "turn/start",
+        "step/start",
+        "system/message",
+        "user/message",
+        "user/message",
+    ];
+    expected.extend([
+        "request/header",
+        "request/context",
+        "assistant/message",
+        "step/end",
+        "turn/end",
+    ]);
+    assert_eq!(harness.types(), expected);
+    let (_, message) = &context_messages(&harness.events())[0];
+    assert_eq!(
+        serde_json::to_value(&message.source).unwrap(),
+        serde_json::json!({ "kind": "runtime-context", "form": "snapshot",
+                            "sections": [{ "name": "policy", "text": "Mode: read-only." }] })
+    );
+    assert!(shows(&harness.model.requests()[0], "Mode: read-only."));
+
+    harness.say("unchanged").await;
+    assert_eq!(snapshots(&harness).len(), 1);
+
+    *mode.lock().unwrap() = "danger-full-access".into();
+    harness.say("changed").await;
+    let sent = snapshots(&harness);
+    assert_eq!(sent.len(), 2);
+    assert!(sent[1].contains("danger-full-access"));
+
+    registration.remove();
+    harness.say("cleared").await;
+    assert_eq!(snapshots(&harness).len(), 3);
+    assert_eq!(snapshots(&harness)[2], CLEARED);
+    let cleared = &context_messages(&harness.events())[2].1;
+    assert_eq!(
+        serde_json::to_value(&cleared.source).unwrap(),
+        serde_json::json!({ "kind": "runtime-context" })
+    );
+
+    harness.say("still clear").await;
+    assert_eq!(snapshots(&harness).len(), 3);
+    // The prompt was never rewritten for it.
+    let requests = harness.model.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.system.as_deref() == Some("Be brief."))
+    );
+    assert_eq!(
+        harness
+            .types()
+            .iter()
+            .filter(|kind| *kind == "system/message")
+            .count(),
+        1
+    );
+    assert_eq!(reasons(&harness), [RequestHeaderReason::Initial]);
+}
+
+/// The registry's `include_runtime_context: false` keeps only required
+/// context.
+#[tokio::test]
+async fn required_context_survives_with_runtime_context_off() {
+    let mut prompt = quiet(None);
+    prompt.include_runtime_context = false;
+    let harness = Harness::with(
+        vec![text("ok")],
+        Setup {
+            loop_config: LoopConfig::new(ROUTE, MODEL),
+            prompt,
+        },
+        Vec::new(),
+    )
+    .await;
+    let _ = harness
+        .prompt
+        .context(
+            None,
+            PromptContext::new("directory", 0.0, "Current working directory: /workspace.")
+                .required(),
+        )
+        .unwrap();
+    let _ = harness
+        .prompt
+        .context(None, PromptContext::new("optional", 1.0, "Mode: optional."))
+        .unwrap();
+    harness.say("hi").await;
+    assert_eq!(
+        snapshots(&harness),
+        [format!(
+            "{SNAPSHOT}\n\nCurrent working directory: /workspace."
+        )]
+    );
+    assert!(!shows(&harness.model.requests()[0], "Mode: optional."));
+}
+
+/// dsh: "re-emits unchanged runtime context when a surface replacement
+/// removed the retained snapshot" (`loop.spec.ts:743`).
+#[tokio::test]
+async fn a_snapshot_compacted_away_is_sent_again() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let _ = harness
+        .prompt
+        .context(None, PromptContext::new("policy", 0.0, "Mode: read-only."))
+        .unwrap();
+    harness.say("first").await;
+    let (seq, _) = context_messages(&harness.events())[0].clone();
+    compact(&harness, seq);
+    harness.say("after compaction").await;
+    assert_eq!(snapshots(&harness).len(), 2);
+    assert!(shows(&harness.model.requests()[1], "Mode: read-only."));
+}
+
+/// dsh: "clears compacted runtime context after the active set becomes
+/// empty" (`loop.spec.ts:921`).
+#[tokio::test]
+async fn compacted_context_that_went_away_is_cleared() {
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let registration = harness
+        .prompt
+        .context(None, PromptContext::new("policy", 0.0, "Mode: read-only."))
+        .unwrap();
+    harness.say("first").await;
+    let (seq, _) = context_messages(&harness.events())[0].clone();
+    compact(&harness, seq);
+    registration.remove();
+    harness.say("after compaction").await;
+    assert!(shows(&harness.model.requests()[1], CLEARED));
+}
+
+/// dsh: "does not clear runtime context after an unrelated replacement"
+/// (`loop.spec.ts:952`).
+#[tokio::test]
+async fn an_unrelated_replacement_sends_nothing() {
+    let harness = Harness::new(vec![text("ok")]).await;
+    // The agent first, as dsh's test creates it before appending.
+    let _agent = harness.agent();
+    let original = UserMessage::text(
+        "old",
+        UserSource::Other(serde_json::json!({ "kind": "test-context" })),
+        "old context",
+    );
+    let seq = harness
+        .sessions
+        .append(&id(), SessionEvent::user(original))
+        .unwrap();
+    compact(&harness, seq);
+    harness.say("after compaction").await;
+    assert!(snapshots(&harness).is_empty());
+    assert!(!shows(
+        &harness.model.requests()[0],
+        "Current runtime context"
+    ));
+}
+
+/// dsh: "replaces a malformed retained runtime-context message with the
+/// current complete snapshot" (`loop.spec.ts:974`).
+#[tokio::test]
+async fn a_malformed_retained_snapshot_is_replaced() {
+    let harness = Harness::new(vec![text("ok")]).await;
+    let _ = harness
+        .prompt
+        .context(None, PromptContext::new("policy", 0.0, "Mode: read-only."))
+        .unwrap();
+    let _agent = harness.agent();
+    let mut broken = UserMessage::text(
+        "broken",
+        UserSource::RuntimeContext(Default::default()),
+        "broken",
+    );
+    broken
+        .content
+        .push(karaka_session::ContentBlock::text("snapshot"));
+    harness
+        .sessions
+        .append(&id(), SessionEvent::user(broken))
+        .unwrap();
+    harness.say("repair context").await;
+    let sent = snapshots(&harness);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1], format!("{SNAPSHOT}\n\nMode: read-only."));
+}
+
+/// A resumed session works out the snapshot already in effect from its
+/// log, as dsh's projection restores it (`runtime-context.ts:123-132`), so
+/// an unchanged one isn't sent again; a changed one is.
+#[tokio::test]
+async fn a_resumed_session_doesnt_resend_its_snapshot() {
+    let before = Harness::new(vec![text("one")]).await;
+    let _ = before
+        .prompt
+        .context(None, PromptContext::new("policy", 0.0, "Mode: read-only."))
+        .unwrap();
+    before.say("first").await;
+    let stored = before.events();
+
+    let after = Harness::with(vec![text("two"), text("three")], config(None), stored).await;
+    let mode = Arc::new(Mutex::new("read-only".to_owned()));
+    let _registration = policy(&after, &mode);
+    after.say("resumed").await;
+    assert_eq!(snapshots(&after).len(), 1);
+    *mode.lock().unwrap() = "strict".into();
+    after.say("changed").await;
+    assert_eq!(snapshots(&after).len(), 2);
+}
+
+/// dsh: "restores runtime context during a retry without admitting the
+/// user batch twice" (`loop.spec.ts:877`).
+#[tokio::test]
+async fn a_retry_after_its_snapshot_was_compacted_sends_it_again_once() {
+    let harness = Harness::new(vec![
+        text("one"),
+        failing(ErrorKind::ContextWindowExceeded, "overflow"),
+        text("two"),
+    ])
+    .await;
+    let _ = harness
+        .prompt
+        .context(
+            None,
+            PromptContext::new("directory", 0.0, "Current working directory: /workspace.")
+                .required(),
+        )
+        .unwrap();
+    harness.say("first").await;
+    harness
+        .hooks
+        .register(Arc::new(Handler(|error: &RequestError| {
+            let events = error.session.events();
+            let (seq, _) = context_messages(&events)
+                .last()
+                .cloned()
+                .expect("a retained snapshot");
+            let summary = UserMessage::text(
+                "checkpoint",
+                UserSource::Other(serde_json::json!({ "kind": "test-compaction" })),
+                "compacted checkpoint",
+            );
+            error
+                .session
+                .append(SessionEvent::UserMessage {
+                    message: summary,
+                    surface: SurfaceIntent {
+                        op: SurfaceOp::Replace {
+                            start: seq,
+                            end: seq,
+                        },
+                        sources: vec![seq],
+                    },
+                })
+                .map_err(|error| error.to_string())?;
+            Ok(Some(RequestErrorAction::Retry))
+        })));
+    harness.say("second").await;
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(shows(&requests[2], "/workspace"));
+    assert_eq!(snapshots(&harness).len(), 2);
+    let people = harness
+        .events()
+        .iter()
+        .filter(|entry| matches!(&entry.event, SessionEvent::UserMessage { message, .. } if matches!(message.source, UserSource::User(_))))
+        .count();
+    assert_eq!(people, 2);
+}
+
+/// dsh: "commits no pending user or prompt when a context provider cancels
+/// admission" (`loop.spec.ts:856`): the context read again at the attempt
+/// cancels, and nothing of the step is logged.
+#[tokio::test]
+async fn a_cancel_from_a_context_provider_commits_nothing() {
+    let harness = Harness::with(Vec::new(), config(Some("Be brief.")), Vec::new()).await;
+    let agent = harness.agent();
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let (counted, cancelled) = (Arc::clone(&evaluations), Arc::clone(&agent));
+    let _ = harness
+        .prompt
+        .context(
+            None,
+            PromptContext::new(
+                "cancel",
+                0.0,
+                Text::dynamic(move |_| {
+                    if counted.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                        cancelled.cancel(CancelCause::User);
+                    }
+                    "pending".into()
+                }),
+            ),
+        )
+        .unwrap();
+    agent.followup(user("do not commit"));
+    idle(agent.as_ref()).await;
+    assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+    assert!(harness.model.requests().is_empty());
+    let types = harness.types();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| kind == "user/message" || kind == "system/message"),
+        "{types:?}"
+    );
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
 }

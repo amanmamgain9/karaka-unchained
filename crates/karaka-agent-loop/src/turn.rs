@@ -57,6 +57,7 @@
 use std::future::{Future, poll_fn};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
+use std::sync::PoisonError;
 use std::task::{Context, Poll};
 
 use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
@@ -65,14 +66,17 @@ use serde_json::Value;
 
 use karaka_model::{
     Block, BlockAssembler, ErrorKind, FinishReason, Message, Model, ModelError, Request, Response,
-    Role, ToolCall, ToolSchema, Usage,
+    Role, ToolCall, Usage,
 };
 use karaka_session::{
     AssistantAttemptData, AssistantMessage, AssistantMessageData, CancelCause, CloseCause,
     ContentBlock, Extra, Failure, History, LogError, Seq, SessionEvent, SurfaceIntent, SurfaceOp,
     SystemMessage, SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason, UserMessage,
 };
-use karaka_system_prompt::{AssembleContext, PromptAssembly, Scope, render_prompt};
+use karaka_system_prompt::{
+    AssembleContext, PromptAssembly, Scope, join_context_sections, render_context_sections,
+    render_prompt,
+};
 
 use crate::agent::{Cancel, Inner};
 use crate::failure::{handler_panicked, model_failure, no_model, other_failure, panicked};
@@ -171,10 +175,13 @@ impl Inner {
             let assembly = self
                 .shared
                 .prompt
-                .assemble(&AssembleContext::scoped(Scope::new(
-                    self.session.id().as_str(),
-                )))
+                .assemble(&self.assemble_context())
                 .await
+                .map_err(|error| Stop::Failed(other_failure(&error)))?;
+            // dsh's pre-step renders the context for its default decision
+            // before the step starts, so a context that doesn't render ends
+            // the turn here too (`agent.ts:277`).
+            render_context_sections(&assembly)
                 .map_err(|error| Stop::Failed(other_failure(&error)))?;
             if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
@@ -217,7 +224,7 @@ impl Inner {
         let prompt =
             render_prompt(assembly).map_err(|error| Stop::Failed(other_failure(&error)))?;
         let response = self
-            .call_model(turn, step, input, &prompt, &assembly.tools, cancel)
+            .call_model(turn, step, input, &prompt, assembly, cancel)
             .await?;
 
         // `karaka_model::FinishReason::Paused` says to treat a paused answer as
@@ -284,13 +291,42 @@ impl Inner {
         step: u64,
         mut input: Option<UserMessage>,
         prompt: &str,
-        tools: &[ToolSchema],
+        assembly: &PromptAssembly,
         cancel: &Cancel,
     ) -> Result<Response, Stop> {
+        let tools = &assembly.tools;
         loop {
+            // The runtime context, read again for this attempt; the rest of
+            // the assembly stays as the step accepted it (`agent.ts:411`).
+            let current = self
+                .shared
+                .prompt
+                .refresh_context(assembly, &self.assemble_context());
+            let sections = render_context_sections(&current)
+                .map_err(|error| Stop::Failed(other_failure(&error)))?;
+            // A cancel here, from a context provider or anyone, leaves the
+            // step with nothing logged (`agent.ts:414`).
+            if let Some(cause) = cancel.cause() {
+                return Err(Stop::Aborted(cause));
+            }
             self.update_system_prompt(turn, step, prompt)?;
             if let Some(message) = input.take() {
                 self.session.append(SessionEvent::user(message))?;
+            }
+            // After the input, as dsh's default pre-step places it, and only
+            // when it changed (`agent.ts:278`, `413` and `425-438`).
+            let snapshot = self
+                .runtime_context
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .project(
+                    &self.session.events(),
+                    &join_context_sections(&sections),
+                    &sections,
+                    self.next_id("runtime-context"),
+                );
+            if let Some(snapshot) = snapshot {
+                self.session.append(SessionEvent::user(snapshot))?;
             }
 
             let config = &self.shared.config;
@@ -541,6 +577,11 @@ impl Inner {
                 .append_all(results.into_iter().map(|entry| entry.event))?;
         }
         Ok(())
+    }
+
+    /// What this agent's assemblies are for: its session's scope.
+    fn assemble_context(&self) -> AssembleContext {
+        AssembleContext::scoped(Scope::new(self.session.id().as_str()))
     }
 
     /// An id for the message the next appended event will hold.

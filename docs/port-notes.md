@@ -1383,11 +1383,8 @@ and its three spec files.*
   that agent's scope" where dsh's names `agent.ctx`.
 - **Tool schemas have no `deferLoading`.** Karaka's model seam doesn't
   model it.
-- **Runtime context isn't shown to the model yet.** The registry
-  assembles and refreshes it, but the loop doesn't yet project it as dsh's
-  `RuntimeContextProjection` does: a user-role snapshot appended when it
-  changes, and refreshed per attempt. No contributor of context exists in
-  Karaka.
+- **Runtime context** was not yet shown to the model at this step; see
+  "Runtime context" below, which ports it.
 
 ### dsh's other contributors, not ported
 
@@ -1427,3 +1424,80 @@ And dsh's context placements (`CONTEXT_ORDERS`):
 Personas, presets and skills are separate dsh plugins and are out of
 scope. dsh's assembly pulls in no guidance of its own beyond the identity
 line; all of the above comes from the packages that own those facts.
+
+## Runtime context
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-25:
+`agent-loop/src/runtime-context.ts` (`RuntimeContextProjection`) and its use
+in `agent.ts`.*
+
+### What is done
+
+- **The snapshot** (`karaka-agent-loop`, `runtime_context.rs`):
+  - It is a `user/message` with source `runtime-context`, appended to the
+    surface. Its text is the registry's rendered context, opened by
+    "Current runtime context. This snapshot supersedes earlier
+    runtime-context snapshots."
+  - Its source carries `form: "snapshot"` and the named sections. Context
+    that went away after a snapshot was sent sends dsh's CLEARED text with
+    a bare `{ "kind": "runtime-context" }` source.
+  - A snapshot is sent only when it differs from the one in effect: the
+    newest runtime-context message still on the surface, when that is one
+    text block.
+  - No context, and none ever sent, sends nothing.
+  - A replacement that cites the snapshot in effect, as compaction does,
+    drops it, so the next step sends it again, or CLEARED.
+- **Resume.** When the agent is made, the snapshot in effect is worked out
+  from the log, newest first, as dsh's constructor does, so a resumed
+  session doesn't send an unchanged snapshot again. The projection then
+  follows the log. dsh uses a `session/event` listener; Karaka reads the
+  events it hasn't seen each time it is asked. Since only the log changes
+  the state, the outcome is the same.
+- **Where it sits in the log**, as dsh admits it (`agent.ts:407-442`):
+  - Each attempt reads the context again with `refresh_context`.
+  - A cancel then (`agent.ts:414`), including one a context provider
+    triggers, logs nothing of the step.
+  - Then the system-prompt commits, then the step's input, then the
+    snapshot when it changed, then `request/header` and `request/context`
+    as the request is built.
+  - A retry whose snapshot was compacted meanwhile sends it again without
+    logging the input twice.
+  - Context that doesn't render ends the turn before its step, as dsh's
+    pre-step renders it for its default decision (`agent.ts:277`).
+- **Required context survives `include_runtime_context: false`**, by the
+  registry's suppression rules, which the refresh applies at each attempt.
+- **Order table:** `ContextOrder::WorkingDirectory`, at dsh's 100, for the
+  working-directory service coming next. The other context placements stay
+  listed under "System prompt".
+- **Tests:**
+  - dsh's `runtime-context.spec.ts`, as unit tests of the projection.
+  - The `loop.spec.ts` runtime-context cases that need no pre-step hook:
+    - context sent when it changes and cleared when it goes, with no
+      prompt rewrite and one `initial` header;
+    - a snapshot compacted away is sent again;
+    - compacted context that went away is cleared;
+    - an unrelated replacement sends nothing;
+    - a malformed retained snapshot is replaced;
+    - a retry after compaction sends the snapshot once more;
+    - a cancel from a context provider commits nothing.
+  - Karaka's own: required context with runtime context off; a resumed
+    session that doesn't resend an unchanged snapshot but sends a changed
+    one.
+  - Every loop log still passes the saved-stream check and the session's
+    log checks.
+
+### Where it differs from dsh
+
+- **No pre-step hook**, so the snapshot always goes after the step's
+  input, which is where dsh's default pre-step decision puts it. dsh's
+  cases that move it, or suppress it, through `agent/pre-step` aren't
+  ported: "replaces a stale owned snapshot at its accepted position",
+  "drops an uncommitted optional snapshot suppressed after the pre-step
+  fallback", "reconciles runtime context replaced before/after the pre-step
+  fallback", and the pre-step `reject`/`empty` cases.
+- **The snapshot's id** is `runtime-context-{seq}`, in the loop's id
+  style; dsh's is random.
+- **The projection reads unseen events when asked**, where dsh listens to
+  `session/event`.
+- **No context contributor exists yet.** The CLI sends no snapshot until
+  the working-directory service is ported.

@@ -44,6 +44,7 @@ use tokio::sync::watch;
 
 use crate::live::FrameCounters;
 use crate::plugin::Shared;
+use crate::runtime_context::RuntimeContextProjection;
 use crate::turn::Ran;
 
 /// The switch that cancels one turn. Only the first cause counts.
@@ -81,6 +82,9 @@ pub(crate) struct Inner {
     /// `true` while no driver runs. [`Agent::when_idle`] waits on it.
     /// Messages may still be queued, after a failed turn.
     idle: watch::Sender<bool>,
+    /// The runtime-context snapshot in effect, worked out from the log the
+    /// agent was made with. Only the driver uses it.
+    pub(crate) runtime_context: Mutex<RuntimeContextProjection>,
 }
 
 struct State {
@@ -114,7 +118,10 @@ impl LoopAgent {
             })
             .unwrap_or(0);
         let generation = session.surface_generation();
+        let runtime_context =
+            RuntimeContextProjection::restore(&session.events(), &session.surface_nodes());
         let inner = Inner {
+            runtime_context: Mutex::new(runtime_context),
             header_logged: AtomicBool::new(false),
             frames: FrameListeners::new(),
             frame_counters: FrameCounters::default(),
