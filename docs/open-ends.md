@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-26, after the argument checks in the tool registry.
+Last updated 2026-11-26, after the `ask_user_question` tool and the terminal answerer.
 
 ## Needs you
 
@@ -40,6 +40,11 @@ Last updated 2026-11-26, after the argument checks in the tool registry.
 - **pi-ai's per-message effort markers** aren't ported. (Second audit)
 - **Assistant messages that stopped with an error** stay in the history
   sent to the model. (Second audit)
+- **Piped answers aren't echoed.** With `printf '2\n' | karaka ask …`,
+  the model's reply starts on the question's `> ` prompt line, because
+  nothing ends that line. In a terminal, the Enter key does. The terminal
+  answerer should end the line itself when stdin isn't a terminal. (The
+  ask_user_question tool)
 
 ## Waiting on missing infrastructure
 
@@ -70,6 +75,10 @@ Last updated 2026-11-26, after the argument checks in the tool registry.
   another. (Agent loop, step one)
 - **`concludesTurn`**, which lets a tool end the turn. (Agent loop, step
   one)
+- **Tool calls have no cancel signal.** A cancelled call's future is
+  dropped. So `ask_user_question`'s request carries no signal, and an
+  answerer sees a cancel only as its own future being dropped. (The
+  ask_user_question tool)
 - **Tool results carry text only.** dsh's also carry images, a
   structured error `{ name, code, reason }`, presentation data and extra
   context for the next step. Play This Life shows its upgrade prompt on
@@ -105,6 +114,11 @@ Last updated 2026-11-26, after the argument checks in the tool registry.
 - **No wire to UI clients.** dsh's typert `@Remote` methods aren't
   ported. The user-questions "time remaining" stream is a plain Rust
   stream for now. This comes with the webserver. (User questions)
+- **Late replies from the terminal.** The binary mounts the legacy
+  `ask_user_question`, as dsh's bundles do, so its questions block and
+  never go pending. With the timed tool, a pending question would need a
+  way to answer it later from `chat` (`UserQuestions::answer`), which
+  isn't built. (The ask_user_question tool)
 - **No presentation layer.** `presentCall` and other card data for UIs
   aren't ported. (The todo_write tool)
 
@@ -131,7 +145,6 @@ Last updated 2026-11-26, after the argument checks in the tool registry.
 
 From Play This Life's plugin list:
 
-- **Next:** `tool-ask-user`, with a terminal answerer in the binary.
 - **Questions and approvals:** `user-approval`.
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.

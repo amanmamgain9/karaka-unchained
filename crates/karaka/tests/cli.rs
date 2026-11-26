@@ -481,8 +481,9 @@ fn asks_deepseek_in_the_messages_format() {
     );
     assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
     // After the question, the runtime context: the session's working
-    // directory, which for `ask` is the process's own. The tools are
-    // `todo_write`, parallel work allowed, and `working_directory`.
+    // directory, which for `ask` is the process's own. The tools are the
+    // legacy `ask_user_question`, `todo_write`, parallel work allowed, and
+    // `working_directory`.
     let directory = std::env::current_dir().unwrap();
     let context = format!(
         "Current runtime context. This snapshot supersedes earlier runtime-context \
@@ -499,7 +500,9 @@ fn asks_deepseek_in_the_messages_format() {
                 r#""max_tokens":393216,"thinking":{{"type":"enabled"}},"#,
                 r#""output_config":{{"effort":"max"}},"#,
                 r#""system":"You are an AI agent powered by Karaka.\n\nBe brief.","#,
-                r#""tools":[{{"name":"todo_write","description":{todo},"#,
+                r#""tools":[{{"name":"ask_user_question","description":{ask},"#,
+                r#""input_schema":{ask_parameters}}},"#,
+                r#"{{"name":"todo_write","description":{todo},"#,
                 r#""input_schema":{{"type":"object","properties":{{"todos":{{"type":"array","#,
                 r#""description":"The COMPLETE task list, replacing any previous list.","#,
                 r#""items":{{"type":"object","additionalProperties":false,"properties":{{"#,
@@ -517,7 +520,10 @@ fn asks_deepseek_in_the_messages_format() {
                 r#"read the current directory."}}}}}}}}]}}"#
             ),
             context = serde_json::to_string(&context).unwrap(),
-            todo = serde_json::to_string(&karaka_tool_todo::description(true)).unwrap()
+            todo = serde_json::to_string(&karaka_tool_todo::description(true)).unwrap(),
+            ask = serde_json::to_string(karaka_tool_ask_user::LEGACY_DESCRIPTION).unwrap(),
+            ask_parameters =
+                karaka_tool_ask_user::parameters(karaka_tool_ask_user::Mode::Legacy, 120)
         )
     );
 }
@@ -890,4 +896,169 @@ fn ask_ends_the_line_and_says_so_when_it_retries_after_text() {
         "karaka: trying again\nstop: finished · in 12 (+100 cached) · out 34 tokens\n"
     );
     assert_eq!(server.join().expect("the server ran").len(), 2);
+}
+
+/// Anthropic's events for a call to `ask_user_question` with `input`.
+fn anthropic_asks(input: &serde_json::Value) -> String {
+    let partial = serde_json::to_string(&input.to_string()).unwrap();
+    [
+        r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}"#.to_owned(),
+        r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_ask","name":"ask_user_question","input":{}}}"#.to_owned(),
+        format!(
+            r#"event: content_block_delta
+data: {{"type":"content_block_delta","index":0,"delta":{{"type":"input_json_delta","partial_json":{partial}}}}}"#
+        ),
+        r#"event: content_block_stop
+data: {"type":"content_block_stop","index":0}"#.to_owned(),
+        r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#.to_owned(),
+        r#"event: message_stop
+data: {"type":"message_stop"}"#.to_owned(),
+    ]
+    .map(|event| format!("{event}\n\n"))
+    .concat()
+}
+
+/// A question with two options.
+fn package_question() -> serde_json::Value {
+    serde_json::json!({ "questions": [{
+        "id": "pkg", "question": "Which package manager?", "header": "Setup",
+        "options": [{ "label": "pnpm", "description": "Workspace default." }, { "label": "npm" }],
+    }] })
+}
+
+/// The text of the tool result a request carries back for `toolu_ask`.
+fn ask_result(request: &str) -> serde_json::Value {
+    let body: serde_json::Value = serde_json::from_str(body(request)).unwrap();
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .find(|block| block["type"] == "tool_result" && block["tool_use_id"] == "toolu_ask")
+        .expect("the request carries the question's result")
+}
+
+/// The first text of a tool result block.
+fn result_text(block: &serde_json::Value) -> String {
+    match &block["content"] {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks[0]["text"].as_str().unwrap().to_owned(),
+        other => panic!("unexpected content {other}"),
+    }
+}
+
+// While the model's question is open, the next line of stdin answers it;
+// the line after is the chat's next message.
+#[test]
+fn chat_routes_the_next_line_to_an_open_question() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_asks(&package_question())),
+        streamed(&anthropic_text("You picked npm.")),
+        streamed(&anthropic_text("You asked which one you picked.")),
+    ]);
+
+    let output = karaka(
+        &["chat"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "set up the project\n2\nwhat did I pick?\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // The question is on stderr, so stdout stays the answers.
+    assert_eq!(
+        stderr,
+        "\n[Setup] Which package manager?\n  1. pnpm - Workspace default.\n  2. npm\n\
+         Pick a number, or type your own answer. Enter skips.\n> "
+    );
+    let stdout = text(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            r#"[ask_user_question gave: {"answers":[{"id":"pkg","selected":["npm"]}]}]"#,
+            "You picked npm.",
+            "You asked which one you picked.",
+        ],
+        "{stdout}"
+    );
+
+    let sent = server.join().expect("the server ran");
+    assert_eq!(
+        result_text(&ask_result(&sent[1])),
+        r#"{"answers":[{"id":"pkg","selected":["npm"]}]}"#
+    );
+    // The answer's line didn't become a message; the next line did.
+    let third = body(&sent[2]);
+    assert!(third.contains("what did I pick?"), "{third}");
+    assert!(!third.contains(r#""text":"2""#), "{third}");
+}
+
+// `ask` reads stdin only for a question the model asks, so a piped line
+// answers it.
+#[test]
+fn ask_answers_the_models_question_from_piped_stdin() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_asks(&package_question())),
+        streamed(&anthropic_text("Using pnpm.")),
+    ]);
+
+    let output = karaka(
+        &["ask", "set", "up", "the", "project"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "1\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("[Setup] Which package manager?\n"),
+        "{stderr}"
+    );
+    // The printer starts each step's text on a line of its own.
+    assert_eq!(text(&output.stdout), "\nUsing pnpm.\n");
+    let sent = server.join().expect("the server ran");
+    assert_eq!(
+        result_text(&ask_result(&sent[1])),
+        r#"{"answers":[{"id":"pkg","selected":["pnpm"]}]}"#
+    );
+}
+
+// At the end of stdin, an open question is cancelled, not waited on: the
+// model reads that it was aborted, and the run ends.
+#[test]
+fn the_end_of_stdin_cancels_an_open_question() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_asks(&package_question())),
+        streamed(&anthropic_text("I'll pick pnpm myself.")),
+    ]);
+
+    let output = karaka(
+        &["ask", "set", "up", "the", "project"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "\nI'll pick pnpm myself.\n");
+    let sent = server.join().expect("the server ran");
+    let result = ask_result(&sent[1]);
+    assert_eq!(result["is_error"], true);
+    assert_eq!(
+        result_text(&result),
+        "Error: ask_user_question was aborted before the user answered"
+    );
 }

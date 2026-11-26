@@ -2187,9 +2187,8 @@ schema compiler and validator from `core/tools/src`.*
 
 `karaka-user-questions` ports dsh's
 `packages/interaction/user-questions`: `types.ts`, `projection.ts`,
-`timed-wait.ts` and `index.ts`. The model-facing `ask_user_question` tool
-and an answerer for the binary come next, so the binary doesn't mount it
-yet.
+`timed-wait.ts` and `index.ts`. The model-facing tool and the binary's
+answerer are in "The ask_user_question tool".
 
 ### What is done
 
@@ -2397,3 +2396,96 @@ dsh's `defineTool` does.
   parsed, and MCP's adapter falls back to `{}`.
 - **The schema is checked when the tool is registered,** not when it is
   defined. Rust tools have no `defineTool`.
+
+## The ask_user_question tool
+
+`karaka-tool-ask-user` ports dsh's `packages/interaction/tool-ask-user`
+(`index.ts` and `timed.ts`). The binary mounts it, with an answerer that
+asks on the terminal.
+
+### What is done
+
+- **The config.** `AskUserConfig { mode, timeout }` defaults to the legacy
+  tool and 120 seconds. `timeout` is -1 or 1 to 2,147,483 seconds, and the
+  timed tool checks it when it is made, with dsh's `validateTimeout` text.
+- **Both tools.** They have dsh's descriptions and its `pendingNotice`.
+  Their parameters are byte for byte what dsh's `defineTool` compiles:
+  - `type`, then the annotations, then `additionalProperties`, then
+    `properties`, then `required`;
+  - the root is open;
+  - the timed tool adds `timeout`, described with its default filled in.
+- **Timed execution**, in dsh's order:
+  1. The registry's argument check. `1.5` gives `"timeout" must be an
+     integer`.
+  2. `validateTimeout`.
+  3. `validateQuestionIds`.
+  4. With a window, `ask_timed`, which needs an agent: "timed questions
+     require a live agent". A pending result is `{pending, callId,
+     message}`.
+  5. With -1, `ask` with `wait {callId}`, not timed, and the agent when
+     there is one.
+- **Legacy execution** is `ask`, with the agent when there is one and no
+  wait.
+- **Results.** A result is the JSON text of the value, as dsh's `render`
+  gives it. A failure is `Error: <message>`, as dsh's tool layer gives a
+  thrown error. That includes the service's errors, such as `Error: no
+  user-questions answerer accepted the request`.
+- **The plugin**, `AskUserPlugin`, requires the tool registry and
+  `UserQuestions`.
+- **The binary mounts the legacy tool.** dsh's only bundles that mount
+  `tool-ask-user` are the web-app presets (`cordis.patch.yml`,
+  `standard.patch.yml`, `ptc.patch.yml`), and they give it no config. The
+  CLI app takes its composition from them. So the late-reply path isn't
+  needed on the terminal, and isn't wired (see open ends).
+- **The terminal answerer** (`karaka/src/questions.rs`) writes each
+  question to stderr, so stdout stays the answer:
+  - its place when there are several, `[header]`, the question, the
+    detail, the numbered options with their descriptions, and how to
+    answer.
+
+  It reads one line per question:
+  - a number picks an option;
+  - for a multi-select question, numbers separated by commas pick each,
+    in order, once;
+  - any other line, including a number that names no option, is `custom`;
+  - an empty line skips the question.
+
+  At the end of stdin it fails with `ASK_ABORTED`, and the model reads
+  that as the tool's error. `UserQuestionError::aborted` is now public for
+  it.
+- **Stdin has one reader.** `Lines` reads on a thread of its own, and
+  only when asked for a line. `chat` asks for its next message only while
+  the agent is idle, and a question asks only during a turn, so while a
+  question is open the next lines answer it. Nothing is read ahead, so a
+  piped stdin splits the same way, and `printf '1\n' | karaka ask "…"`
+  answers with option 1. A line read for a caller that stopped waiting is
+  kept for the next one. The thread isn't the runtime's, so an exit never
+  waits on a read.
+- **Tests:**
+  - `tool-ask-user.spec`, but for what is listed below, with the schema
+    compared to the byte;
+  - the terminal answerer's rendering and parsing, and `Lines`, as unit
+    tests;
+  - three CLI cases: chat routes the line after a question to it and the
+    next line to the chat, `ask` answers from piped stdin, and the end of
+    stdin aborts the question;
+  - the `ask` CLI case expects the new tool in its request, first, in
+    the registry's order.
+
+### Left out
+
+- **"passes the tool abort signal".** A Karaka tool has no signal; its
+  future is dropped instead (see open ends).
+- **The DELEGATED_CALLER case.** There are no child agents.
+- **Unregistering when the plugin unloads.**
+- **The structured `error.info`** (`UserQuestionError` and its code). A
+  Karaka result is text only. The text is checked instead.
+
+### Where it differs from dsh
+
+- **An option's undeclared keys are dropped** on their way to the service.
+  dsh copies options as they are, and the service's option type here has
+  only `label` and `description`.
+- **The CLI prints a step's text on a line of its own**, so an `ask` whose
+  model asked a question prints a blank line before the answer. That is
+  the printer's behaviour after any tool call.

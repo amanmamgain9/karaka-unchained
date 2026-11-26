@@ -52,6 +52,8 @@ karaka-fs = { path = "crates/karaka-fs" }
 karaka-working-directory = { path = "crates/karaka-working-directory" }
 karaka-tool-working-directory = { path = "crates/karaka-tool-working-directory" }
 karaka-tool-todo = { path = "crates/karaka-tool-todo" }
+karaka-user-questions = { path = "crates/karaka-user-questions" }
+karaka-tool-ask-user = { path = "crates/karaka-tool-ask-user" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }

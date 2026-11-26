@@ -629,9 +629,11 @@ dependencies = [
  "karaka-session-persistence",
  "karaka-session-projection",
  "karaka-system-prompt",
+ "karaka-tool-ask-user",
  "karaka-tool-todo",
  "karaka-tool-working-directory",
  "karaka-tools",
+ "karaka-user-questions",
  "karaka-working-directory",
  "serde_json",
  "tokio",
@@ -801,6 +803,22 @@ version = "0.1.0"
 dependencies = [
  "karaka-kernel",
  "karaka-model",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-tool-ask-user"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-system-prompt",
+ "karaka-tools",
+ "karaka-user-questions",
+ "serde_json",
  "tokio",
 ]
 

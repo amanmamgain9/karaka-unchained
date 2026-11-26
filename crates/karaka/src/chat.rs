@@ -10,7 +10,7 @@
 //! ends.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, BufReader, IsTerminal, Write};
 use std::sync::Arc;
 
 use karaka_agent::Agents;
@@ -27,13 +27,16 @@ use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
+use karaka_tool_ask_user::{AskUserConfig, AskUserPlugin};
 use karaka_tool_todo::{TodoConfig, TodoToolPlugin};
 use karaka_tool_working_directory::WorkingDirectoryToolPlugin;
 use karaka_tools::{ToolRegistry, ToolsPlugin};
+use karaka_user_questions::{UserQuestions, UserQuestionsPlugin};
 use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
 use crate::current_time::CurrentTime;
+use crate::questions::{Lines, TerminalAnswerer};
 
 /// The session a chat runs in, unless `KARAKA_SESSION` names another.
 const SESSION: &str = "chat";
@@ -44,8 +47,9 @@ const SHORT_RESULT: usize = 80;
 /// The plugins `chat` and `ask` both run: the model provider, the system
 /// prompt, the tools and sessions, the sessions' projections, the host's
 /// files and each session's working directory with its tool, the todo
-/// tool, the agent loop, and the retry plugin, which retries a failed
-/// request as the provider's policy says before the turn gives up.
+/// tool, the user-questions service with the `ask_user_question` tool, the
+/// agent loop, and the retry plugin, which retries a failed request as the
+/// provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
@@ -74,9 +78,24 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     plugins.push(Box::new(TodoToolPlugin::new(TodoConfig {
         allow_parallel_in_progress: true,
     })));
+    // Questions the model asks the user, with the blocking legacy tool,
+    // which is what dsh's bundles mount (`tool-ask-user` with no config in
+    // `bundle/web-app/presets/*.patch.yml`).
+    plugins.push(Box::new(UserQuestionsPlugin));
+    plugins.push(Box::new(AskUserPlugin::new(AskUserConfig::default())));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins
+}
+
+/// Puts the model's questions to the user on the terminal: written to
+/// stderr, answered from `lines`.
+pub fn answer_on_the_terminal(runtime: &Runtime, lines: &Arc<Lines>) {
+    let answerer = TerminalAnswerer::new(Arc::clone(lines), Box::new(io::stderr()));
+    // For the runtime's life.
+    let _ = runtime
+        .get::<UserQuestions>()
+        .answerer(None, Arc::new(answerer));
 }
 
 /// Runs the chat until stdin ends.
@@ -96,6 +115,10 @@ pub async fn chat(config: Config) -> Result<(), String> {
         .get::<ToolRegistry>()
         .register(Arc::new(CurrentTime))
         .map_err(|error| error.to_string())?;
+    // stdin's one reader, shared by the chat's messages and the model's
+    // questions (see `questions.rs`).
+    let lines = Arc::new(Lines::new(BufReader::new(io::stdin())));
+    answer_on_the_terminal(&runtime, &lines);
 
     // A stored session is resumed, and repaired if a crash left a turn
     // open, before the agent sees it.
@@ -113,7 +136,7 @@ pub async fn chat(config: Config) -> Result<(), String> {
         }
         None => None,
     };
-    let result = converse(&runtime, &id).await;
+    let result = converse(&runtime, &id, &lines).await;
     // Whatever happened, what the chat said is written before it exits.
     if let Some(durable) = durable {
         durable.close().await.map_err(|error| error.to_string())?;
@@ -122,7 +145,7 @@ pub async fn chat(config: Config) -> Result<(), String> {
 }
 
 /// Reads lines and answers them until stdin ends.
-async fn converse(runtime: &Runtime, id: &SessionId) -> Result<(), String> {
+async fn converse(runtime: &Runtime, id: &SessionId, lines: &Lines) -> Result<(), String> {
     let store = runtime.get::<SessionStore>();
     let agent = runtime
         .get::<dyn Agents>()
@@ -138,17 +161,19 @@ async fn converse(runtime: &Runtime, id: &SessionId) -> Result<(), String> {
         }
         eprintln!("Type a message and press Enter. Ctrl-D ends the chat.");
     }
-    let mut lines = io::stdin().lock().lines();
     loop {
         if interactive {
             eprint!("> ");
         }
-        // This blocks the thread, but the agent is idle, and its turns run
-        // on the runtime's other threads anyway.
-        let Some(line) = lines.next() else {
+        // Read only now, with the agent idle: during a turn, the lines are a
+        // question's to read.
+        let Some(line) = lines
+            .next()
+            .await
+            .map_err(|error| format!("couldn't read the message: {error}"))?
+        else {
             return Ok(());
         };
-        let line = line.map_err(|error| format!("couldn't read the message: {error}"))?;
         let line = line.trim();
         if line.is_empty() {
             continue;

@@ -77,8 +77,9 @@ impl UserQuestionError {
         self.cause.as_ref()
     }
 
-    /// dsh: `abortedQuestion`.
-    pub(crate) fn aborted(cause: Option<Cause>) -> Self {
+    /// `ASK_ABORTED`, caused by `cause`, for an answerer whose user went
+    /// away, too. (dsh: `abortedQuestion`.)
+    pub fn aborted(cause: Option<Cause>) -> Self {
         Self {
             cause,
             ..Self::new(

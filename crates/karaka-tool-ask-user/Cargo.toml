@@ -1,0 +1,27 @@
+[package]
+name = "karaka-tool-ask-user"
+description = "The ask_user_question tool: the model asks the user, through the user-questions service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the tool.
+karaka-kernel.workspace = true
+# The tool seam, and the schema the model sees.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+# The service the tool asks through.
+karaka-user-questions.workspace = true
+# `preserve_order`, so the schema keeps dsh's key order, and the results
+# are dsh's JSON text.
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+karaka-agent.workspace = true
+karaka-session.workspace = true
+karaka-session-projection.workspace = true
+karaka-system-prompt.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

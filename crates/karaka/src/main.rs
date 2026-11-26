@@ -10,9 +10,10 @@ mod answer;
 mod chat;
 mod config;
 mod current_time;
+mod questions;
 
 use std::ffi::OsString;
-use std::io::{self, IsTerminal};
+use std::io::{self, BufReader, IsTerminal};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSou
 
 use crate::answer::Printer;
 use crate::config::Config;
+use crate::questions::Lines;
 
 const USAGE: &str = "\
 Usage: karaka ask <question...>
@@ -36,8 +38,12 @@ With no question, or with -, the question is read from stdin. A request
 that fails for a reason worth retrying is tried again first.
 
 chat reads messages from stdin, one per line, and answers each through
-the agent loop, which can call one tool, current_time. Each tool call is
-printed on a line of its own, then the answer. A request that fails for a
+the agent loop and its tools. Each tool call is printed on a line of its
+own, then the answer.
+
+Either may ask you a question on stderr. Answer it on stdin with an
+option's number (numbers separated by commas where several may be
+picked), or type your own answer; an empty line skips it. A request that fails for a
 reason worth retrying, such as a rate limit, is tried again first. With
 KARAKA_SESSIONS set, the chat is stored there, and the next chat in the
 same session carries on the conversation.
@@ -159,6 +165,10 @@ async fn ask(question: Option<String>) -> Result<(), String> {
     // Checked before the turn, so an unknown route lists the routes there
     // are, rather than failing the turn.
     model_at(&runtime.get::<ModelRegistry>(), &route)?;
+    // The model's questions are put on the terminal, and answered from
+    // stdin, which `ask` otherwise reads only for a question it wasn't
+    // given: `printf '1\n' | karaka ask "…"` picks the first option.
+    chat::answer_on_the_terminal(&runtime, &Arc::new(Lines::new(BufReader::new(io::stdin()))));
 
     let id = SessionId::new("ask");
     let agent = runtime

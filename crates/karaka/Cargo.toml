@@ -33,6 +33,10 @@ karaka-working-directory.workspace = true
 karaka-tool-working-directory.workspace = true
 # The model's task list.
 karaka-tool-todo.workspace = true
+# Questions the model asks the user, and its tool for asking them. The
+# binary answers them on the terminal.
+karaka-user-questions.workspace = true
+karaka-tool-ask-user.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true
@@ -42,4 +46,5 @@ serde_json.workspace = true
 httpdate.workspace = true
 # `rt-multi-thread` is the executor a server will need, so the binary starts
 # on it now. `macros` is for `#[tokio::main]`.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `sync` for handing a line of stdin to whoever asked for it.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
