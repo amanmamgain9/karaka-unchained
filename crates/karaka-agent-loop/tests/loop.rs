@@ -3391,3 +3391,76 @@ async fn a_pending_id_cant_be_queued_again() {
     assert_eq!(splices(&harness).len(), 1);
     assert!(harness.model.requests().is_empty());
 }
+
+/// Records what the inbox hooks hear: `claimed id turn` and `discarded id`.
+#[derive(Default)]
+struct Heard(Mutex<Vec<String>>);
+
+impl karaka_agent::InboxListener for Heard {
+    fn claimed(&self, agent: &dyn Agent, message: &UserMessage, turn: u64) {
+        assert_eq!(agent.id(), &id());
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("claimed {} {turn}", message.id));
+    }
+
+    fn discarded(&self, agent: &dyn Agent, message: &UserMessage) {
+        assert_eq!(agent.id(), &id());
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("discarded {}", message.id));
+    }
+}
+
+// dsh's `agent/inbox/claimed` and `agent/inbox/discarded`: each message a
+// step takes, with its turn, after `turn/start`; and each message a cancel
+// drops, next-step first.
+#[tokio::test]
+async fn the_inbox_hooks_hear_each_claim_and_each_discard() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![
+        text("one"),
+        Reply::Hang(Vec::new(), Arc::clone(&waiting)),
+    ])
+    .await;
+    let heard = Arc::new(Heard::default());
+    let hooks = harness._runtime.get::<karaka_agent::InboxHooks>();
+    hooks.register(Arc::clone(&heard) as Arc<dyn karaka_agent::InboxListener>);
+    let agent = harness.agent();
+    agent.inject(notice("context")).unwrap();
+    harness.say("first").await;
+    assert_eq!(
+        *heard.0.lock().unwrap(),
+        ["claimed notice-context 1", "claimed user-first 1"]
+    );
+
+    agent.followup(user("second")).unwrap();
+    waiting.notified().await;
+    agent.inject(notice("late")).unwrap();
+    agent.followup(user("third")).unwrap();
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+    assert_eq!(
+        heard.0.lock().unwrap()[2..],
+        [
+            "claimed user-second 2",
+            "discarded notice-late",
+            "discarded user-third",
+        ]
+    );
+}
+
+// dsh's registry `get`: the live agent, or none, without making one; and
+// every handle on one agent shares its instance.
+#[tokio::test]
+async fn the_registry_finds_live_agents_without_making_them() {
+    let harness = Harness::new(Vec::new()).await;
+    assert!(harness.agents.get(&id()).is_none());
+    let agent = harness.agent();
+    let found = harness.agents.get(&id()).expect("the agent is live");
+    assert_eq!(found.instance(), agent.instance());
+    let other = harness.agents.open(SessionId::new("b1")).unwrap();
+    assert_ne!(other.instance(), agent.instance());
+}

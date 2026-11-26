@@ -232,12 +232,12 @@ impl Inbox<'_> {
         Ok(claimed)
     }
 
-    /// Drops everything pending, next-step first, as cancellations. (dsh:
-    /// `clear`.)
-    pub(crate) fn clear(&self) -> Result<(), InboxError> {
-        self.splice(InboxTarget::NextStep, 0, usize::MAX, Vec::new())?;
-        self.splice(InboxTarget::NextTurn, 0, usize::MAX, Vec::new())?;
-        Ok(())
+    /// Drops everything pending, next-step first, as cancellations, and
+    /// gives what it dropped, in that order. (dsh: `clear`.)
+    pub(crate) fn clear(&self) -> Result<Vec<UserMessage>, InboxError> {
+        let mut dropped = self.splice(InboxTarget::NextStep, 0, usize::MAX, Vec::new())?;
+        dropped.extend(self.splice(InboxTarget::NextTurn, 0, usize::MAX, Vec::new())?);
+        Ok(dropped)
     }
 
     /// A splice whose removed messages are dropped, not taken. (dsh:

@@ -21,15 +21,18 @@
 //! (`request_error.rs`). Its payload can wait on the turn's
 //! [`Cancellation`] (`cancel.rs`). And each agent publishes live
 //! [`AssistantStreamFrame`]s of its model calls, for a view that shows the
-//! answer as it is written (`stream.rs`).
+//! answer as it is written (`stream.rs`). [`InboxHooks`] tell plugins when
+//! a message leaves an agent's inbox (`inbox_hooks.rs`).
 
 mod cancel;
 mod inbox;
+mod inbox_hooks;
 mod request_error;
 mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
 pub use inbox::{InboxError, SpliceCause};
+pub use inbox_hooks::{InboxHooks, InboxListener};
 pub use request_error::{
     HandlerError, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
     RequestErrorHooks,
@@ -116,6 +119,20 @@ pub trait Agent: Send + Sync {
     /// agent-scoped `agent/assistant-stream` event.) See `stream.rs` for
     /// what a listener may do.
     fn subscribe(&self, listener: FrameListener) -> FrameSubscription;
+
+    /// Which agent this is, beyond its id: two handles on one agent give
+    /// the same number, and a different agent, even one with the same id,
+    /// gives another while both live. dsh compares agent objects by
+    /// identity (`assertLiveRoot` in `user-questions/src/index.ts`); a
+    /// Rust agent may be reached through more than one `Arc`, so it says
+    /// what its identity is.
+    ///
+    /// The default is the address of `self`, which suits an agent with one
+    /// handle. An agent whose handles wrap a shared core gives the core's
+    /// address.
+    fn instance(&self) -> usize {
+        std::ptr::from_ref(self).cast::<()>() as usize
+    }
 }
 
 /// The future [`Agent::when_idle`] returns. Boxed so the trait works as
@@ -150,6 +167,10 @@ pub trait Agents: Send + Sync {
     /// The closing events don't fit the log, or the log's queued input
     /// doesn't fold, as dsh refuses to read an invalid inbox history.
     fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, OpenError>;
+
+    /// The live agent for the session `id`, if one has been opened, without
+    /// making one. (dsh: `AgentRegistry.get`.)
+    fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>>;
 }
 
 /// Why [`Agents::open`] failed.

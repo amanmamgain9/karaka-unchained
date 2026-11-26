@@ -1,0 +1,39 @@
+[package]
+name = "karaka-user-questions"
+description = "Questions an agent asks the user: the answerer chain, timed waits, late replies, and the userQuestions projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that provides the service.
+karaka-kernel.workspace = true
+# The calling agent, the registry that vouches for it, and the inbox
+# signals that track a late reply.
+karaka-agent.workspace = true
+# The events the projection folds, the reply message, and the listener
+# that sees a reply admitted.
+karaka-session.workspace = true
+# The `userQuestions` projection, and the `inbox` one a reply is looked
+# for in.
+karaka-session-projection.workspace = true
+# The cancel a request carries: a cause-less signal, as dsh's `AbortSignal`.
+karaka-fs.workspace = true
+# The questions and answers, in dsh's JSON. `preserve_order`, so the reply's
+# text keeps dsh's key order.
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+# The stream a client attaches to a timed wait.
+futures-core.workspace = true
+# `time` for a timed wait's deadline; `rt` to run its timer; `sync` for its
+# end; `macros` to race a claim's two signals.
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+karaka-agent-loop.workspace = true
+karaka-model.workspace = true
+karaka-system-prompt.workspace = true
+karaka-tools.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }

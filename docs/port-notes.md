@@ -2180,3 +2180,144 @@ schema compiler and validator from `core/tools/src`.*
 - **A `todo/write` whose `todos` doesn't read as a list** leaves the
   projection unchanged. dsh folds whatever the event holds; storage
   doesn't check it in either.
+
+## User questions
+
+`karaka-user-questions` ports dsh's
+`packages/interaction/user-questions`: `types.ts`, `projection.ts`,
+`timed-wait.ts` and `index.ts`. The model-facing `ask_user_question` tool
+and an answerer for the binary come next, so the binary doesn't mount it
+yet.
+
+### What is done
+
+- **The types**, in dsh's camelCase JSON, with absent optionals left out:
+  questions, options, the plan-review intent, answer batches, pending and
+  settled questions, the projection's view, and the timed result
+  (`{pending: true, callId}` or the batch). The late reply's source is
+  `{kind: "user-question-reply", callId, outcome: "answered"}`.
+- **`ask`**, with dsh's order and texts:
+  1. ASK_ABORTED for a signal that already fired;
+  2. EMPTY_QUESTIONS;
+  3. CALLER_NOT_LIVE;
+  4. both BAD_INTENT checks;
+  5. the answerer chain.
+
+  A failure in the service's terms passes through. Any other becomes
+  ASK_ABORTED, with it as the cause, when the signal has fired, and
+  passes through otherwise.
+- **The answerer chain**, dsh's `user-questions/request` waterfall:
+  - A `QuestionAnswerer` gets the request and an `AnswerNext`, and answers
+    or runs the rest.
+  - An answerer is global, or scoped to one agent by its session id, as
+    the system prompt's listeners are. An agent's request runs the global
+    ones and its own, in registration order; a request with no agent runs
+    only the global ones.
+  - The end of the chain fails with NO_PROVIDER.
+  - The cancel is `karaka-fs`'s `AbortSignal`. The agent seam's
+    `Cancellation` needs a `CancelCause`, which a question's signal
+    doesn't have, so the crate depends on `karaka-fs` for it.
+- **`ask_timed`** and `TimedQuestionWait`:
+  - BAD_TIMEOUT is for 0 or more than 2,147,483,647 ms. The window is a
+    `u64`, so dsh's non-integer and negative cases can't be written.
+  - DUPLICATE_WAIT is per (agent, call).
+  - The chain gets the wait's own signal and `wait {callId, timed: true}`.
+  - An answerer's ASK_TIMED_OUT, or the window closing with no claim,
+    gives the pending result. With no answerer the window is waited out.
+  - The turn's signal, or `close`, gives ASK_ABORTED.
+  - The wait is closed and forgotten however the ask ends, including when
+    its future is dropped.
+- **`attach_wait`** is a plain method returning a `Stream` of one
+  `{remainingMs}` frame. While a claim is held the host doesn't count the
+  window down; when the last claim leaves, the countdown resumes toward the
+  original deadline.
+- **The `userQuestions` projection**, version 2, with dsh's rules for
+  timed headers, open and continued calls, settling, dropping, PTC
+  sub-calls and late replies. Events before the inherited count are
+  skipped. The restored state is strict, refuses duplicate or empty call
+  ids ("callIds must be unique"), and requires at least one question.
+  `TIMED_WAIT_PARAMETER`, `is_timed_ask_user_question_schema` and
+  `questions_of` are public, for the tool.
+- **`answer`**:
+  - CALLER_NOT_LIVE first.
+  - A call that isn't continued gives `false`.
+  - REPLY_QUEUED when the service has a reply queued, or the durable inbox
+    holds one, read from the `inbox` projection's view.
+  - BAD_ANSWER unless the batch names each question exactly once.
+  - The reply's text is dsh's JSON in dsh's key order:
+    `{kind: "answer_to_pending_question", tool: "ask_user_question",
+    callId, questions, answers}`. It is steered into the agent.
+  - A refused steer releases the reservation, so the reply can be sent
+    again.
+- **The queued-reply bookkeeping**, from dsh's listeners:
+  - A claim notes its turn, or reserves a reply restored with the inbox.
+  - A discard releases the reply.
+  - The reply's `user/message` releases it.
+  - A `turn/end` releases what that turn claimed.
+- **The inbox signals.** `karaka-agent` has a new port, `InboxHooks`, with
+  an `InboxListener` trait. The loop provides it beside
+  `RequestErrorHooks`, now bundled with it in `LoopHooks` for
+  `AgentLoop::new`.
+  - `claimed(agent, message, turn)` fires for each message a step takes,
+    next-step first, after the claim is logged and after `turn/start`. Its
+    agent is the driver's handle.
+  - `discarded(agent, message)` fires for each message a cancel's clear
+    drops, next-step first.
+  - Both fire just after the inbox mutation, once the agent's lock is
+    released. dsh fires them inside it.
+  - `inserted` has no listener here, so it isn't ported.
+- **The agent's identity.** `Agent::instance()` and `Agents::get(id)` are
+  new. The loop's agent gives the address of its shared core, so the
+  tool-call handle and `Agents::open`'s handle compare equal, and a stale
+  agent reusing a live id doesn't.
+- **The plugin** provides `UserQuestions` and registers the projection. It
+  requires the session store, the session projections, `Agents` and
+  `InboxHooks`.
+- **Tests:**
+  - all 16 `projection.spec` cases;
+  - all 6 `timed-wait.spec` cases, on Tokio's paused clock, plus one for a
+    single end;
+  - `user-questions.spec` but what is listed below;
+  - Karaka cases: scoped answerers, `attach_wait` and `answer` from a
+    stale agent, and a run through the real loop. In that run a stand-in
+    timed tool asks, nobody answers in the window, a late answer is steered
+    in, and the next turn admits and settles it.
+  - two loop cases: the inbox hooks hear claims and discards, and `get`
+    finds live agents.
+
+### Left out
+
+- **DELEGATED_CALLER.** Karaka has no child agents, so every live agent is
+  a root and the check isn't made. The code constant is kept for
+  answerers. dsh's "rejects a live runtime-owned agent" case isn't ported.
+- **The typert wire:**
+  - the transported-error restore and its tests ("restores a transported
+    provider rejection", "restores a transported UserQuestionError");
+  - the namesake and non-`Error` rejection cases;
+  - `@Remote`.
+- **"Answers nothing when the composition carries no Session
+  projections".** The plugin requires them.
+- **HMR disposal.** The kernel has no teardown, so dsh's disposal is
+  `UserQuestions::close`. A consumed registration can't be removed twice.
+- **The timer-count checks** of the timed-wait and askTimed specs. Tokio
+  has no counterpart; a wait's single end covers them.
+- **The seeded header with `tools: "{{tools}}"`** in projection.spec.
+  Karaka's typed header refuses it when it is read.
+
+### Where it differs from dsh
+
+- **Errors.** dsh's `UserQuestionError` and any other rejection are
+  `QuestionError::Question` and `QuestionError::Other` here.
+- **A parent cancel has no reason.** The signal is cause-less, so an ask
+  ended by the turn's cancel is ASK_ABORTED with no cause, where dsh's
+  cause is the turn's reason.
+- **Claim release timing.** A claim is released when its stream is next
+  read or dropped after its signal fires. dsh releases it on the abort
+  event itself.
+- **Bookkeeping keys.** Queued replies are kept by session id, where dsh's
+  `WeakMap` is keyed by the session object. Waits are kept by agent
+  instance and call.
+- **The reply's message id** is `user-question-reply-{callId}-{len}`,
+  after the session's length. dsh's is random.
+- **`AskUserQuestionItem` accepts `intent` when restored.** dsh's restore
+  schema leaves it out, but the fold never records one.

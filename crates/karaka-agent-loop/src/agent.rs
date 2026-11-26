@@ -177,12 +177,25 @@ impl Agent for LoopAgent {
     fn cancel(&self, cause: CancelCause) {
         let mut state = self.inner.lock();
         // dsh clears first and throws if the log refuses; here the turn is
-        // stopped either way.
-        let _ = self.inner.inbox().clear();
+        // stopped either way. A refused clear may have dropped next-step
+        // already, unheard.
+        let dropped = self.inner.inbox().clear().unwrap_or_default();
         state.wake_requested = false;
         if let Some(switch) = &state.switch {
             switch.cancel(cause);
         }
+        drop(state);
+        // dsh: `agent/inbox/discarded`, for each message the clear dropped.
+        for message in &dropped {
+            self.inner.shared.inbox_hooks.discarded(self, message);
+        }
+    }
+
+    /// Every handle on this agent wraps one core, and the driver's own
+    /// handle for its tool calls is another, so the core's address is the
+    /// agent's identity.
+    fn instance(&self) -> usize {
+        Arc::as_ptr(&self.inner).cast::<()>() as usize
     }
 
     fn subscribe(&self, listener: FrameListener) -> FrameSubscription {
@@ -292,10 +305,23 @@ impl Inner {
         }
     }
 
-    /// Takes one step's input. (dsh: the pre-step's `claim`.)
-    pub(crate) fn claim(&self, target: InboxTarget) -> Result<Vec<UserMessage>, InboxError> {
-        let _state = self.lock();
-        self.inbox().claim(target)
+    /// Takes one step's input, for turn `turn` of `caller`, the driver's
+    /// handle on this agent, and tells the inbox listeners. (dsh: the
+    /// pre-step's `claim`, and `agent/inbox/claimed`.)
+    pub(crate) fn claim(
+        &self,
+        target: InboxTarget,
+        turn: u64,
+        caller: &dyn Agent,
+    ) -> Result<Vec<UserMessage>, InboxError> {
+        let claimed = {
+            let _state = self.lock();
+            self.inbox().claim(target)?
+        };
+        for message in &claimed {
+            self.shared.inbox_hooks.claimed(caller, message, turn);
+        }
+        Ok(claimed)
     }
 
     /// Whether next-step holds input, so the turn goes on.

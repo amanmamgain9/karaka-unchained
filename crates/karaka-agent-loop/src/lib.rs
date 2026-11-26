@@ -32,4 +32,4 @@ mod runtime_context;
 mod turn;
 
 pub use inbox::{InboxProjection, InboxState, InboxView, InvalidSplice};
-pub use plugin::{AgentLoop, AgentLoopPlugin, LoopConfig};
+pub use plugin::{AgentLoop, AgentLoopPlugin, LoopConfig, LoopHooks};

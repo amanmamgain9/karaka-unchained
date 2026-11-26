@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use karaka_agent::{Agent, Agents, OpenError, RequestErrorHooks};
+use karaka_agent::{Agent, Agents, InboxHooks, OpenError, RequestErrorHooks};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
 use karaka_session::{SessionId, SessionStore};
@@ -56,6 +56,8 @@ pub(crate) struct Shared {
     pub(crate) tools: Arc<ToolRegistry>,
     sessions: Arc<SessionStore>,
     pub(crate) hooks: Arc<RequestErrorHooks>,
+    /// Who hears messages leave an agent's inbox.
+    pub(crate) inbox_hooks: Arc<InboxHooks>,
     /// Each step's prompt and tool list are assembled from it.
     pub(crate) prompt: Arc<SystemPrompt>,
     /// Where each agent's inbox is folded, as the `inbox` projection.
@@ -74,18 +76,28 @@ pub struct AgentLoop {
     agents: Mutex<HashMap<SessionId, Arc<LoopAgent>>>,
 }
 
+/// The extension points a loop runs: the request-error hook, and the
+/// inbox signals.
+#[derive(Clone, Debug, Default)]
+pub struct LoopHooks {
+    /// Run when a model request fails.
+    pub request_error: Arc<RequestErrorHooks>,
+    /// Told when a message leaves an agent's inbox.
+    pub inbox: Arc<InboxHooks>,
+}
+
 impl AgentLoop {
     /// A loop that asks the models in `models`, runs the tools in `tools`,
-    /// keeps its sessions in `sessions`, runs `hooks` when a request fails,
-    /// assembles each step's prompt and tools from `prompt`, and keeps each
-    /// agent's pending input as the `inbox` projection of `projections`,
-    /// which must have [`InboxProjection`] registered.
+    /// keeps its sessions in `sessions`, runs `hooks`, assembles each
+    /// step's prompt and tools from `prompt`, and keeps each agent's
+    /// pending input as the `inbox` projection of `projections`, which must
+    /// have [`InboxProjection`] registered.
     pub fn new(
         config: LoopConfig,
         models: Arc<ModelRegistry>,
         tools: Arc<ToolRegistry>,
         sessions: Arc<SessionStore>,
-        hooks: Arc<RequestErrorHooks>,
+        hooks: LoopHooks,
         prompt: Arc<SystemPrompt>,
         projections: Arc<SessionProjections>,
     ) -> Self {
@@ -95,7 +107,8 @@ impl AgentLoop {
                 models,
                 tools,
                 sessions,
-                hooks,
+                hooks: hooks.request_error,
+                inbox_hooks: hooks.inbox,
                 prompt,
                 projections,
             }),
@@ -130,6 +143,13 @@ impl Agents for AgentLoop {
         agents.insert(id, Arc::clone(&agent));
         Ok(agent)
     }
+
+    fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>> {
+        let agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
+        agents
+            .get(id)
+            .map(|agent| Arc::clone(agent) as Arc<dyn Agent>)
+    }
 }
 
 impl fmt::Debug for AgentLoop {
@@ -156,8 +176,8 @@ impl fmt::Debug for AgentLoop {
 /// session projections and the system prompt. It registers the `inbox`
 /// projection, which holds each agent's pending input, and the prompt
 /// variables `provider` (its route) and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
-/// port beside `Agents`, empty: the loop
-/// runs the hook, so it owns the list. A plugin that registers a handler,
+/// and [`InboxHooks`] ports beside `Agents`, empty: the loop
+/// runs the hooks, so it owns the lists. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
 ///
 /// It doesn't check its route at setup: a route may be registered later, and a
@@ -182,6 +202,7 @@ impl Plugin for AgentLoopPlugin {
         vec![
             PortId::of::<dyn Agents>(),
             PortId::of::<RequestErrorHooks>(),
+            PortId::of::<InboxHooks>(),
         ]
     }
 
@@ -196,7 +217,7 @@ impl Plugin for AgentLoopPlugin {
     }
 
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
-        let hooks = Arc::new(RequestErrorHooks::new());
+        let hooks = LoopHooks::default();
         let prompt = ctx.get::<SystemPrompt>();
         let projections = ctx.get::<SessionProjections>();
         // For the life of the runtime, as dsh's loop holds it for its own.
@@ -212,12 +233,13 @@ impl Plugin for AgentLoopPlugin {
             ctx.get::<ModelRegistry>(),
             ctx.get::<ToolRegistry>(),
             ctx.get::<SessionStore>(),
-            Arc::clone(&hooks),
+            hooks.clone(),
             prompt,
             projections,
         ));
         ctx.provide(agents);
-        ctx.provide(hooks);
+        ctx.provide(hooks.request_error);
+        ctx.provide(hooks.inbox);
         Ok(())
     }
 }

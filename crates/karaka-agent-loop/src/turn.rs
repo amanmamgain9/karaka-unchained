@@ -168,7 +168,7 @@ impl Inner {
             // Each step takes all of next-step; a turn's first also takes
             // the oldest of next-turn (`agent.ts:271`).
             let input = self
-                .claim(target)
+                .claim(target, turn, caller.as_ref())
                 .map_err(|error| Stop::Failed(other_failure(&error)))?;
             // The step's prompt and tools, assembled once, before the step
             // starts, as dsh's pre-step does (`agent.ts:272`). A failure
