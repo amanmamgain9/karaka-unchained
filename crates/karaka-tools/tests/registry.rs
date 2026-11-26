@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
+use karaka_agent::{Agent, FrameListener, FrameListeners, FrameSubscription, InboxError, WhenIdle};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId, Runtime};
 use karaka_model::{ToolCall, ToolSchema};
+use karaka_session::{CancelCause, SessionId, UserMessage};
 use karaka_tools::{
     Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRegistryError, ToolRun, ToolsPlugin,
 };
@@ -88,7 +90,9 @@ async fn a_registered_tool_runs_with_its_parsed_arguments() {
     let registry = ToolRegistry::new();
     registry.register(Arc::new(Echo)).unwrap();
 
-    let output = registry.execute(&call("echo", r#"{"text": "ping"}"#)).await;
+    let output = registry
+        .execute(&call("echo", r#"{"text": "ping"}"#), None)
+        .await;
     assert_eq!(output, ToolOutput::ok(r#"call_1 echo {"text":"ping"}"#));
 }
 
@@ -97,7 +101,7 @@ async fn empty_arguments_reach_the_tool_as_an_empty_object() {
     let registry = ToolRegistry::new();
     registry.register(Arc::new(Echo)).unwrap();
 
-    let output = registry.execute(&call("echo", "")).await;
+    let output = registry.execute(&call("echo", ""), None).await;
     assert_eq!(output, ToolOutput::ok("call_1 echo {}"));
 }
 
@@ -132,7 +136,7 @@ async fn an_unknown_tool_is_an_error_for_the_model() {
     let registry = ToolRegistry::new();
     registry.register(Arc::new(Echo)).unwrap();
 
-    let output = registry.execute(&call("weather", "{}")).await;
+    let output = registry.execute(&call("weather", "{}"), None).await;
     assert_eq!(output, ToolOutput::error("Error: unknown tool \"weather\""));
 }
 
@@ -144,7 +148,7 @@ async fn arguments_that_arent_a_json_object_are_an_error_for_the_model() {
     registry.register(Arc::new(Echo)).unwrap();
 
     for raw in ["not json", r#"{"text": "pi"#, "[1]"] {
-        let output = registry.execute(&call("echo", raw)).await;
+        let output = registry.execute(&call("echo", raw), None).await;
         assert_eq!(
             output,
             ToolOutput::error("Error: invalid arguments: \"arguments\" must be an object"),
@@ -156,7 +160,7 @@ async fn arguments_that_arent_a_json_object_are_an_error_for_the_model() {
 #[tokio::test]
 async fn a_name_nobody_registered_is_reported_before_its_arguments() {
     let registry = ToolRegistry::new();
-    let output = registry.execute(&call("weather", "not json")).await;
+    let output = registry.execute(&call("weather", "not json"), None).await;
     assert_eq!(output, ToolOutput::error("Error: unknown tool \"weather\""));
 }
 
@@ -165,7 +169,7 @@ async fn a_tools_own_failure_reaches_the_model_unchanged() {
     let registry = ToolRegistry::new();
     registry.register(Arc::new(Broken)).unwrap();
 
-    let output = registry.execute(&call("broken", "{}")).await;
+    let output = registry.execute(&call("broken", "{}"), None).await;
     assert_eq!(output, ToolOutput::error("the weather service is down"));
     let result = output.into_result("call_1");
     assert!(result.is_error);
@@ -182,7 +186,7 @@ async fn dropping_the_call_cancels_the_tool() {
         }))
         .unwrap();
 
-    let mut running = registry.execute(&call("stuck", "{}"));
+    let mut running = registry.execute(&call("stuck", "{}"), None);
     // Polled once, so the tool has started, and it is still waiting.
     assert!(poll_once(&mut running).await.is_pending());
     assert!(!dropped.load(Ordering::SeqCst));
@@ -228,7 +232,7 @@ async fn a_plugin_registers_its_tool_in_the_port() {
 
     let registry = runtime.get::<ToolRegistry>();
     assert_eq!(registry.schemas(), [schema("echo")]);
-    let output = registry.execute(&call("echo", "{}")).await;
+    let output = registry.execute(&call("echo", "{}"), None).await;
     assert_eq!(output.content, "call_1 echo {}");
 
     // The registry is a tool source of the system prompt, as dsh's tool
@@ -250,5 +254,77 @@ fn the_registry_and_its_calls_work_across_threads() {
 
     assert_send_sync::<ToolRegistry>();
     let registry = ToolRegistry::new();
-    assert_send(registry.execute(&call("echo", "{}")));
+    assert_send(registry.execute(&call("echo", "{}"), None));
+}
+
+/// Says which agent called it, if any.
+struct Caller;
+
+impl Tool for Caller {
+    fn schema(&self) -> ToolSchema {
+        schema("caller")
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async move {
+            ToolOutput::ok(match &run.agent {
+                Some(agent) => agent.id().to_string(),
+                None => "no agent".into(),
+            })
+        })
+    }
+}
+
+/// An agent that only has an id.
+struct Idle {
+    id: SessionId,
+    frames: FrameListeners,
+}
+
+impl Agent for Idle {
+    fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    fn followup(&self, _: UserMessage) -> Result<(), InboxError> {
+        Ok(())
+    }
+
+    fn steer(&self, _: UserMessage) -> Result<(), InboxError> {
+        Ok(())
+    }
+
+    fn inject(&self, _: UserMessage) -> Result<(), InboxError> {
+        Ok(())
+    }
+
+    fn cancel(&self, _: CancelCause) {}
+
+    fn when_idle(&self) -> WhenIdle<'_> {
+        Box::pin(async {})
+    }
+
+    fn subscribe(&self, listener: FrameListener) -> FrameSubscription {
+        self.frames.subscribe(listener)
+    }
+}
+
+// dsh's `ToolExecutionInput.agent`: the calling agent reaches the tool, and
+// a call made outside any agent has none.
+#[tokio::test]
+async fn a_tool_is_told_which_agent_called_it() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Caller)).unwrap();
+    let agent: Arc<dyn Agent> = Arc::new(Idle {
+        id: SessionId::new("a1"),
+        frames: FrameListeners::new(),
+    });
+    let output = registry
+        .execute(&call("caller", "{}"), Some(Arc::clone(&agent)))
+        .await;
+    assert_eq!(output, ToolOutput::ok("a1"));
+    let output = registry.execute(&call("caller", "{}"), None).await;
+    assert_eq!(output, ToolOutput::ok("no agent"));
+    // The call keeps no hold on the agent once it is done.
+    assert_eq!(Arc::strong_count(&agent), 1);
 }

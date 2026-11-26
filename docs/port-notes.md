@@ -2000,7 +2000,8 @@ and the directory half of `tests/admission.spec.ts`).*
 
 - The admission case's file-policy and approval lines, which need
   `dsh-sandbox-policy` and `dsh-user-approval`.
-- The `working_directory` tool, a plugin of its own, and its case.
+- The `working_directory` tool, a plugin of its own, and its case. (Ported
+  since: see "The working_directory tool".)
 - "Refuses an Agent disposed during directory inspection": Karaka's
   agents live as long as the runtime, so there is no fiber to assert active.
 
@@ -2031,3 +2032,67 @@ and the directory half of `tests/admission.spec.ts`).*
   changes the directory between attempts. So the failed attempt's snapshot
   (the project) stays in history, superseded by the next attempt's.
 - **Absolute means starting with `/`**, as Karaka targets Unix.
+
+## The working_directory tool
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-26:
+`session/tool-working-directory/src/index.ts`, with the tool layer's rules
+from `core/tools/src` (`schema.ts`, `json-schema.ts`, `index.ts`).*
+
+### What is done
+
+- **Tools know their caller.** `ToolRun` has `agent:
+  Option<Arc<dyn Agent>>`, as dsh's `ToolExecutionInput` has an optional
+  `agent`. `ToolRegistry::execute(call, agent)` passes it on; a call made
+  outside any agent passes `None`.
+  - The loop's driver makes one `Arc<dyn Agent>` handle on its own inner
+    state, held as long as the driver runs, and passes a clone to each tool
+    call. Nothing inside the agent holds the handle, so there is no cycle,
+    and a call's clone is dropped with the call.
+  - Existing tools ignore the new field and behave as before.
+- **The tool** is the new crate `karaka-tool-working-directory`, registered
+  by `WorkingDirectoryToolPlugin`, which requires the tool registry and the
+  working-directory service. The binary mounts it after working-directory.
+  - It has dsh's name, description and `cd` description. Its parameters are
+    what dsh's `defineTool` compiles `{ cd }` to:
+    `{"type":"object","properties":{"cd":{"type":"string","description":…}}}`.
+    That is an open object, with no `required` and no
+    `additionalProperties`, so other keys are ignored.
+  - With no `cd` it calls `ensure`; with `cd`, `set`. The result is the
+    directory, as dsh's `render` gives it.
+  - The error results follow dsh's tool layer, which shows a thrown error
+    as `Error: <message>` (`toolErrorResult`):
+    - a `cd` that isn't a string, `null` included, is
+      `Error: invalid arguments: "cd" must be a string`, the `ToolArgsError`
+      of `validateArgs`;
+    - a call with no agent is
+      `Error: working_directory requires an agent Session`;
+    - the service's failures are its own messages after `Error: `.
+- **Tests:**
+  - the deferred `working-directory.spec` case, without its unregistering;
+  - the schema exactly as dsh's;
+  - the argument and failure results;
+  - the registry passing the agent, and holding it no longer than the call;
+  - end to end: a model calls `working_directory` with `cd`. The change is
+    logged, the tool's result is the directory, the notice reaches the
+    next step's request as a user message after the tool result, and that
+    step's runtime context shows the new directory, where the first
+    request's showed the project.
+  - The `ask` CLI case now expects the tool in its request.
+
+### Where it differs from dsh
+
+- **No unregistering.** dsh's registration is undone when its plugin
+  unloads. The kernel unloads no plugin, and the registry has no removal,
+  so the tool stays for the runtime's life. The deferred case is ported
+  without that part.
+- **No signal.** dsh passes the call's signal to `ensure` and `set`. Here
+  a cancelled call is dropped. The service's commit has no await in it, so
+  a drop can't land between the check and the change.
+- **Only `cd` is checked.** Karaka's registry has no schema validation, so
+  the tool checks its one argument itself, with dsh's wording. There is no
+  output-schema check.
+- **The agent is a handle, not the agent the loop registered.** The
+  `Arc<dyn Agent>` a tool gets wraps the same agent state as the one
+  `Agents::open` gives, but it is another `Arc`. Tools that compare agents
+  by identity would need the id.

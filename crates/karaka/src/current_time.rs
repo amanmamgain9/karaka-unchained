@@ -38,6 +38,7 @@ mod tests {
         let run = ToolRun {
             call_id: "call_1".into(),
             name: "current_time".into(),
+            agent: None,
         };
         let output = CurrentTime.execute(json!({}), run).await;
         assert!(!output.is_error);

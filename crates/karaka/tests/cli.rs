@@ -481,7 +481,8 @@ fn asks_deepseek_in_the_messages_format() {
     );
     assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
     // After the question, the runtime context: the session's working
-    // directory, which for `ask` is the process's own.
+    // directory, which for `ask` is the process's own. The one tool `ask`
+    // offers is `working_directory`.
     let directory = std::env::current_dir().unwrap();
     let context = format!(
         "Current runtime context. This snapshot supersedes earlier runtime-context \
@@ -497,7 +498,13 @@ fn asks_deepseek_in_the_messages_format() {
                 r#"{{"type":"text","text":{context}}}]}}],"#,
                 r#""max_tokens":393216,"thinking":{{"type":"enabled"}},"#,
                 r#""output_config":{{"effort":"max"}},"#,
-                r#""system":"You are an AI agent powered by Karaka.\n\nBe brief."}}"#
+                r#""system":"You are an AI agent powered by Karaka.\n\nBe brief.","#,
+                r#""tools":[{{"name":"working_directory","description":"Read the current "#,
+                r#"working directory, or change it with cd. Relative paths use the current "#,
+                r#"directory. Existing shells and running processes keep their own "#,
+                r#"directories.","input_schema":{{"type":"object","properties":{{"cd":"#,
+                r#"{{"type":"string","description":"Existing directory to enter. Omit to "#,
+                r#"read the current directory."}}}}}}}}]}}"#
             ),
             context = serde_json::to_string(&context).unwrap()
         )

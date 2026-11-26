@@ -50,6 +50,7 @@ karaka-system-prompt = { path = "crates/karaka-system-prompt" }
 karaka-session-projection = { path = "crates/karaka-session-projection" }
 karaka-fs = { path = "crates/karaka-fs" }
 karaka-working-directory = { path = "crates/karaka-working-directory" }
+karaka-tool-working-directory = { path = "crates/karaka-tool-working-directory" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }

@@ -3,6 +3,7 @@ use std::fmt;
 use std::future::ready;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
+use karaka_agent::Agent;
 use karaka_model::{ToolCall, ToolSchema};
 use serde_json::{Map, Value};
 
@@ -80,9 +81,13 @@ impl ToolRegistry {
     /// tool runs. An unknown name is checked first, as in dsh, where the
     /// registry rejects it before the tool's own argument check could run.
     ///
+    /// `agent` is the agent whose turn made the call, which the tool gets
+    /// in its [`ToolRun`]; `None` for a call made outside any agent. (dsh:
+    /// the input's `agent`.)
+    ///
     /// The future owns everything it needs, so it outlives this borrow of
     /// the registry. Dropping it cancels the call.
-    pub fn execute(&self, call: &ToolCall) -> ToolFuture<'static> {
+    pub fn execute(&self, call: &ToolCall, agent: Option<Arc<dyn Agent>>) -> ToolFuture<'static> {
         let Some(tool) = self.find(&call.name) else {
             return Box::pin(ready(unknown_tool(&call.name)));
         };
@@ -92,6 +97,7 @@ impl ToolRegistry {
         let run = ToolRun {
             call_id: call.id.clone(),
             name: call.name.clone(),
+            agent,
         };
         // The block owns `tool`, so the future `execute` returns can borrow
         // it for as long as the call runs.

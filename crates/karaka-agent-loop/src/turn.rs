@@ -61,10 +61,10 @@
 use std::future::{Future, poll_fn};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 use std::task::{Context, Poll};
 
-use karaka_agent::{RequestError, RequestErrorAction, SettledAs, StreamChunk};
+use karaka_agent::{Agent, RequestError, RequestErrorAction, SettledAs, StreamChunk};
 use karaka_tools::ToolOutput;
 use serde_json::Value;
 
@@ -133,11 +133,12 @@ enum Streamed {
 impl Inner {
     /// Runs turn `turn` from `turn/start` to `turn/end`, and says whether
     /// the driver may go on to the next queued message.
-    pub(crate) async fn turn(&self, turn: u64, cancel: &Cancel) -> Ran {
+    /// `caller` is the agent its tool calls are made by.
+    pub(crate) async fn turn(&self, turn: u64, cancel: &Cancel, caller: &Arc<dyn Agent>) -> Ran {
         if self.session.append(SessionEvent::turn_start(turn)).is_err() {
             return Ran::NotStarted;
         }
-        let (reason, ran) = match self.steps(turn, cancel).await {
+        let (reason, ran) = match self.steps(turn, cancel, caller).await {
             Ok(reason) => (reason, Ran::Ended),
             Err(Stop::Aborted(cause)) => (TurnEndReason::Aborted(cause), Ran::Aborted),
             Err(Stop::Failed(failure)) => (TurnEndReason::Error(failure), Ran::Failed),
@@ -151,7 +152,12 @@ impl Inner {
     /// Runs steps until one ends the turn with nothing left in next-step,
     /// and says how it ended. (dsh: the `while (true)` in `turn`,
     /// `agent.ts:310-352`.)
-    async fn steps(&self, turn: u64, cancel: &Cancel) -> Result<TurnEndReason, Stop> {
+    async fn steps(
+        &self,
+        turn: u64,
+        cancel: &Cancel,
+        caller: &Arc<dyn Agent>,
+    ) -> Result<TurnEndReason, Stop> {
         let mut step = 0;
         let mut target = InboxTarget::NextTurn;
         let mut ending: Option<TurnEndReason> = None;
@@ -198,7 +204,9 @@ impl Inner {
             }
             step += 1;
             let started = self.session.append(SessionEvent::step_start(turn, step))?;
-            let outcome = self.step(turn, step, input, &assembly, cancel).await;
+            let outcome = self
+                .step(turn, step, input, &assembly, cancel, caller)
+                .await;
             if outcome.is_err() {
                 // If these are refused too, the step's own failure is still
                 // the one to report, as in dsh's `AggregateError`.
@@ -235,6 +243,7 @@ impl Inner {
         input: Vec<UserMessage>,
         assembly: &PromptAssembly,
         cancel: &Cancel,
+        caller: &Arc<dyn Agent>,
     ) -> Result<Option<TurnEndReason>, Stop> {
         // Rendered once for the step's attempts (`agent.ts:407`).
         let prompt =
@@ -282,7 +291,7 @@ impl Inner {
                 // A tool that panics gets an error result, as a dsh tool
                 // that throws gets `Error: <message>`
                 // (`core/tools/src/index.ts:1917-1924`).
-                output = CatchUnwind(self.shared.tools.execute(call)) => output
+                output = CatchUnwind(self.shared.tools.execute(call, Some(Arc::clone(caller)))) => output
                     .unwrap_or_else(|Panicked(message)| ToolOutput::error(format!("Error: {message}"))),
             };
             let result = output.into_result(&call.id);

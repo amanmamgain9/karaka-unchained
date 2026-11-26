@@ -254,9 +254,15 @@ impl Inner {
             inner: &self,
             armed: true,
         };
+        // The agent the driver's tool calls are made by. It lives as long as
+        // the driver, which holds `self` anyway; nothing in `self` holds it,
+        // so it makes no cycle.
+        let caller: Arc<dyn Agent> = Arc::new(LoopAgent {
+            inner: Arc::clone(&self),
+        });
         loop {
             let turn = self.lock().last_turn + 1;
-            let ran = self.turn(turn, &cancel).await;
+            let ran = self.turn(turn, &cancel, &caller).await;
             let mut state = self.lock();
             if !matches!(ran, Ran::NotStarted) {
                 state.last_turn = turn;

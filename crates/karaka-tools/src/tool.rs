@@ -1,5 +1,9 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+
+use karaka_agent::Agent;
 
 use karaka_model::{ToolResult, ToolSchema};
 use serde_json::Value;
@@ -36,14 +40,28 @@ pub trait Tool: Send + Sync {
 /// be `Send` so a multi-threaded executor can run it on any thread.
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>>;
 
-/// Which call a run is for. (dsh: the identity fields of `ToolRunContext`,
-/// `callId` and `name`.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Which call a run is for, and who made it. (dsh: the identity fields of
+/// `ToolRunContext`, `callId` and `name`, and its `agent`.)
+#[derive(Clone)]
 pub struct ToolRun {
     /// The id the model gave the call. Its result repeats it.
     pub call_id: String,
     /// The tool's name, as the model called it.
     pub name: String,
+    /// The agent whose turn made the call; `None` for a call made outside
+    /// any agent. The run holds it only while the call runs. (dsh:
+    /// `agent`.)
+    pub agent: Option<Arc<dyn Agent>>,
+}
+
+impl fmt::Debug for ToolRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolRun")
+            .field("call_id", &self.call_id)
+            .field("name", &self.name)
+            .field("agent", &self.agent.as_ref().map(|agent| agent.id()))
+            .finish()
+    }
 }
 
 /// What a call returned, as the model reads it. (dsh: the `content` and

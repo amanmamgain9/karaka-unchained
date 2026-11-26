@@ -17,7 +17,10 @@ karaka-model.workspace = true
 karaka-system-prompt.workspace = true
 # The registry parses the model's arguments before a tool sees them.
 serde_json.workspace = true
+# A call carries the agent that made it, as dsh's `ToolExecutionInput` does.
+karaka-agent.workspace = true
 
 # Only for running the async tests.
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+karaka-session.workspace = true

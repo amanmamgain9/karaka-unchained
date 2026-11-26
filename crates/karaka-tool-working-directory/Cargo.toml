@@ -1,0 +1,29 @@
+[package]
+name = "karaka-tool-working-directory"
+description = "The working_directory tool: read or change the calling session's working directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the tool.
+karaka-kernel.workspace = true
+# The tool seam, and the schema the model sees.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+# The service the tool reads and changes the directory through.
+karaka-working-directory.workspace = true
+# The model's arguments.
+serde_json.workspace = true
+
+[dev-dependencies]
+karaka-agent.workspace = true
+karaka-agent-loop.workspace = true
+karaka-fs-local.workspace = true
+karaka-session.workspace = true
+karaka-session-projection.workspace = true
+karaka-system-prompt.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

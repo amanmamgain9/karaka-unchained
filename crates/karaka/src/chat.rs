@@ -27,6 +27,7 @@ use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
+use karaka_tool_working_directory::WorkingDirectoryToolPlugin;
 use karaka_tools::{ToolRegistry, ToolsPlugin};
 use karaka_working_directory::WorkingDirectoryPlugin;
 
@@ -41,9 +42,9 @@ const SHORT_RESULT: usize = 80;
 
 /// The plugins `chat` and `ask` both run: the model provider, the system
 /// prompt, the tools and sessions, the sessions' projections, the host's
-/// files and each session's working directory, the agent loop, and the
-/// retry plugin, which retries a failed
-/// request as the provider's policy says before the turn gives up.
+/// files and each session's working directory with its tool, the agent
+/// loop, and the retry plugin, which retries a failed request as the
+/// provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
@@ -65,6 +66,8 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     // Each session's working directory, shown to the model as runtime
     // context: the session's project, or the process's directory.
     plugins.push(Box::new(WorkingDirectoryPlugin::default()));
+    // The model's tool for reading and changing it.
+    plugins.push(Box::new(WorkingDirectoryToolPlugin));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins
