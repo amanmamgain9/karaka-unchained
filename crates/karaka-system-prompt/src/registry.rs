@@ -751,6 +751,19 @@ impl SystemPrompt {
         self.registration(scope, id)
     }
 
+    /// Adds a listener that runs before every listener added so far. (dsh:
+    /// `system-prompt/assemble` with `{ prepend: true }`.)
+    pub fn on_assemble_first(
+        &self,
+        scope: Option<&Scope>,
+        listener: Arc<dyn AssembleListener>,
+    ) -> Registration {
+        let mut state = self.lock();
+        let id = state.id();
+        state.listeners.insert(0, (id, scope.cloned(), listener));
+        self.registration(scope, id)
+    }
+
     /// The variables, each provider called with no lock held. Providers
     /// added meanwhile are called too; one removed before its turn isn't.
     fn variables(&self, context: &AssembleContext) -> Variables {

@@ -28,6 +28,7 @@ use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tools::{ToolRegistry, ToolsPlugin};
+use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
 use crate::current_time::CurrentTime;
@@ -40,7 +41,8 @@ const SHORT_RESULT: usize = 80;
 
 /// The plugins `chat` and `ask` both run: the model provider, the system
 /// prompt, the tools and sessions, the sessions' projections, the host's
-/// files, the agent loop, and the retry plugin, which retries a failed
+/// files and each session's working directory, the agent loop, and the
+/// retry plugin, which retries a failed
 /// request as the provider's policy says before the turn gives up.
 pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
@@ -60,6 +62,9 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     plugins.push(Box::new(SessionProjectionsPlugin));
     // The host's files, relative paths from the process's directory.
     plugins.push(Box::new(LocalFsPlugin::default()));
+    // Each session's working directory, shown to the model as runtime
+    // context: the session's project, or the process's directory.
+    plugins.push(Box::new(WorkingDirectoryPlugin::default()));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins

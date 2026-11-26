@@ -27,6 +27,8 @@ karaka-system-prompt.workspace = true
 karaka-session-projection.workspace = true
 # The host's files, behind the filesystem seam.
 karaka-fs-local.workspace = true
+# Each session's working directory, shown to the model.
+karaka-working-directory.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

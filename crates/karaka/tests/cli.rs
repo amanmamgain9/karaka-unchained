@@ -480,14 +480,26 @@ fn asks_deepseek_in_the_messages_format() {
         "{head}"
     );
     assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
+    // After the question, the runtime context: the session's working
+    // directory, which for `ask` is the process's own.
+    let directory = std::env::current_dir().unwrap();
+    let context = format!(
+        "Current runtime context. This snapshot supersedes earlier runtime-context \
+         snapshots.\n\nCurrent working directory: {}.",
+        serde_json::to_string(directory.to_str().unwrap()).unwrap()
+    );
     assert_eq!(
         body,
-        concat!(
-            r#"{"model":"deepseek-flash","stream":true,"#,
-            r#""messages":[{"role":"user","content":[{"type":"text","text":"say hello"}]}],"#,
-            r#""max_tokens":393216,"thinking":{"type":"enabled"},"#,
-            r#""output_config":{"effort":"max"},"#,
-            r#""system":"You are an AI agent powered by Karaka.\n\nBe brief."}"#
+        format!(
+            concat!(
+                r#"{{"model":"deepseek-flash","stream":true,"#,
+                r#""messages":[{{"role":"user","content":[{{"type":"text","text":"say hello"}},"#,
+                r#"{{"type":"text","text":{context}}}]}}],"#,
+                r#""max_tokens":393216,"thinking":{{"type":"enabled"}},"#,
+                r#""output_config":{{"effort":"max"}},"#,
+                r#""system":"You are an AI agent powered by Karaka.\n\nBe brief."}}"#
+            ),
+            context = serde_json::to_string(&context).unwrap()
         )
     );
 }

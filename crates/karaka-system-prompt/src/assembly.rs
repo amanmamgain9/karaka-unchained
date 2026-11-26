@@ -13,7 +13,8 @@ use karaka_model::ToolSchema;
 pub struct PromptError(pub(crate) String);
 
 impl PromptError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    /// A failure with `message`, such as a listener's.
+    pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 

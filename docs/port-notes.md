@@ -1939,3 +1939,95 @@ the turn's end), with `core/agent/src/runtime-types.ts` for the contracts.*
 - **The harness's `events()` leaves out the inbox's splices.** Each turn
   now logs two (the followup and the claim). The older loop tests read the
   turn's own events through it; the inbox tests read the full log.
+
+## Working directory
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-26:
+`session/working-directory` (`src/index.ts`, `tests/working-directory.spec.ts`,
+and the directory half of `tests/admission.spec.ts`).*
+
+### What is done
+
+- **The crate** `karaka-working-directory`, with `WorkingDirectoryPlugin`.
+  It requires the filesystem, the session store and projections, the
+  system prompt and the agents, and provides the `WorkingDirectory` port.
+  The binary mounts it after fs-local.
+- **Config.** `default_directory` must be absolute ("working-directory:
+  defaultDirectory must be absolute"). When unset, it is the process's
+  directory.
+- **The `workingDirectory` projection.** Its initial state is the header's
+  `cwd`, or `None`. Each `working-directory/change { cwd }` sets it, and
+  clients see the state itself.
+- **The context.** `working-directory:current` is required and literal, at
+  `ContextOrder::WorkingDirectory` (100). Its text is `Current working
+  directory: "<dir>".`, the directory as a JSON string. It is empty for an
+  assembly with no agent.
+- **The listener.** It is added before every other listener (the new
+  `SystemPrompt::on_assemble_first`, dsh's `{ prepend: true }`). It calls
+  `ensure`, runs the rest of the chain, then overwrites the context, or puts
+  it back first, so a later listener can't drop or change it.
+- **`get`, `ensure` and `set`:**
+  - `get` reads the projection, or the default.
+  - `ensure` checks the directory with the filesystem's `resolve` and
+    `stat`. If it is gone, it returns to the header's project or the
+    default. A session whose state is still `None` (no project in its
+    header) gets the directory recorded.
+  - `set` resolves relative to the current directory and takes the
+    filesystem's `process_path`.
+  - All keep dsh's messages: "working-directory: cd must not be empty" and
+    "working-directory: directory does not exist: "path"".
+- **Commits.** A commit logs the change, then injects the notice, with
+  dsh's two texts, as a `{ kind: "working-directory" }` user message. An
+  unchanged directory commits nothing. A notice that can't be queued is
+  warned of, and the change stands.
+- **Serialization and cancellation.**
+  - Each session's operations take turns, first come first served.
+  - Each races the caller's signal and the service's stop, and is dropped
+    by either, so it commits nothing.
+  - `stop` cancels what is pending, waits until nothing runs, and later
+    calls are refused with "working-directory service disposed".
+- **System prompt.** `PromptError::new` is public, so a listener in another
+  crate can fail an assembly.
+- **Tests.** Every case of `working-directory.spec` but the two below, and
+  the admission case.
+  - The admission case runs as a change between two attempts of one
+    request, made by a request-error handler. The retried attempt shows the
+    new directory, the notice gets its own step, and the turn completes.
+  - A real `karaka ask` request now carries the directory in its runtime
+    context (`crates/karaka/tests/cli.rs`).
+
+### Deferred
+
+- The admission case's file-policy and approval lines, which need
+  `dsh-sandbox-policy` and `dsh-user-approval`.
+- The `working_directory` tool, a plugin of its own, and its case.
+- "Refuses an Agent disposed during directory inspection": Karaka's
+  agents live as long as the runtime, so there is no fiber to assert active.
+
+### Where it differs from dsh
+
+- **The agent has no `session`.** The service finds the session in the
+  store by the agent's id, and refuses an agent with none.
+- **The assembly context has no agent.** The listener opens the agent of
+  the assembly's scope through `Agents`. A scope is an agent's id.
+- **No signal from the assembly.** The listener's `ensure` takes none,
+  since Karaka's assembly context carries none.
+- **A cancel has no reason.** Karaka's `AbortSignal` carries none, so a
+  cancelled operation is "working-directory: cancelled", where dsh rejects
+  with the signal's reason.
+- **Stopping drops what is pending** rather than waiting for the
+  filesystem call under it to return. Either way nothing commits once the
+  stop starts. `stop()` stands in for dsh's fiber disposal, since the
+  kernel unloads no plugin.
+- **Warnings go to a sink**, `with_warnings`, which is stderr by default.
+  dsh uses `ctx.logger.warn`. The error in the text is Rust's Display
+  ("inbox unavailable"), where dsh's `String(error)` adds "Error: ".
+- **A notice's id** is `working-directory-<seq>`, after the change's seq.
+  dsh's is random.
+- **The projection's state isn't checked as absolute** when read from a
+  checkpoint, as dsh's `stateSchema` checks it. A change whose `cwd` isn't
+  a string is ignored rather than folded.
+- **The admission case**, without dsh's pre-step and `prepareCall` hooks,
+  changes the directory between attempts. So the failed attempt's snapshot
+  (the project) stays in history, superseded by the next attempt's.
+- **Absolute means starting with `/`**, as Karaka targets Unix.

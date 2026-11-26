@@ -1008,3 +1008,36 @@ async fn a_listener_can_add_or_override_variables() {
         format!("{HARNESS_IDENTITY}\n\nfrom-waterfall")
     );
 }
+
+// dsh's `{ prepend: true }` on a `system-prompt/assemble` listener: it runs
+// before every listener added earlier, as working-directory's does.
+#[tokio::test]
+async fn a_listener_added_first_runs_before_the_others() {
+    let prompt = plain();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (first, second) = (Arc::clone(&order), Arc::clone(&order));
+    let _ = prompt.on_assemble(
+        None,
+        Arc::new(Before(
+            move |_: &mut PromptAssembly, _: &AssembleContext| {
+                first.lock().unwrap().push("added earlier");
+            },
+        )),
+    );
+    let _ = prompt.on_assemble_first(
+        None,
+        Arc::new(Before(
+            move |_: &mut PromptAssembly, _: &AssembleContext| {
+                second.lock().unwrap().push("added first");
+            },
+        )),
+    );
+    prompt.assemble(&global()).await.unwrap();
+    assert_eq!(*order.lock().unwrap(), ["added first", "added earlier"]);
+}
+
+#[test]
+fn a_listener_elsewhere_can_fail_an_assembly() {
+    let error = karaka_system_prompt::PromptError::new("working-directory: failed");
+    assert_eq!(error.message(), "working-directory: failed");
+}
