@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-26, after `e67fe14` (user questions).
+Last updated 2026-11-26, after the argument checks in the tool registry.
 
 ## Needs you
 
@@ -30,11 +30,6 @@ Last updated 2026-11-26, after `e67fe14` (user questions).
   map never shrinks. dsh's is freed with the session. This matters only
   for a long-running server, so fix it with the webserver. (Working
   directory)
-- **Argument checks belong in the tool registry.** dsh's registry checks
-  every tool's arguments against its schema. Karaka's doesn't, so
-  `todo_write` and `working_directory` check their own, with dsh's
-  wording. Move `karaka-tool-todo/src/schema.rs` into `karaka-tools`
-  before the next tool needs it. (The todo_write tool)
 - **Compare agents by `instance()`, not by `Arc`.** The loop gives tool
   calls a different `Arc` from the one `Agents::open` returns.
   `Agent::instance()` gives both the same identity. Nothing is wrong

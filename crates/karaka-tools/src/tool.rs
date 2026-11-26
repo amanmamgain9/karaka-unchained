@@ -21,9 +21,24 @@ pub trait Tool: Send + Sync {
     /// is registered.
     fn schema(&self) -> ToolSchema;
 
+    /// Whether the registry checks the arguments against the parameters
+    /// before the tool runs, as dsh checks every tool made with
+    /// `defineTool`. Such a tool's parameters must be in dsh's enforced
+    /// JSON Schema subset (`json_schema.rs`), which the registry checks when
+    /// the tool is registered.
+    ///
+    /// A tool whose schema comes from elsewhere, such as an MCP server's,
+    /// says `false`, as dsh's raw `ToolDefinition`s are unchecked: its
+    /// parameters go to the model as they are, in any JSON Schema, and the
+    /// tool checks its own arguments.
+    fn registry_checks_arguments(&self) -> bool {
+        true
+    }
+
     /// Runs one call. `arguments` is the model's JSON, already parsed: the
-    /// registry has checked it is an object, so the tool only checks the
-    /// fields it needs.
+    /// registry has checked it is an object, and, unless the tool opted out
+    /// with [`registry_checks_arguments`](Self::registry_checks_arguments),
+    /// that it fits the parameters.
     ///
     /// Dropping the future cancels the call, as dropping a model's stream
     /// does. dsh passes an `AbortSignal` instead and waits for the tool to

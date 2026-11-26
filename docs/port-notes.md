@@ -2067,7 +2067,8 @@ from `core/tools/src` (`schema.ts`, `json-schema.ts`, `index.ts`).*
     as `Error: <message>` (`toolErrorResult`):
     - a `cd` that isn't a string, `null` included, is
       `Error: invalid arguments: "cd" must be a string`, the `ToolArgsError`
-      of `validateArgs`;
+      of `validateArgs`, which the registry now gives (see "Argument checks
+      in the tool registry");
     - a call with no agent is
       `Error: working_directory requires an agent Session`;
     - the service's failures are its own messages after `Error: `.
@@ -2130,8 +2131,8 @@ schema compiler and validator from `core/tools/src`.*
     root stays open.
 - **Execution follows dsh's order:**
   1. The schema check, which dsh's registry makes before any typed tool
-     runs. Karaka's registry doesn't validate, so `schema.rs` ports the
-     validator's subset and wording, its walk order included: an object's
+     runs, and Karaka's registry now makes too (see "Argument checks in the
+     tool registry"), with the validator's wording and walk order: an object's
      missing keys, then each declared property, then undeclared keys,
      joined by `; ` after `invalid arguments: `. For example:
      `Error: invalid arguments: missing required property "todos[0].content"; "todos[0].status" must be a string; "todos[0].extra" is not a declared property (additionalProperties: false)`.
@@ -2174,9 +2175,7 @@ schema compiler and validator from `core/tools/src`.*
 
 ### Where it differs from dsh
 
-- **The tool checks its own arguments.** dsh's registry does it for every
-  typed tool. The wording is the same, and the subset covers this schema.
-  The output schema isn't checked, and no structured `value` is returned,
+- **The output schema isn't checked,** and no structured `value` is returned,
   only the rendered text, which is all Karaka's `ToolOutput` carries.
 - **A session the store doesn't hold** for the calling agent is
   `todo_write: no session "id"`. dsh's agent always carries its session.
@@ -2324,3 +2323,77 @@ yet.
   after the session's length. dsh's is random.
 - **`AskUserQuestionItem` accepts `intent` when restored.** dsh's restore
   schema leaves it out, but the fold never records one.
+
+## Argument checks in the tool registry
+
+dsh's validator, `tools/src/json-schema.ts`, is now `karaka-tools`'
+`json_schema.rs`, and the registry runs it before every checked tool, as
+dsh's `defineTool` does.
+
+### What is done
+
+- **The whole enforced subset.** `check_schema`
+  (`assertSupportedJsonSchema`) and `check_object_schema`
+  (`assertObjectJsonSchema`) accept and refuse exactly what dsh's do, with
+  its texts, and report every violation in dsh's walk order. The subset
+  covers:
+  - any JSON root, and annotation-only nodes;
+  - one scalar `type`;
+  - `properties`, `required` and a boolean `additionalProperties` on
+    objects;
+  - `items` on arrays;
+  - type-correct scalar `enum` and `const`;
+  - exact-one `oneOf` with at least two branches.
+
+  Any other keyword is refused, not ignored.
+- **The validator.** `validate` (`validateJsonSchemaValue`) has dsh's
+  wording. Its order is an object's missing required keys, then each
+  declared property in declaration order, then its undeclared keys when it
+  is closed. An empty path names the root `arguments` and its properties
+  bare, as `validateArgs` does. `integer` follows `Number.isInteger`, so
+  `1.0` is one. Enum and const compare numbers by value, as `===` does.
+- **The registry:**
+  - `register` parses a checked tool's parameters and checks them against
+    the subset, refusing the tool otherwise: `tool "x": unsupported JSON
+    schema: …`, or `tool "x" parameters are not JSON: …`. dsh's
+    `defineTool` refuses such a tool when it is defined.
+  - `execute` checks the arguments after the object check and before the
+    tool, giving
+    `Error: invalid arguments: <violations joined by "; ">`.
+- **The escape hatch.** dsh validates only tools made with `defineTool`. A
+  raw `ToolDefinition`, such as an MCP tool, goes unchecked, and its
+  parameters can be any JSON Schema. Karaka's `Tool` trait has
+  `registry_checks_arguments()`, which defaults to `true`. A tool returns
+  `false` to have its schema sent as it is and its arguments left
+  unchecked.
+- **The tools' own checks are gone.** `todo_write` loses `schema.rs`, and
+  `working_directory` loses its `cd` check. Their tests, which go through
+  the registry, are unchanged and pass. `current_time`'s
+  `{"type":"object","properties":{}}` is in the subset.
+- **Tests:**
+  - `json-schema.spec`, where a case fits plain JSON;
+  - the `validateArgs` cases of `tools.spec`;
+  - the two `defineTool validation` result cases;
+  - a raw tool's unchecked arguments, and a checked tool refused at
+    registration.
+
+### Left out
+
+- **What JSON can't hold.** dsh's checks for `undefined`, `NaN`,
+  `Infinity`, `-0`, sparse or decorated arrays, forged or other-realm
+  prototypes, proxies, getters, symbols, cycles, `Date` and `Map` have
+  nothing to check in a `serde_json::Value`. Their cases aren't ported.
+- **The 5,000-deep `oneOf` cases.** dsh walks with explicit stacks. Here
+  the walk recurses as deep as the schema, which a tool's author writes,
+  not the model.
+- **The structured error.** dsh puts `{ name: "ToolArgsError", code:
+  "INVALID_ARGS" }` on the result. Karaka's results carry text only; see
+  that open end.
+
+### Where it differs from dsh
+
+- **A raw tool still gets an object.** The registry refuses arguments
+  that aren't a JSON object for every tool. dsh hands a raw tool whatever
+  parsed, and MCP's adapter falls back to `{}`.
+- **The schema is checked when the tool is registered,** not when it is
+  defined. Rust tools have no `defineTool`.

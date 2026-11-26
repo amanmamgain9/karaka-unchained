@@ -11,9 +11,8 @@
 //! model, as v4 leaves its payload to its plugin: it is stored as a
 //! passthrough, its shape [`TodoItem`]s.
 //!
-//! - `schema.rs`: the argument checks dsh's registry makes, in its words.
-
-mod schema;
+//! The registry checks the arguments against the tool's parameters before it
+//! runs, as dsh's does.
 
 use std::sync::{Arc, LazyLock};
 
@@ -197,12 +196,8 @@ impl TodoWriteTool {
     }
 
     fn write(&self, arguments: &Value, run: &ToolRun) -> Result<String, String> {
-        // dsh's registry checks the arguments against the schema before the
-        // tool runs.
-        let violations = schema::violations(&PARAMETERS, arguments);
-        if !violations.is_empty() {
-            return Err(format!("invalid arguments: {}", violations.join("; ")));
-        }
+        // The registry has checked the arguments against the schema, so
+        // this only fails for a call made around it.
         let raw: Vec<TodoItem> = serde_json::from_value(arguments["todos"].clone())
             .map_err(|error| format!("invalid arguments: {error}"))?;
         let todos = to_todo_list(raw, self.allow_parallel)?;

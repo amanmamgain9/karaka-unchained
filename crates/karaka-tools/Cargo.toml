@@ -15,8 +15,10 @@ karaka-kernel.workspace = true
 karaka-model.workspace = true
 # The registry is a tool source of the system prompt.
 karaka-system-prompt.workspace = true
-# The registry parses the model's arguments before a tool sees them.
-serde_json.workspace = true
+# The registry parses the model's arguments, and checks them against the
+# tool's parameters, before a tool sees them. `preserve_order`, so the
+# checks walk properties in declaration order, as dsh's validator does.
+serde_json = { workspace = true, features = ["preserve_order"] }
 # A call carries the agent that made it, as dsh's `ToolExecutionInput` does.
 karaka-agent.workspace = true
 

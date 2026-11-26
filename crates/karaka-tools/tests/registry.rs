@@ -328,3 +328,116 @@ async fn a_tool_is_told_which_agent_called_it() {
     // The call keeps no hold on the agent once it is done.
     assert_eq!(Arc::strong_count(&agent), 1);
 }
+
+/// A tool whose parameters require a string `path`, and which answers with
+/// it. (dsh: the `reader` fixture of `tools.spec.ts`.)
+struct Reader {
+    /// Whether the registry checks its arguments.
+    checked: bool,
+    parameters: &'static str,
+}
+
+impl Reader {
+    const PARAMETERS: &'static str = r#"{"type":"object","properties":{"path":{"type":"string"},"count":{"type":"integer"}},"required":["path"]}"#;
+
+    fn checked() -> Self {
+        Self {
+            checked: true,
+            parameters: Self::PARAMETERS,
+        }
+    }
+}
+
+impl Tool for Reader {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "reader".into(),
+            description: "reads a path".into(),
+            parameters: self.parameters.into(),
+        }
+    }
+
+    fn registry_checks_arguments(&self) -> bool {
+        self.checked
+    }
+
+    fn execute<'a>(&'a self, arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async move { ToolOutput::ok(format!("read {arguments}")) })
+    }
+}
+
+// tools.spec: "returns an isError result with the violations when the
+// model sends bad args", and "runs execute normally when args are valid"
+#[tokio::test]
+async fn arguments_are_checked_against_the_parameters_before_the_tool_runs() {
+    let registry = ToolRegistry::new();
+    registry.register(Arc::new(Reader::checked())).unwrap();
+    let output = registry.execute(&call("reader", "{}"), None).await;
+    assert_eq!(
+        output,
+        ToolOutput::error("Error: invalid arguments: missing required property \"path\"")
+    );
+    let output = registry
+        .execute(&call("reader", r#"{"count":1.5,"path":2}"#), None)
+        .await;
+    assert_eq!(
+        output,
+        ToolOutput::error(
+            "Error: invalid arguments: \"path\" must be a string; \"count\" must be an integer"
+        )
+    );
+    let output = registry
+        .execute(&call("reader", r#"{"path":"/x"}"#), None)
+        .await;
+    assert_eq!(output, ToolOutput::ok(r#"read {"path":"/x"}"#));
+}
+
+// A tool that checks its own arguments, as dsh's raw `ToolDefinition`s
+// (MCP's among them) do, gets them unchecked, and may use any JSON Schema.
+#[tokio::test]
+async fn a_tool_that_opts_out_gets_its_arguments_unchecked() {
+    let registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(Reader {
+            checked: false,
+            parameters: r#"{"type":"object","properties":{"path":{"type":"string","minLength":1}}}"#,
+        }))
+        .unwrap();
+    let output = registry
+        .execute(&call("reader", r#"{"path":2}"#), None)
+        .await;
+    assert_eq!(output, ToolOutput::ok(r#"read {"path":2}"#));
+    // Arguments that aren't an object are still refused.
+    let output = registry.execute(&call("reader", "[1]"), None).await;
+    assert!(output.is_error);
+}
+
+// dsh's `defineTool` refuses parameters outside the subset when the tool is
+// defined; here, when it is registered.
+#[test]
+fn a_checked_tool_needs_parameters_in_the_subset() {
+    let registry = ToolRegistry::new();
+    let error = registry
+        .register(Arc::new(Reader {
+            checked: true,
+            parameters: r#"{"type":"object","properties":{"path":{"type":"string","minLength":1}}}"#,
+        }))
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "tool \"reader\": unsupported JSON schema: schema.properties.path.minLength is not a \
+         supported keyword (subset: \
+         type/oneOf/properties/required/additionalProperties/items/enum/const + annotations)"
+    );
+    let error = registry
+        .register(Arc::new(Reader {
+            checked: true,
+            parameters: "not json",
+        }))
+        .unwrap_err();
+    assert!(
+        matches!(&error, ToolRegistryError::ParametersNotJson { name, .. } if name == "reader"),
+        "{error}"
+    );
+    assert!(registry.schemas().is_empty());
+}

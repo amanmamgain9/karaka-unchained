@@ -56,13 +56,11 @@ impl Tool for WorkingDirectoryTool {
 
     fn execute<'a>(&'a self, arguments: Value, run: ToolRun) -> ToolFuture<'a> {
         Box::pin(async move {
-            // dsh's argument check comes first: an absent `cd` is fine,
-            // anything but a string isn't (`validateArgs`'s wording).
-            let cd = match arguments.get("cd") {
-                None => None,
-                Some(Value::String(cd)) => Some(cd.clone()),
-                Some(_) => return thrown("invalid arguments: \"cd\" must be a string"),
-            };
+            // The registry has checked that `cd`, if there, is a string.
+            let cd = arguments
+                .get("cd")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let Some(agent) = run.agent else {
                 return thrown("working_directory requires an agent Session");
             };
