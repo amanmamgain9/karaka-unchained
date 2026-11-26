@@ -629,6 +629,7 @@ dependencies = [
  "karaka-session-persistence",
  "karaka-session-projection",
  "karaka-system-prompt",
+ "karaka-tool-todo",
  "karaka-tool-working-directory",
  "karaka-tools",
  "karaka-working-directory",
@@ -800,6 +801,24 @@ version = "0.1.0"
 dependencies = [
  "karaka-kernel",
  "karaka-model",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-tool-todo"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "karaka-agent",
+ "karaka-agent-loop",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-system-prompt",
+ "karaka-tools",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

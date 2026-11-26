@@ -2096,3 +2096,87 @@ from `core/tools/src` (`schema.ts`, `json-schema.ts`, `index.ts`).*
   `Arc<dyn Agent>` a tool gets wraps the same agent state as the one
   `Agents::open` gives, but it is another `Arc`. Tools that compare agents
   by identity would need the id.
+
+## The todo_write tool
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-26: `todo/tool-todo`
+(`src/index.ts`, `src/types.ts`, and the `tool-todo`, `projection`,
+`integration` and `loader-composition` specs), with the tool layer's
+schema compiler and validator from `core/tools/src`.*
+
+### What is done
+
+- **The crate** `karaka-tool-todo`, with `TodoToolPlugin`. It requires the
+  tool registry, the session projections and the session store, and
+  registers the `todos` projection and the `todo_write` tool.
+- **Config.** `TodoConfig { allow_parallel_in_progress }` has no default,
+  so the deployment chooses, as dsh's required config does. The binary sets
+  it to `true`, as every dsh bundle does (`bundle/base/cordis.patch.yml`,
+  and the web-app presets `standard`, `cordis` and `ptc`).
+- **The projection.** `todos` is at state version 2. It is `None` at
+  first. A `todo/write` sets the whole list, the next `turn/start` clears it
+  (a `turn/end` keeps the finished list in view), and every other event
+  leaves it. Clients see the state.
+- **The tool:**
+  - It has dsh's name, and dsh's description: the head, then the parallel
+    or the single clause, then the tail.
+  - Its parameters are exactly what dsh's `defineTool` compiles. Each
+    `required: true` becomes its parent's `required` list, after
+    `properties`. The item keeps `additionalProperties: false`, before
+    `properties`. Annotations follow `type`, and `enum` follows them. The
+    root stays open.
+- **Execution follows dsh's order:**
+  1. The schema check, which dsh's registry makes before any typed tool
+     runs. Karaka's registry doesn't validate, so `schema.rs` ports the
+     validator's subset and wording, its walk order included: an object's
+     missing keys, then each declared property, then undeclared keys,
+     joined by `; ` after `invalid arguments: `. For example:
+     `Error: invalid arguments: missing required property "todos[0].content"; "todos[0].status" must be a string; "todos[0].extra" is not a declared property (additionalProperties: false)`.
+     A bad status gives
+     `"todos[0].status" must be one of ["pending","in_progress","completed"]`.
+  2. `toTodoList`'s rules, with dsh's texts: trimmed non-empty content, no
+     duplicate content, and at most one `in_progress` unless parallel work
+     is allowed.
+  3. The agent check: "todo_write requires an owning agent session".
+  4. The append of `todo/write { todos }` to the agent's session, found in
+     the store by the agent's id.
+
+  The result is "Updated todo list: N pending, N in progress, N completed."
+  Every error is `Error: <message>`.
+- **The event.** `todo/write` is in v4's known types, and v4 doesn't check
+  its payload, leaving it to its plugin. So it is stored as a passthrough,
+  as `working-directory/change` is, with `TodoItem` as its shape. It isn't
+  surface-eligible, and adds no message.
+- **Tests:**
+  - every `tool-todo.spec` and `projection.spec` case but those below;
+  - both `integration.spec` cases;
+  - the config cases of `loader-composition.spec`, through `TodoConfig`;
+  - a loop case: the model calls `todo_write`, the write lands between
+    the call's start and its result, the projection holds the list, and
+    the next turn's `turn/start` clears it;
+  - the schema to the byte, the validator's wording and order, and the list
+    rules as unit tests;
+  - the `ask` CLI case now expects `todo_write` in its request.
+
+### Left out
+
+- **`presentCall`.** Karaka has no presentation layer.
+- **Unregistering when the plugin unloads** (`tool-todo.spec`,
+  `projection.spec`). The kernel unloads no plugin.
+- **`loader-composition.spec`'s Cordis parts:** the cordis.yml boot, the
+  namespace-export shape, and the missing or non-boolean flag, which a
+  Rust `bool` field can't be.
+- **"Isolates the log from later mutation".** An owned Rust value can't be
+  mutated through the log.
+
+### Where it differs from dsh
+
+- **The tool checks its own arguments.** dsh's registry does it for every
+  typed tool. The wording is the same, and the subset covers this schema.
+  The output schema isn't checked, and no structured `value` is returned,
+  only the rendered text, which is all Karaka's `ToolOutput` carries.
+- **A session the store doesn't hold** for the calling agent is
+  `todo_write: no session "id"`. dsh's agent always carries its session.
+- **A `todo/write` whose `todos` doesn't read as a list** leaves the
+  projection unchanged. dsh folds whatever the event holds; storage
+  doesn't check it in either.

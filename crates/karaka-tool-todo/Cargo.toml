@@ -1,0 +1,31 @@
+[package]
+name = "karaka-tool-todo"
+description = "The todo_write tool: the agent's whole task list, logged as todo/write and served as the todos projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the tool and the projection.
+karaka-kernel.workspace = true
+# The tool seam, and the schema the model sees.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+# The `todo/write` event, appended to the calling agent's session.
+karaka-session.workspace = true
+# The `todos` projection.
+karaka-session-projection.workspace = true
+# The list's JSON form.
+serde.workspace = true
+# `preserve_order`, so the schema keeps dsh's key order and its checks walk
+# properties in declaration order, as dsh's validator does.
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+karaka-agent.workspace = true
+karaka-agent-loop.workspace = true
+karaka-system-prompt.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -31,6 +31,8 @@ karaka-fs-local.workspace = true
 karaka-working-directory.workspace = true
 # The model's tool for reading and changing it.
 karaka-tool-working-directory.workspace = true
+# The model's task list.
+karaka-tool-todo.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true
