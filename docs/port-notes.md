@@ -3,6 +3,9 @@
 Things to remember while moving Karaka and Play This Life off dsh. Each entry
 says where it came from and whether it has been checked here.
 
+Everything still undone is collected in `open-ends.md`, which names the
+section here that explains each item.
+
 ## Service tokens between the app and Karaka
 
 *Source: a review in another session, 2026-11-17. Not re-checked here.*
