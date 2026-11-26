@@ -60,8 +60,9 @@ mod surface;
 mod verify;
 
 pub use data::{
-    AssistantMessageData, CancelCause, DeveloperMessageData, Failure, Step, SystemMessageData,
-    ToolCallData, ToolError, ToolResultData, TurnEnd, TurnEndReason, TurnStart,
+    AssistantMessageData, CancelCause, DeveloperMessageData, Failure, InboxSplice, InboxTarget,
+    SpliceOutcome, Step, SystemMessageData, ToolCallData, ToolError, ToolResultData, TurnEnd,
+    TurnEndReason, TurnStart,
 };
 pub use derive::History;
 pub use event::{Entry, Passthrough, Seq, SessionEvent, SurfaceIntent, SurfaceOp, Time};

@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::event::Seq;
 use crate::message::{
     AssistantMessage, DeveloperMessage, Extra, SystemMessage, TokenUsage, ToolResultMessage,
-    present,
+    UserMessage, present,
 };
 
 /// dsh v4: `system/message`, `{ turn, step, message }`.
@@ -141,6 +141,47 @@ pub struct ToolCallData {
     pub name: String,
     /// The arguments exactly as the model wrote them, unparsed.
     pub arguments: String,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// One of an agent's two lists of pending input. (dsh: `InboxTarget`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InboxTarget {
+    /// Prompts waiting for a turn each.
+    #[serde(rename = "next-turn")]
+    NextTurn,
+    /// Input waiting for the next step boundary.
+    #[serde(rename = "next-step")]
+    NextStep,
+}
+
+/// Why a splice removed messages, when they were dropped rather than
+/// taken. (dsh: `outcome`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpliceOutcome {
+    Canceled,
+}
+
+/// dsh v4: `agent/inbox/spliced`, `{ target, start, removedCount?,
+/// inserted, outcome? }`: one change to an agent's durable pending input,
+/// a JavaScript `splice` of one list. (dsh: `agent/src/types.ts`.)
+///
+/// Its messages are ordinary user messages, as v4 checks them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxSplice {
+    pub target: InboxTarget,
+    pub start: u64,
+    /// Written only when something was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_count: Option<u64>,
+    pub inserted: Vec<UserMessage>,
+    /// `canceled` when the removed messages were dropped, as a cancel drops
+    /// them; absent when they were taken, as a step takes its input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<SpliceOutcome>,
     #[serde(flatten)]
     pub extra: Extra,
 }

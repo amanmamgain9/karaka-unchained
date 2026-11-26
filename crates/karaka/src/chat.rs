@@ -143,7 +143,9 @@ async fn converse(runtime: &Runtime, id: &SessionId) -> Result<(), String> {
         // seq, as the loop names its own messages.
         let start = Seq(session.len() as u64);
         let message = UserMessage::text(format!("user-{start}"), UserSource::user(), line);
-        agent.followup(message);
+        agent
+            .followup(message)
+            .map_err(|error| format!("couldn't send the message: {error}"))?;
         agent.when_idle().await;
         // The turn is durable before its answer shows. Without storage,
         // there is nothing to wait for.

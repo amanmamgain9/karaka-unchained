@@ -9,6 +9,7 @@
 //! session read back from storage carries on exactly where it was.
 //!
 //! - `agent.rs`: one session's agent and the task that drives its turns.
+//! - `inbox.rs`: the agent's durable pending input, the `inbox` projection.
 //! - `turn.rs`: one turn and its steps, and the events they log.
 //! - `request.rs`: the request header and route context logged before
 //!   each model call.
@@ -23,10 +24,12 @@
 
 mod agent;
 mod failure;
+mod inbox;
 mod live;
 mod plugin;
 mod request;
 mod runtime_context;
 mod turn;
 
+pub use inbox::{InboxProjection, InboxState, InboxView, InvalidSplice};
 pub use plugin::{AgentLoop, AgentLoopPlugin, LoopConfig};

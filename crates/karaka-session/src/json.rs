@@ -12,7 +12,8 @@
 //!
 //! The last three are optional. `surfaceOp` is required on the five surface
 //! types and forbidden on the lifecycle types Karaka models, which include
-//! `request/header`, `request/context` and `assistant/attempt`. Other types are
+//! `request/header`, `request/context`, `assistant/attempt` and
+//! `agent/inbox/spliced`. Other types are
 //! passthrough and keep whatever they carry.
 //!
 //! Only the shape of one event is checked here. Whether it fits the log,
@@ -94,6 +95,7 @@ fn envelope_of(entry: &Entry) -> Result<Envelope, serde_json::Error> {
         SessionEvent::RequestHeader(data) => (to_json(data)?, None, None),
         SessionEvent::RequestContext(data) => (to_json(data)?, None, None),
         SessionEvent::AssistantAttempt(data) => (to_json(data)?, None, None),
+        SessionEvent::InboxSpliced(data) => (to_json(data)?, None, None),
         SessionEvent::Passthrough(passthrough) => (
             passthrough.data.clone(),
             passthrough.surface_op.clone(),
@@ -152,8 +154,15 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
             data: from_json(data)?,
             surface: intent_of(&event_type, surface_op, source_event_seqs)?,
         },
-        "turn/start" | "turn/end" | "step/start" | "step/end" | "tool/call" | "request/header"
-        | "request/context" | "assistant/attempt" => {
+        "turn/start"
+        | "turn/end"
+        | "step/start"
+        | "step/end"
+        | "tool/call"
+        | "request/header"
+        | "request/context"
+        | "assistant/attempt"
+        | "agent/inbox/spliced" => {
             if let Some(field) = surface_field(&surface_op, &source_event_seqs) {
                 return Err(not_surface_eligible(&event_type, field));
             }
@@ -165,6 +174,7 @@ fn entry_of(envelope: Envelope) -> Result<Entry, String> {
                 "tool/call" => SessionEvent::ToolCall(from_json(data)?),
                 "request/header" => SessionEvent::RequestHeader(from_json(data)?),
                 "request/context" => SessionEvent::RequestContext(from_json(data)?),
+                "agent/inbox/spliced" => SessionEvent::InboxSpliced(from_json(data)?),
                 _ => SessionEvent::AssistantAttempt(from_json(data)?),
             }
         }
@@ -441,6 +451,55 @@ mod tests {
             "data": { "turn": 1, "step": 2, "stream": [{ "type": "text-chunks", "texts": ["x"] }] },
         }));
         assert!(matches!(attempt.event, SessionEvent::AssistantAttempt(_)));
+    }
+
+    // dsh's `agent/inbox/spliced` (`agent/src/types.ts`), which v4 validates
+    // as ordinary user messages (`session-format-v3-to-v4/src/developer.ts`),
+    // and which isn't surface-eligible.
+    #[test]
+    fn an_inbox_splice_reads_typed_and_writes_back() {
+        let splice = round_trip(json!({
+            "type": "agent/inbox/spliced", "seq": 0, "time": 1,
+            "data": { "target": "next-step", "start": 0, "removedCount": 1, "inserted": [{
+                "content": [{ "type": "text", "text": "notice" }],
+                "source": { "kind": "watcher" }, "role": "user", "id": "m-1",
+            }], "outcome": "canceled" },
+        }));
+        let SessionEvent::InboxSpliced(data) = splice.event else {
+            panic!("an inbox splice is typed");
+        };
+        assert_eq!(data.target, crate::InboxTarget::NextStep);
+        assert_eq!((data.start, data.removed_count), (0, Some(1)));
+        assert_eq!(data.inserted[0].id, "m-1");
+        assert_eq!(data.outcome, Some(crate::SpliceOutcome::Canceled));
+
+        let bare = round_trip(json!({
+            "type": "agent/inbox/spliced", "seq": 0, "time": 1,
+            "data": { "target": "next-turn", "start": 2, "inserted": [] },
+        }));
+        let SessionEvent::InboxSpliced(data) = bare.event else {
+            panic!("an inbox splice is typed");
+        };
+        assert_eq!((data.removed_count, data.outcome), (None, None));
+
+        assert!(
+            refusal(json!({
+                "type": "agent/inbox/spliced", "seq": 0, "time": 1, "surfaceOp": "append",
+                "data": { "target": "next-turn", "start": 0, "inserted": [] },
+            }))
+            .contains("not surface-eligible")
+        );
+        // Its messages are ordinary user messages.
+        refusal(json!({
+            "type": "agent/inbox/spliced", "seq": 0, "time": 1,
+            "data": { "target": "next-turn", "start": 0, "inserted": [{
+                "content": [], "source": { "kind": "user" }, "role": "assistant", "id": "m-1",
+            }] },
+        }));
+        refusal(json!({
+            "type": "agent/inbox/spliced", "seq": 0, "time": 1,
+            "data": { "target": "elsewhere", "start": 0, "inserted": [] },
+        }));
     }
 
     /// v4's `assertCurrentLlmShape`: a reason it doesn't define, a marker

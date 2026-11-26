@@ -25,6 +25,7 @@ tokio = { workspace = true, features = ["time", "macros"] }
 # The tests run the real loop over a scripted model, on paused time.
 [dev-dependencies]
 karaka-agent-loop.workspace = true
+karaka-session-projection.workspace = true
 karaka-tools.workspace = true
 karaka-system-prompt.workspace = true
 futures-core.workspace = true

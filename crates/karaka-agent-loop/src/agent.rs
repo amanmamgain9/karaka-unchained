@@ -1,17 +1,30 @@
 //! One session's agent, and the task that drives its turns.
-//! (dsh: `ReactLoopAgent` in `agent-loop/src/agent.ts`: `followup`,
-//! `cancel`, `whenIdle`, `wakeDriver` and `kick`.)
+//! (dsh: `ReactLoopAgent` in `agent-loop/src/agent.ts`: `send`,
+//! `followup`, `steer`, `inject`, `cancel`, `whenIdle`, `wakeDriver` and
+//! `kick`.)
+//!
+//! # The inbox
+//!
+//! What waits is the session's durable inbox (`inbox.rs`): next-turn, the
+//! prompts that get a turn each, and next-step, the input the next step
+//! takes. [`followup`](Agent::followup) queues for a turn and wakes the
+//! agent; [`steer`](Agent::steer) queues for the next step and wakes it;
+//! [`inject`](Agent::inject) queues for the next step and doesn't.
 //!
 //! # The driver
 //!
-//! An idle agent runs nothing. The first [`followup`](Agent::followup)
-//! starts a driver, a task that runs one turn per queued message until the
-//! queue is empty, or until a turn fails, and then ends. A failed turn
-//! leaves the rest of the queue for the next followup's driver, as dsh's
-//! `kick` does. A followup sent while the driver runs only
-//! joins the queue: the driver picks it up when the current turn ends. So
-//! an agent runs one turn at a time, and turns run in the order their
-//! messages came. This is dsh's `wakeDriver` and `kick`.
+//! An idle agent runs nothing. A waking send starts a driver, a task that
+//! runs turns while anything is pending, and then ends. Each step takes
+//! all of next-step, and the first step of a turn also the oldest of
+//! next-turn; a turn goes on for as long as a step leaves next-step
+//! non-empty. A turn that fails stops the driver, as dsh's `kick` does,
+//! and leaves what is pending for the next wake. Input sent while a driver
+//! runs only joins the inbox, so an agent runs one turn at a time.
+//!
+//! A cancel stops the running turn and drops what is pending. Input that
+//! wakes the agent after a cancel, while the cancelled turn winds down,
+//! goes to next-turn and runs next; input that doesn't wake it waits. This
+//! is dsh's latched wake.
 //!
 //! # Cancelling
 //!
@@ -24,24 +37,25 @@
 //!
 //! # Locking
 //!
-//! The queue and the switch sit behind one `std::sync` mutex, held only to
-//! read or change them, never across an `.await`, so `followup` and
-//! `cancel` never wait on a model call. Starting the driver and the driver
-//! finishing both happen under it, so a followup can't slip in between the
-//! driver deciding it is done and saying so.
+//! Every change to the inbox, and the switch, sit behind one `std::sync`
+//! mutex, held only to read or change them, never across an `.await`, so
+//! sending and cancelling never wait on a model call. Each splice is worked
+//! out and logged under it, so splices never race. Starting the driver and
+//! the driver finishing both happen under it, so a send can't slip in
+//! between the driver deciding it is done and saying so.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karaka_agent::{
-    Agent, CancelSwitch, Cancellation, FrameListener, FrameListeners, FrameSubscription, WhenIdle,
-    cancellation,
+    Agent, CancelSwitch, Cancellation, FrameListener, FrameListeners, FrameSubscription,
+    InboxError, WhenIdle, cancellation,
 };
-use karaka_session::{CancelCause, Session, SessionEvent, SessionId, UserMessage};
+use karaka_session::{CancelCause, InboxTarget, Session, SessionEvent, SessionId, UserMessage};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
+use crate::inbox::Inbox;
 use crate::live::FrameCounters;
 use crate::plugin::Shared;
 use crate::runtime_context::RuntimeContextProjection;
@@ -88,12 +102,13 @@ pub(crate) struct Inner {
 }
 
 struct State {
-    /// The messages waiting for a turn each, oldest first. (dsh: the
-    /// inbox's `next-turn` list.)
-    queue: VecDeque<UserMessage>,
     /// The current turn's switch while a driver runs, `None` while the
     /// agent is idle. (dsh: the `running` phase's `AbortController`.)
     switch: Option<Switch>,
+    /// A waking send arrived after the running turn was cancelled: the
+    /// driver runs another turn once that one ends. (dsh:
+    /// `wakeRequested`.)
+    wake_requested: bool,
     /// The number of the last turn that started, 0 before the first. Turns
     /// are numbered from 1 in each session, carrying on after the turns of
     /// a restored log. (dsh: the `turnBoundary` projection's `lastTurn`.)
@@ -130,8 +145,8 @@ impl LoopAgent {
             shared,
             runtime: Handle::current(),
             state: Mutex::new(State {
-                queue: VecDeque::new(),
                 switch: None,
+                wake_requested: false,
                 last_turn,
             }),
             idle: watch::Sender::new(true),
@@ -147,24 +162,24 @@ impl Agent for LoopAgent {
         self.inner.session.id()
     }
 
-    fn followup(&self, message: UserMessage) {
-        let mut state = self.inner.lock();
-        state.queue.push_back(message);
-        if state.switch.is_some() {
-            // The running driver takes it when the current turn ends.
-            return;
-        }
-        let (switch, cancel) = cancellation();
-        state.switch = Some(switch);
-        self.inner.idle.send_replace(false);
-        drop(state);
-        let inner = Arc::clone(&self.inner);
-        self.inner.runtime.spawn(inner.drive(cancel));
+    fn followup(&self, message: UserMessage) -> Result<(), InboxError> {
+        self.send(message, InboxTarget::NextTurn, true)
+    }
+
+    fn steer(&self, message: UserMessage) -> Result<(), InboxError> {
+        self.send(message, InboxTarget::NextStep, true)
+    }
+
+    fn inject(&self, message: UserMessage) -> Result<(), InboxError> {
+        self.send(message, InboxTarget::NextStep, false)
     }
 
     fn cancel(&self, cause: CancelCause) {
         let mut state = self.inner.lock();
-        state.queue.clear();
+        // dsh clears first and throws if the log refuses; here the turn is
+        // stopped either way.
+        let _ = self.inner.inbox().clear();
+        state.wake_requested = false;
         if let Some(switch) = &state.switch {
             switch.cancel(cause);
         }
@@ -186,8 +201,52 @@ impl Agent for LoopAgent {
     }
 }
 
+impl LoopAgent {
+    /// Queues `message` in `target`, and starts the driver when `wake` and
+    /// the agent is idle. (dsh: `send`.)
+    fn send(
+        &self,
+        message: UserMessage,
+        target: InboxTarget,
+        wake: bool,
+    ) -> Result<(), InboxError> {
+        let mut state = self.inner.lock();
+        // A cancelled turn can't take waking input at a step: it goes to
+        // the next turn, and runs once the cancelled one ends.
+        let after_cancel = wake
+            && state
+                .switch
+                .as_ref()
+                .is_some_and(CancelSwitch::is_cancelled);
+        let target = if after_cancel {
+            InboxTarget::NextTurn
+        } else {
+            target
+        };
+        self.inner.inbox().append(target, message)?;
+        if !wake {
+            return Ok(());
+        }
+        if state.switch.is_some() {
+            // A live driver takes it itself.
+            if after_cancel {
+                state.wake_requested = true;
+            }
+            return Ok(());
+        }
+        let (switch, cancel) = cancellation();
+        state.switch = Some(switch);
+        self.inner.idle.send_replace(false);
+        drop(state);
+        let inner = Arc::clone(&self.inner);
+        self.inner.runtime.spawn(inner.drive(cancel));
+        Ok(())
+    }
+}
+
 impl Inner {
-    /// Runs turns until the queue is empty or a turn fails. (dsh: `kick`.)
+    /// Runs turns while anything is pending, until a turn fails. (dsh:
+    /// `kick`, and the end of `turn`.)
     async fn drive(self: Arc<Self>, mut cancel: Cancel) {
         // If the driver panics, or the runtime shuts down under it, the
         // guard still marks the agent idle, so nobody waits for it forever.
@@ -203,15 +262,21 @@ impl Inner {
                 state.last_turn = turn;
             }
             // After a turn that failed, or one the log refused to start, the
-            // driver stops, as dsh's does, and leaves the queue as it is.
-            // The next followup starts a driver, which takes the oldest
-            // queued message first. An aborted turn needs no such rule: the
-            // cancel emptied the queue.
-            if !matches!(ran, Ran::Ended) || state.queue.is_empty() {
+            // driver stops, as dsh's does, and leaves what is pending for
+            // the next wake. After a cancelled one it goes on only for input
+            // that woke it since (dsh's latched wake).
+            let pending = self.inbox().has_pending().unwrap_or(false);
+            let more = match ran {
+                Ran::Ended => pending,
+                Ran::Aborted => state.wake_requested && pending,
+                Ran::Failed | Ran::NotStarted => false,
+            };
+            if !more {
                 guard.armed = false;
                 self.finish(&mut state);
                 return;
             }
+            state.wake_requested = false;
             // A new switch for the next turn: a cancel of the turn that
             // just ended doesn't reach it. (dsh: `phase.abort = new
             // AbortController()`.)
@@ -221,10 +286,23 @@ impl Inner {
         }
     }
 
-    /// Takes the oldest queued message, for the first step of a turn.
-    /// (dsh: the inbox's `claim`.)
-    pub(crate) fn claim(&self) -> Option<UserMessage> {
-        self.lock().queue.pop_front()
+    /// Takes one step's input. (dsh: the pre-step's `claim`.)
+    pub(crate) fn claim(&self, target: InboxTarget) -> Result<Vec<UserMessage>, InboxError> {
+        let _state = self.lock();
+        self.inbox().claim(target)
+    }
+
+    /// Whether next-step holds input, so the turn goes on.
+    pub(crate) fn has_next_step(&self) -> bool {
+        let _state = self.lock();
+        self.inbox().has_next_step().unwrap_or(false)
+    }
+
+    pub(crate) fn inbox(&self) -> Inbox<'_> {
+        Inbox {
+            projections: &self.shared.projections,
+            session: &self.session,
+        }
     }
 
     /// Marks the agent idle. The caller holds the lock, so no followup can

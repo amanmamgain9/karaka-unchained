@@ -24,6 +24,7 @@ use karaka_session::{
     CancelCause, Entry, Failure, SessionEvent, SessionId, SessionStore, SessionsPlugin,
     TurnEndReason, UserMessage, UserSource,
 };
+use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::SystemPromptPlugin;
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
@@ -164,6 +165,7 @@ impl Harness {
             Box::new(SystemPromptPlugin::default()),
             Box::new(ToolsPlugin),
             Box::new(SessionsPlugin),
+            Box::new(SessionProjectionsPlugin),
             Box::new(AgentLoopPlugin::new(LoopConfig::new(ROUTE, "mock-model"))),
             Box::new(RetryPlugin::with_random(move || {
                 samples.lock().unwrap().pop_front().unwrap_or(0.5)
@@ -199,7 +201,7 @@ impl Harness {
 
     async fn say(&self, text: &str) {
         let agent = self.agent();
-        agent.followup(user(text));
+        agent.followup(user(text)).unwrap();
         agent.when_idle().await;
     }
 
@@ -247,8 +249,12 @@ fn user(text: &str) -> UserMessage {
 }
 
 /// The events of a first step up to its request.
-const OPENING: [&str; 6] = [
+/// A turn's opening: the followup queued, the turn started, and its first
+/// step taking the followup from the inbox.
+const OPENING: [&str; 8] = [
+    "agent/inbox/spliced",
     "turn/start",
+    "agent/inbox/spliced",
     "step/start",
     "system/message",
     "user/message",
@@ -304,7 +310,7 @@ async fn one_retry_then_success() {
     assert_eq!(
         harness.data(RETRY),
         [json!({
-            "retryId": "retry-7",
+            "retryId": "retry-9",
             "turn": 1,
             "step": 1,
             "provider": PROVIDER,
@@ -318,12 +324,12 @@ async fn one_retry_then_success() {
     );
     assert_eq!(
         harness.data(RETRY_STARTED),
-        [json!({ "retryId": "retry-7", "turn": 1, "step": 1, "retry": 1 })]
+        [json!({ "retryId": "retry-9", "turn": 1, "step": 1, "retry": 1 })]
     );
     // The key order is dsh's too.
-    let written = serde_json::to_string(&harness.events()[7]).unwrap();
+    let written = serde_json::to_string(&harness.events()[9]).unwrap();
     assert!(
-        written.contains(r#""data":{"retryId":"retry-7","turn":1,"step":1,"provider":"mock","mode":"normal","policyKey":"#),
+        written.contains(r#""data":{"retryId":"retry-9","turn":1,"step":1,"provider":"mock","mode":"normal","policyKey":"#),
         "{written}"
     );
     assert_eq!(harness.calls(), 2);
@@ -541,7 +547,7 @@ async fn a_cancel_during_the_wait_ends_the_turn() {
     )
     .await;
     let agent = harness.agent();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     // Each 1 ms sleep is the earliest timer, so paused time moves only that
     // far, and the retry's 500 ms wait is still running when it is seen.
     while harness.data(RETRY).is_empty() {
@@ -581,6 +587,7 @@ async fn a_cancel_from_an_earlier_handler_stops_the_retry() {
         Box::new(SystemPromptPlugin::default()),
         Box::new(ToolsPlugin),
         Box::new(SessionsPlugin),
+        Box::new(SessionProjectionsPlugin),
         Box::new(AgentLoopPlugin::new(LoopConfig::new(ROUTE, "mock-model"))),
     ])
     .await
@@ -599,7 +606,7 @@ async fn a_cancel_from_an_earlier_handler_stops_the_retry() {
     hooks.register(Arc::new(Canceller(Arc::clone(&agents))));
     hooks.register(Arc::new(RetryHandler::new(Arc::new(|| 0.5))));
     let agent = agents.open(id()).unwrap();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     agent.when_idle().await;
 
     let events = runtime.get::<SessionStore>().events(&id()).unwrap();

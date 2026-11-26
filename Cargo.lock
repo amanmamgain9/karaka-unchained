@@ -652,8 +652,10 @@ dependencies = [
  "karaka-kernel",
  "karaka-model",
  "karaka-session",
+ "karaka-session-projection",
  "karaka-system-prompt",
  "karaka-tools",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -735,6 +737,7 @@ dependencies = [
  "karaka-kernel",
  "karaka-model",
  "karaka-session",
+ "karaka-session-projection",
  "karaka-system-prompt",
  "karaka-tools",
  "serde_json",

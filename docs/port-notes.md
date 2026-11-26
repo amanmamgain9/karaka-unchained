@@ -371,6 +371,7 @@ Each lives in dsh at the path given, under `packages/`.
   `inject` in `core/agent-loop/src/agent.ts:154-173`, and
   `core/agent-loop/src/inbox.ts`. Also the `agent/turn-stopping` and
   `agent/pre-step` hooks that feed it (`core/agent/src/runtime-types.ts`).
+  (Ported since, without the hooks: see "Agent inbox".)
 - **Tool policies and approvals.** `tools/pre-execute` and
   `tools/post-execute` in `core/tools/src/index.ts`, and
   `interaction/user-approval`.
@@ -398,9 +399,8 @@ the queue is empty.
 
 ### Where step one differs from dsh
 
-- **The inbox is in memory.** dsh logs every queue change as an
-  `agent/inbox/spliced` event (`core/agent-loop/src/inbox.ts`), so queued
-  messages survive a restart. Karaka's queue is lost with the process.
+- **The inbox was in memory** at this step. It is durable since, as dsh's
+  is: see "Agent inbox".
 - **Cancelling drops the running work.** dsh aborts an `AbortSignal` and
   waits for the tool to settle, then logs `Error: tool call aborted`
   (`ABORTED`), and for calls it never started, a `tool/call` plus `Error:
@@ -1830,3 +1830,112 @@ and `tests/registry.spec.ts`).*
   say so and return, as dsh's socket case does where sockets are refused.
   The watch filtering is covered by the synthetic-event unit tests either
   way.
+
+## Agent inbox
+
+*Ported from dsh tag `dsh-v0.2.1-rc.2`, 2026-11-26:
+`core/agent-loop/src/inbox.ts` and the parts of `agent.ts` that use it
+(`send`, `followup`, `steer`, `inject`, `cancel`, the pre-step `claim`, and
+the turn's end), with `core/agent/src/runtime-types.ts` for the contracts.*
+
+### What is done
+
+- **The event.** `agent/inbox/spliced` is typed
+  (`SessionEvent::InboxSpliced`): `{ target, start, removedCount?,
+  inserted, outcome? }`, with `target` as `next-turn` or `next-step` and
+  `outcome` as `canceled`. Before, it was a passthrough of a known type.
+  Typing it is what v4 asks for: its messages are ordinary user messages
+  (`session-format-v3-to-v4/src/developer.ts`), and it isn't
+  surface-eligible, so a `surfaceOp` on it is refused, as on the other
+  lifecycle events.
+- **The inbox** is the `inbox` projection of `karaka-session-projection`,
+  folded from those events, as in dsh. The loop's plugin now requires the
+  projections port, and registers `InboxProjection` at setup.
+  - Clients see `{ "next-turn": [...], "next-step": [...] }`.
+  - The fold refuses a splice outside its list ("invalid inbox splice"),
+    and one that would make an id pending twice ("message "id" is already
+    pending"), as "invalid persisted inbox splice at session seq N".
+- **The agent** (`karaka-agent`):
+  - `steer` and `inject` are new on `Agent`.
+  - `followup`, `steer` and `inject` now return a `Result`, as dsh's
+    `send` throws. The errors are an id that is already pending, an
+    invalid history, or a log that refuses the splice.
+  - `Agents::open` returns `OpenError`, which adds an invalid inbox
+    history to the session's errors.
+- **The loop** (`karaka-agent-loop`):
+  - `send` splices at the end of its list. `followup` (next-turn) and
+    `steer` (next-step) wake an idle agent; `inject` (next-step) doesn't.
+  - Each step claims all of next-step, and a turn's first step also the
+    oldest of next-turn, before assembling, as dsh's pre-step does. The
+    claimed messages are logged as `user/message`s, in that order, in the
+    step's first attempt.
+  - A turn goes on while a step leaves next-step non-empty, so steering or
+    context that lands during a step gets another one. `max-tokens` sticks
+    once a step hits it.
+  - The driver runs another turn while anything is pending.
+  - A cancel clears both lists durably, next-step first, as `canceled`
+    splices; an empty list logs nothing.
+  - Waking input sent after a cancel, while the cancelled turn winds down,
+    goes to next-turn and runs next (dsh's latched wake). Input that doesn't
+    wake waits.
+- **Restore.** What is pending is folded from the log, so it survives a
+  restore. As in dsh, a restored agent doesn't wake on a non-empty inbox:
+  dsh's resume runs setup as maintenance, and only a waking send made
+  meanwhile latches a wake. The next followup or steer runs the pending
+  input first: its turn claims all of next-step and the oldest of
+  next-turn.
+- **Tests:**
+  - From `agent.spec`, `loop.spec` and `inbox.spec`:
+    - an idle inject is staged and runs nothing;
+    - a later turn takes it first;
+    - an inject during a tool is taken after the result;
+    - an idle steer starts a turn;
+    - steering during a tool, or during a final answer, runs another step;
+    - a failed turn keeps steering until the next wake;
+    - a cancel clears both queues durably, and twice adds nothing;
+    - an invalid history (out of range, or a duplicate id) is refused with
+      dsh's errors;
+    - a pending id can't be queued again.
+  - Karaka's own:
+    - a followup's exact splices;
+    - an inject after a cancel waits;
+    - a steer after a cancel runs next;
+    - the queues survive a restore without waking;
+    - the fold's unit tests;
+    - the typed event's JSON.
+
+### Where it differs from dsh
+
+- **A history that doesn't fold is refused at `open`**, with dsh's message
+  and its cause as the error's source. dsh lets the agent open, and throws
+  from the first read of its inbox. Every operation of such an agent would
+  fail, so Karaka refuses it up front. The inbox's operations still give
+  the same error if they ever meet one.
+- **The fold records its failure** in the state (`invalid`, the seq and the
+  cause) and folds nothing after it, where dsh's `apply` throws. A
+  projection unit here can't fail.
+- **A start or count that isn't a non-negative integer is refused when the
+  log is read**, as JSON that doesn't fit the type. dsh's fold refuses it
+  with its own message.
+- **No `agent/inbox/inserted`, `claimed` or `discarded` events.** Karaka
+  has no equivalent hook. `replace` and `remove`, the inbox's editing API,
+  aren't ported either: nothing calls them yet.
+- **No tool-call context.** dsh's tools can return additional context for
+  the next step (`tool-calls.ts`, `acceptContext`), which the loop splices
+  into next-step. Karaka's `ToolOutput` has no such field.
+- **No `agent/pre-step` or `agent/turn-stopping` hook.** The pre-step's
+  default decision is the one taken, and a turn stops when a step that
+  ended it leaves next-step empty. So a turn whose first claim is empty
+  ends without a step even with runtime context to show, where dsh's
+  default decision would count the context snapshot as input. In Karaka
+  that happens only after a cancel, which ends the turn as aborted anyway.
+- **The driver is a task, not synchronous.** In dsh, a steer to an idle
+  agent claims before the call returns, so a second steer right after it
+  waits for the next step. Here both can land before the first claim and go
+  to the same step. dsh's "starts idle steering synchronously" case is
+  ported as steering that lands while the first answer streams.
+- **`cancel` stops the turn even if the log refuses the clear.** dsh's
+  `cancel` throws first.
+- **The harness's `events()` leaves out the inbox's splices.** Each turn
+  now logs two (the followup and the claim). The older loop tests read the
+  turn's own events through it; the inbox tests read the full log.

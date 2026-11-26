@@ -5,10 +5,13 @@
 //! # The events, in order
 //!
 //! ```text
+//! agent/inbox/spliced     a followup, steer or inject queued, any time
 //! turn/start
+//!   agent/inbox/spliced   the step taking its input: all of next-step, and
+//!                         in a turn's first step the oldest of next-turn
 //!   step/start
 //!     system/message      when the prompt first appears or changes
-//!     user/message        the queued message, in the first step only
+//!     user/message        each message the step took, in its first attempt
 //!     request/header      when the settings or tools change, or a loop
 //!                         makes its first request (see `request.rs`)
 //!     request/context     when the route changes
@@ -21,7 +24,8 @@
 //!     tool/call           for each call, in the model's order:
 //!     tool/result           logged as it starts, then its result
 //!   step/end              always, even when the step fails
-//!   ... another step if the last one called tools ...
+//!   ... another step if the last one called tools, or next-step holds
+//!       input ...
 //! turn/end                completed, max-tokens, aborted or error
 //! ```
 //!
@@ -70,8 +74,9 @@ use karaka_model::{
 };
 use karaka_session::{
     AssistantAttemptData, AssistantMessage, AssistantMessageData, CancelCause, CloseCause,
-    ContentBlock, Extra, Failure, History, LogError, Seq, SessionEvent, SurfaceIntent, SurfaceOp,
-    SystemMessage, SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason, UserMessage,
+    ContentBlock, Extra, Failure, History, InboxTarget, LogError, Seq, SessionEvent, SurfaceIntent,
+    SurfaceOp, SystemMessage, SystemMessageData, ToolCallRecovery, ToolResultData, TurnEndReason,
+    UserMessage,
 };
 use karaka_system_prompt::{
     AssembleContext, PromptAssembly, Scope, join_context_sections, render_context_sections,
@@ -103,7 +108,10 @@ pub(crate) enum Ran {
     /// It ended with reason `error`. dsh's `turn` throws here, and `kick`
     /// catches it and stops the driver (`agent.ts:252-265,375-383`).
     Failed,
-    /// It ended any other way: completed, max-tokens or aborted.
+    /// It ended with reason `aborted`. dsh's `turn` throws here too, and
+    /// the driver goes on only for a latched wake.
+    Aborted,
+    /// It ended any other way: completed or max-tokens.
     Ended,
 }
 
@@ -131,7 +139,7 @@ impl Inner {
         }
         let (reason, ran) = match self.steps(turn, cancel).await {
             Ok(reason) => (reason, Ran::Ended),
-            Err(Stop::Aborted(cause)) => (TurnEndReason::Aborted(cause), Ran::Ended),
+            Err(Stop::Aborted(cause)) => (TurnEndReason::Aborted(cause), Ran::Aborted),
             Err(Stop::Failed(failure)) => (TurnEndReason::Error(failure), Ran::Failed),
         };
         // If the log refuses even this, the turn stays open, and repair
@@ -140,35 +148,22 @@ impl Inner {
         ran
     }
 
-    /// Runs steps until one ends the turn, and says how it ended.
+    /// Runs steps until one ends the turn with nothing left in next-step,
+    /// and says how it ended. (dsh: the `while (true)` in `turn`,
+    /// `agent.ts:310-352`.)
     async fn steps(&self, turn: u64, cancel: &Cancel) -> Result<TurnEndReason, Stop> {
         let mut step = 0;
+        let mut target = InboxTarget::NextTurn;
+        let mut ending: Option<TurnEndReason> = None;
         loop {
             if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
-            // Only the first step takes input: the queued message the turn
-            // is for. dsh's later steps take steering, which isn't ported.
-            let input = if step == 0 {
-                match self.claim() {
-                    Some(message) => Some(message),
-                    // A cancel empties the queue, so a cancel that lands
-                    // between the check above and the claim leaves nothing
-                    // to claim. It has flipped the switch by then: both
-                    // happen under the agent's lock.
-                    None => {
-                        return match cancel.cause() {
-                            Some(cause) => Err(Stop::Aborted(cause)),
-                            // Nothing queued and nothing cancelled. dsh ends
-                            // such a turn as completed, without a step
-                            // (`agent.ts:326-329`).
-                            None => Ok(TurnEndReason::Completed),
-                        };
-                    }
-                }
-            } else {
-                None
-            };
+            // Each step takes all of next-step; a turn's first also takes
+            // the oldest of next-turn (`agent.ts:271`).
+            let input = self
+                .claim(target)
+                .map_err(|error| Stop::Failed(other_failure(&error)))?;
             // The step's prompt and tools, assembled once, before the step
             // starts, as dsh's pre-step does (`agent.ts:272`). A failure
             // ends the turn with no step.
@@ -186,6 +181,21 @@ impl Inner {
             if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
+            if let Some(reason) = ending.take_if(|_| input.is_empty()) {
+                return Ok(reason);
+            }
+            if step == 0 && input.is_empty() {
+                // A cancel drops what is pending, so one that lands before
+                // the claim leaves nothing to take. It has flipped the switch
+                // by then: both happen under the agent's lock.
+                return match cancel.cause() {
+                    Some(cause) => Err(Stop::Aborted(cause)),
+                    // Nothing pending and nothing cancelled. dsh ends such
+                    // a turn as completed, without a step
+                    // (`agent.ts:326-329`).
+                    None => Ok(TurnEndReason::Completed),
+                };
+            }
             step += 1;
             let started = self.session.append(SessionEvent::step_start(turn, step))?;
             let outcome = self.step(turn, step, input, &assembly, cancel).await;
@@ -195,18 +205,24 @@ impl Inner {
                 let _ = self.answer_pending_calls(started);
             }
             let ended = self.session.append(SessionEvent::step_end(turn, step));
-            let ending = outcome?;
+            let step_ending = outcome?;
             ended?;
             if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
-            // dsh keeps a `max-tokens` ending even if a later step of the
-            // turn completes (`agent.ts:338-343`). Only steering can run a
-            // step after one that ended the turn, and it isn't ported, so
-            // here the first ending is always the last step's.
-            if let Some(reason) = ending {
+            // A `max-tokens` ending sticks: a later step of the turn that
+            // completes, or calls tools, doesn't change it
+            // (`agent.ts:338-343`).
+            if !matches!(ending, Some(TurnEndReason::MaxTokens)) {
+                ending = step_ending;
+            }
+            // Steering that arrived during the step keeps the turn going.
+            // (dsh's `agent/turn-stopping` hook, which may add some, isn't
+            // ported.)
+            if let Some(reason) = ending.take_if(|_| !self.has_next_step()) {
                 return Ok(reason);
             }
+            target = InboxTarget::NextStep;
         }
     }
 
@@ -216,7 +232,7 @@ impl Inner {
         &self,
         turn: u64,
         step: u64,
-        input: Option<UserMessage>,
+        input: Vec<UserMessage>,
         assembly: &PromptAssembly,
         cancel: &Cancel,
     ) -> Result<Option<TurnEndReason>, Stop> {
@@ -282,14 +298,14 @@ impl Inner {
     ///
     /// Each attempt does again what dsh's does: it updates the system prompt,
     /// looks up the model, logs the header and context if they are due, and
-    /// builds the request from the log anew. Only the queued message is
+    /// builds the request from the log anew. Only the step's input is
     /// logged once, on the first attempt (`agent.ts:426-437`). A failed
     /// attempt is logged as an `assistant/attempt`, then the hook decides.
     async fn call_model(
         &self,
         turn: u64,
         step: u64,
-        mut input: Option<UserMessage>,
+        mut input: Vec<UserMessage>,
         prompt: &str,
         assembly: &PromptAssembly,
         cancel: &Cancel,
@@ -310,7 +326,7 @@ impl Inner {
                 return Err(Stop::Aborted(cause));
             }
             self.update_system_prompt(turn, step, prompt)?;
-            if let Some(message) = input.take() {
+            for message in std::mem::take(&mut input) {
                 self.session.append(SessionEvent::user(message))?;
             }
             // After the input, as dsh's default pre-step places it, and only

@@ -18,6 +18,11 @@ karaka-session.workspace = true
 karaka-agent.workspace = true
 # Each step's system prompt and tool list are assembled from the registry.
 karaka-system-prompt.workspace = true
+# The agent's pending input is the session's `inbox` projection, folded
+# from its `agent/inbox/spliced` events.
+karaka-session-projection.workspace = true
+# The inbox's state is checkpointed and served as JSON.
+serde.workspace = true
 # The compact stream records each settlement embeds are JSON.
 serde_json.workspace = true
 # Each agent drives its turns on a task of its own. `sync` is for the watch

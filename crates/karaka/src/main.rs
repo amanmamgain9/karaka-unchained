@@ -173,7 +173,9 @@ async fn ask(question: Option<String>) -> Result<(), String> {
             .unwrap_or_else(PoisonError::into_inner)
             .frame(frame);
     }));
-    agent.followup(UserMessage::text("user-0", UserSource::user(), question));
+    agent
+        .followup(UserMessage::text("user-0", UserSource::user(), question))
+        .map_err(|error| format!("couldn't send the question: {error}"))?;
     agent.when_idle().await;
 
     let ending = runtime

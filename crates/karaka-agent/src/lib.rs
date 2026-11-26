@@ -3,8 +3,11 @@
 //! (dsh: `packages/core/agent`, `dsh-agent`.)
 //!
 //! An agent drives one session. Callers queue what the user said with
-//! [`Agent::followup`], stop the running turn with [`Agent::cancel`], and
-//! wait for the agent to settle with [`Agent::when_idle`]. Everything the
+//! [`Agent::followup`], input for the next step with [`Agent::steer`] and
+//! [`Agent::inject`], stop the running turn with [`Agent::cancel`], and
+//! wait for the agent to settle with [`Agent::when_idle`]. What is queued
+//! is durable: each change to it is an `agent/inbox/spliced` event in the
+//! session's log (`inbox.rs`). Everything the
 //! agent does goes into the session's log, so that is where callers read
 //! the answer: an agent returns nothing itself.
 //!
@@ -21,10 +24,12 @@
 //! answer as it is written (`stream.rs`).
 
 mod cancel;
+mod inbox;
 mod request_error;
 mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
+pub use inbox::{InboxError, SpliceCause};
 pub use request_error::{
     HandlerError, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
     RequestErrorHooks,
@@ -44,9 +49,14 @@ use karaka_session::{CancelCause, SessionError, SessionId, UserMessage};
 /// of the session. (dsh: `Agent` in `agent/src/types.ts`, with the live
 /// methods `runtime-types.ts` adds to it.)
 ///
-/// dsh's agent has more: `steer` and `inject` for input between steps, an
-/// inbox to edit what is queued, a status, maintenance tasks, and its own
-/// plugin scope. Karaka adds them as the loop needs them.
+/// dsh's agent has more: an inbox to edit what is queued, a status,
+/// maintenance tasks, and its own plugin scope. Karaka adds them as the
+/// loop needs them.
+///
+/// Queued input is durable: it is the session's `inbox`, folded from its
+/// `agent/inbox/spliced` events, so it survives a restore. A restored agent
+/// doesn't start on it by itself, as in dsh: it waits for the next
+/// followup or steer, which runs it first.
 pub trait Agent: Send + Sync {
     /// The session this agent drives. An agent and its session share their
     /// id, as in dsh.
@@ -57,12 +67,38 @@ pub trait Agent: Send + Sync {
     /// turn to end. Messages run in the order they were queued, so a
     /// followup to an idle agent with messages still queued runs those
     /// first. (dsh: `followup`.)
-    fn followup(&self, message: UserMessage);
+    ///
+    /// # Errors
+    ///
+    /// A message with the id of one still pending, or one the log refuses.
+    /// Nothing is queued then.
+    fn followup(&self, message: UserMessage) -> Result<(), InboxError>;
 
-    /// Drops every queued message and stops the running turn, which ends
-    /// with `cause` as its reason. With no turn running it only empties the
-    /// queue: it doesn't stop the next turn. Only the first cause for a
-    /// turn counts. (dsh: `cancel`, without `keepInbox`.)
+    /// Queues `message` for the nearest step, and starts the agent if it is
+    /// idle. A running agent takes it at its next step boundary, so the
+    /// turn goes on for it; an idle one starts a turn with it. (dsh:
+    /// `steer`.)
+    ///
+    /// # Errors
+    ///
+    /// As [`followup`](Self::followup).
+    fn steer(&self, message: UserMessage) -> Result<(), InboxError>;
+
+    /// Queues `message`, model-facing context, for the next step without
+    /// starting the agent. A running agent takes it at the nearest later
+    /// step boundary; an idle one keeps it until a followup or a steer
+    /// starts a turn. It may miss a step that has already taken its input.
+    /// (dsh: `inject`.)
+    ///
+    /// # Errors
+    ///
+    /// As [`followup`](Self::followup).
+    fn inject(&self, message: UserMessage) -> Result<(), InboxError>;
+
+    /// Drops every queued message, durably, and stops the running turn,
+    /// which ends with `cause` as its reason. With no turn running it only
+    /// empties the queue: it doesn't stop the next turn. Only the first
+    /// cause for a turn counts. (dsh: `cancel`, without `keepInbox`.)
     fn cancel(&self, cause: CancelCause);
 
     /// Resolves once the agent is idle: no driver is running its turns.
@@ -107,7 +143,56 @@ pub trait Agents: Send + Sync {
     ///
     /// A session the store already holds, such as one restored from
     /// storage, may end in a turn a crash left open. The agent closes that
-    /// turn before it is returned, as dsh's resume repairs the log. That is
-    /// the one way this fails: the closing events don't fit the log.
-    fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, SessionError>;
+    /// turn before it is returned, as dsh's resume repairs the log.
+    ///
+    /// # Errors
+    ///
+    /// The closing events don't fit the log, or the log's queued input
+    /// doesn't fold, as dsh refuses to read an invalid inbox history.
+    fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, OpenError>;
+}
+
+/// Why [`Agents::open`] failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenError {
+    /// The session refused the events that close a turn a crash left open.
+    Session(SessionError),
+    /// The session's queued input doesn't fold.
+    Inbox(InboxError),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Session(error) => error.fmt(f),
+            Self::Inbox(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Session(error) => Some(error),
+            Self::Inbox(error) => Some(error),
+        }
+    }
+}
+
+impl From<SessionError> for OpenError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
+impl From<InboxError> for OpenError {
+    fn from(error: InboxError) -> Self {
+        Self::Inbox(error)
+    }
+}
+
+impl From<karaka_session::LogError> for OpenError {
+    fn from(error: karaka_session::LogError) -> Self {
+        Self::Session(SessionError::Log(error))
+    }
 }

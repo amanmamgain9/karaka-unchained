@@ -30,6 +30,11 @@ impl CancelSwitch {
             true
         })
     }
+
+    /// Whether it has flipped. (dsh: `phase.abort.signal.aborted`.)
+    pub fn is_cancelled(&self) -> bool {
+        self.0.borrow().is_some()
+    }
 }
 
 /// Watches a [`CancelSwitch`]. Cheap to clone; every clone sees the same
@@ -78,7 +83,9 @@ mod tests {
         let (switch, watching) = cancellation();
         let other = watching.clone();
         assert!(!watching.is_cancelled());
+        assert!(!switch.is_cancelled());
         assert!(switch.cancel(CancelCause::User));
+        assert!(switch.is_cancelled());
         assert!(!switch.cancel(CancelCause::Parent));
         assert_eq!(watching.cause(), Some(CancelCause::User));
         assert_eq!(other.cancelled().await, CancelCause::User);

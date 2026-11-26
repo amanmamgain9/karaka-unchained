@@ -6,14 +6,16 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use karaka_agent::{Agent, Agents, RequestErrorHooks};
+use karaka_agent::{Agent, Agents, OpenError, RequestErrorHooks};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
-use karaka_session::{SessionError, SessionId, SessionStore};
+use karaka_session::{SessionId, SessionStore};
+use karaka_session_projection::SessionProjections;
 use karaka_system_prompt::SystemPrompt;
 use karaka_tools::ToolRegistry;
 
 use crate::agent::LoopAgent;
+use crate::inbox::{Inbox, InboxProjection};
 
 /// How every agent of a loop asks its model. (dsh: `AgentOptions`, in
 /// `agent/src/runtime-types.ts`.)
@@ -56,6 +58,8 @@ pub(crate) struct Shared {
     pub(crate) hooks: Arc<RequestErrorHooks>,
     /// Each step's prompt and tool list are assembled from it.
     pub(crate) prompt: Arc<SystemPrompt>,
+    /// Where each agent's inbox is folded, as the `inbox` projection.
+    pub(crate) projections: Arc<SessionProjections>,
 }
 
 /// The default loop's [`Agents`]: one agent per session, made the first
@@ -73,7 +77,9 @@ pub struct AgentLoop {
 impl AgentLoop {
     /// A loop that asks the models in `models`, runs the tools in `tools`,
     /// keeps its sessions in `sessions`, runs `hooks` when a request fails,
-    /// and assembles each step's prompt and tools from `prompt`.
+    /// assembles each step's prompt and tools from `prompt`, and keeps each
+    /// agent's pending input as the `inbox` projection of `projections`,
+    /// which must have [`InboxProjection`] registered.
     pub fn new(
         config: LoopConfig,
         models: Arc<ModelRegistry>,
@@ -81,6 +87,7 @@ impl AgentLoop {
         sessions: Arc<SessionStore>,
         hooks: Arc<RequestErrorHooks>,
         prompt: Arc<SystemPrompt>,
+        projections: Arc<SessionProjections>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
@@ -90,6 +97,7 @@ impl AgentLoop {
                 sessions,
                 hooks,
                 prompt,
+                projections,
             }),
             agents: Mutex::new(HashMap::new()),
         }
@@ -100,7 +108,7 @@ impl Agents for AgentLoop {
     /// # Panics
     ///
     /// If called outside a Tokio runtime, when the agent is new.
-    fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, SessionError> {
+    fn open(&self, id: SessionId) -> Result<Arc<dyn Agent>, OpenError> {
         // Held while the agent is made, so two connections opening one new
         // session at once get the same agent.
         let mut agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
@@ -111,6 +119,13 @@ impl Agents for AgentLoop {
         // Nothing runs on a session before its agent exists, so a turn left
         // open here was left by a crash, and closing it is safe.
         session.repair()?;
+        // A history of queued input that doesn't fold can't be continued:
+        // dsh refuses to read it.
+        Inbox {
+            projections: &self.shared.projections,
+            session: &session,
+        }
+        .current()?;
         let agent = Arc::new(LoopAgent::new(session, Arc::clone(&self.shared)));
         agents.insert(id, Arc::clone(&agent));
         Ok(agent)
@@ -137,9 +152,10 @@ impl fmt::Debug for AgentLoop {
 /// `dsh-agent-loop` plugin, which registers its factory with the agent
 /// registry.)
 ///
-/// It requires the model and tool registries, the session store and the
-/// system prompt, and registers the prompt variables `provider` (its route)
-/// and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
+/// It requires the model and tool registries, the session store, the
+/// session projections and the system prompt. It registers the `inbox`
+/// projection, which holds each agent's pending input, and the prompt
+/// variables `provider` (its route) and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
 /// port beside `Agents`, empty: the loop
 /// runs the hook, so it owns the list. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
@@ -174,6 +190,7 @@ impl Plugin for AgentLoopPlugin {
             PortId::of::<ModelRegistry>(),
             PortId::of::<ToolRegistry>(),
             PortId::of::<SessionStore>(),
+            PortId::of::<SessionProjections>(),
             PortId::of::<SystemPrompt>(),
         ]
     }
@@ -181,6 +198,9 @@ impl Plugin for AgentLoopPlugin {
     async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
         let hooks = Arc::new(RequestErrorHooks::new());
         let prompt = ctx.get::<SystemPrompt>();
+        let projections = ctx.get::<SessionProjections>();
+        // For the life of the runtime, as dsh's loop holds it for its own.
+        let _ = projections.register(InboxProjection)?;
         // dsh reads them off each agent's options; one config serves every
         // agent here. They stay for the life of the runtime.
         let route = self.config.route.clone();
@@ -194,6 +214,7 @@ impl Plugin for AgentLoopPlugin {
             ctx.get::<SessionStore>(),
             Arc::clone(&hooks),
             prompt,
+            projections,
         ));
         ctx.provide(agents);
         ctx.provide(hooks);

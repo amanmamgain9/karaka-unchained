@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::data::{
-    AssistantMessageData, DeveloperMessageData, Step, SystemMessageData, ToolCallData,
+    AssistantMessageData, DeveloperMessageData, InboxSplice, Step, SystemMessageData, ToolCallData,
     ToolResultData, TurnEnd, TurnEndReason, TurnStart,
 };
 use crate::message::{Extra, SystemMessage, UserMessage};
@@ -25,8 +25,9 @@ use crate::request::{
 ///   system, developer, user, assistant and tool result. Each says how it
 ///   joins the model-visible surface (see [`SurfaceIntent`]).
 /// - **Lifecycle events**, which Karaka's loop writes and reads: turn and
-///   step boundaries, `tool/call`, and the three it logs around each model
-///   call, `request/header`, `request/context` and `assistant/attempt`.
+///   step boundaries, `tool/call`, the three it logs around each model
+///   call, `request/header`, `request/context` and `assistant/attempt`, and
+///   `agent/inbox/spliced`, each change to the agent's pending input.
 ///   They never change the history the model sees.
 /// - **[`Passthrough`]**, for every other type: approvals, questions,
 ///   compaction, plugin events, and whatever comes next. Karaka keeps the type and payload untouched, so a
@@ -91,6 +92,9 @@ pub enum SessionEvent {
     RequestContext(RequestContext),
     /// A model call that left no message. (dsh v4: `assistant/attempt`.)
     AssistantAttempt(AssistantAttemptData),
+    /// A change to an agent's durable pending input. (dsh v4:
+    /// `agent/inbox/spliced`.)
+    InboxSpliced(InboxSplice),
     /// Any other event type, kept as it was.
     Passthrough(Passthrough),
 }
@@ -112,6 +116,7 @@ impl SessionEvent {
             Self::RequestHeader(_) => "request/header",
             Self::RequestContext(_) => "request/context",
             Self::AssistantAttempt(_) => "assistant/attempt",
+            Self::InboxSpliced(_) => "agent/inbox/spliced",
             Self::Passthrough(passthrough) => &passthrough.event_type,
         }
     }

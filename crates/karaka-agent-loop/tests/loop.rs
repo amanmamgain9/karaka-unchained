@@ -8,14 +8,15 @@ use std::collections::VecDeque;
 use std::future::pending;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
 use karaka_agent::{
-    Agent, Agents, AssistantStreamFrame, FrameSubscription, HookFuture, Next, RequestError,
-    RequestErrorAction, RequestErrorHandler, RequestErrorHooks, StreamChunk, StreamOutcome,
+    Agent, Agents, AssistantStreamFrame, FrameSubscription, HookFuture, InboxError, Next,
+    RequestError, RequestErrorAction, RequestErrorHandler, RequestErrorHooks, StreamChunk,
+    StreamOutcome,
 };
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_kernel::Runtime;
@@ -25,12 +26,13 @@ use karaka_model::{
     ToolResult, ToolSchema, Usage, stream_of,
 };
 use karaka_session::{
-    CallConfig, CancelCause, Entry, Extra, Failure, IN_HISTORY, RequestContext, RequestHeader,
-    RequestHeaderData, RequestHeaderReason, Seq, SessionEvent, SessionId, SessionStore,
-    SessionsPlugin, SurfaceIntent, SurfaceOp, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, TimedChunk,
-    TokenUsage, TurnEndReason, UserMessage, UserSource, check_assistant_streams, chunk_event,
-    chunk_json, expand_stream,
+    CallConfig, CancelCause, ContentBlock, Entry, Extra, Failure, IN_HISTORY, InboxSplice,
+    InboxTarget, RequestContext, RequestHeader, RequestHeaderData, RequestHeaderReason, Seq,
+    SessionEvent, SessionId, SessionStore, SessionsPlugin, SpliceOutcome, SurfaceIntent, SurfaceOp,
+    TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN, Time, TimedChunk, TokenUsage, TurnEndReason,
+    UserMessage, UserSource, check_assistant_streams, chunk_event, chunk_json, expand_stream,
 };
+use karaka_session_projection::{SessionProjections, SessionProjectionsPlugin};
 use karaka_system_prompt::{
     HARNESS_IDENTITY, PromptContext, Scope, Section, SystemPrompt, SystemPromptConfig,
     SystemPromptPlugin, TOOL_ORDER_REST, Text,
@@ -57,6 +59,8 @@ enum Reply {
     Hang(Vec<Event>, Arc<Notify>),
     /// These events, then a panic in the stream.
     Panic(Vec<Event>),
+    /// Runs the closure as the call starts, then plays the reply.
+    Before(Box<dyn FnOnce() + Send>, Box<Reply>),
 }
 
 /// Plays one reply per call, in order, and keeps every request it got.
@@ -86,7 +90,12 @@ impl Model for Scripted {
 
     fn stream(&self, request: Request) -> EventStream {
         self.requests.lock().unwrap().push(request);
-        let playback = match self.replies.lock().unwrap().pop_front() {
+        let mut reply = self.replies.lock().unwrap().pop_front();
+        while let Some(Reply::Before(run, then)) = reply {
+            run();
+            reply = Some(*then);
+        }
+        let playback = match reply {
             Some(Reply::Events(events)) => Playback {
                 events: events.into(),
                 hang: None,
@@ -102,6 +111,7 @@ impl Model for Scripted {
                 hang: None,
                 panic: true,
             },
+            Some(Reply::Before(..)) => unreachable!("played above"),
             // dsh's mock throws "script exhausted".
             None => Playback {
                 events: VecDeque::from([Err(ModelError::new(
@@ -284,6 +294,7 @@ struct Harness {
     hooks: Arc<RequestErrorHooks>,
     agents: Arc<dyn Agents>,
     prompt: Arc<SystemPrompt>,
+    projections: Arc<SessionProjections>,
     stuck: Arc<Notify>,
     stuck_dropped: Arc<AtomicBool>,
     _runtime: Runtime,
@@ -305,6 +316,7 @@ impl Harness {
             Box::new(AgentLoopPlugin::new(loop_config)),
             Box::new(SystemPromptPlugin::new(prompt)),
             Box::new(SessionsPlugin),
+            Box::new(SessionProjectionsPlugin),
             Box::new(ToolsPlugin),
             Box::new(ModelsPlugin),
         ])
@@ -337,6 +349,7 @@ impl Harness {
             hooks: runtime.get::<RequestErrorHooks>(),
             agents: runtime.get::<dyn Agents>(),
             prompt: runtime.get::<SystemPrompt>(),
+            projections: runtime.get::<SessionProjections>(),
             stuck,
             stuck_dropped,
             _runtime: runtime,
@@ -347,8 +360,21 @@ impl Harness {
         self.agents.open(id()).expect("the agent opens")
     }
 
-    fn events(&self) -> Vec<Entry> {
+    /// Every event, to restore elsewhere.
+    fn log(&self) -> Vec<Entry> {
         self.sessions.events(&id()).expect("the session exists")
+    }
+
+    /// Every event but the inbox's splices, which a followup and each
+    /// step's claim log around a turn; the inbox's own tests read them,
+    /// with [`log_types`] and [`splices`].
+    fn events(&self) -> Vec<Entry> {
+        self.sessions
+            .events(&id())
+            .expect("the session exists")
+            .into_iter()
+            .filter(|entry| !matches!(entry.event, SessionEvent::InboxSpliced(_)))
+            .collect()
     }
 
     /// The type of every event logged, in order.
@@ -395,7 +421,7 @@ impl Harness {
     /// Sends `text` as a followup and waits for the agent to be idle.
     async fn say(&self, text: &str) {
         let agent = self.agent();
-        agent.followup(user(text));
+        agent.followup(user(text)).unwrap();
         idle(agent.as_ref()).await;
     }
 }
@@ -623,7 +649,7 @@ async fn a_tool_round_trip_logs_the_call_and_its_result() {
             is_error: false
         }
     );
-    assert_eq!(sources, [7]);
+    assert_eq!(sources, [events[7].seq.0]);
     assert_eq!(error, None);
 
     // The second request carries the call and its result.
@@ -687,12 +713,12 @@ async fn two_calls_in_one_step_run_in_the_models_order() {
         (first.0.call_id.as_str(), first.0.content.as_str()),
         ("c1", "echo: one")
     );
-    assert_eq!(first.1, [7]);
+    assert_eq!(first.1, [events[7].seq.0]);
     assert_eq!(
         (second.0.call_id.as_str(), second.0.content.as_str()),
         ("c2", "echo: two")
     );
-    assert_eq!(second.1, [9]);
+    assert_eq!(second.1, [events[9].seq.0]);
 
     // Both results go back in one user message, in the model's order.
     let requests = harness.model.requests();
@@ -713,7 +739,7 @@ async fn an_unknown_tool_gets_an_error_result_and_the_turn_carries_on() {
     let (result, sources, _) = tool_result(&events[8]);
     assert_eq!(result.content, "Error: unknown tool \"weather\"");
     assert!(result.is_error);
-    assert_eq!(sources, [7]);
+    assert_eq!(sources, [events[7].seq.0]);
     assert_eq!(harness.endings(), [TurnEndReason::Completed]);
     assert_eq!(harness.model.requests().len(), 2);
 }
@@ -886,7 +912,7 @@ async fn a_section_scoped_to_one_session_reaches_its_agent_only() {
         .unwrap();
     harness.say("hi").await;
     let other = harness.agents.open(SessionId::new("b1")).unwrap();
-    other.followup(user("hello"));
+    other.followup(user("hello")).unwrap();
     idle(other.as_ref()).await;
     let requests = harness.model.requests();
     assert_eq!(requests[0].system.as_deref(), Some("Only a1."));
@@ -1077,8 +1103,8 @@ async fn a_failed_turn_leaves_the_queue_for_the_next_followup() {
     ])
     .await;
     let agent = harness.agent();
-    agent.followup(user("first"));
-    agent.followup(user("second"));
+    agent.followup(user("first")).unwrap();
+    agent.followup(user("second")).unwrap();
     idle(agent.as_ref()).await;
 
     // Only the failed turn ran; "second" is still waiting.
@@ -1089,7 +1115,7 @@ async fn a_failed_turn_leaves_the_queue_for_the_next_followup() {
     assert_eq!(failure.code, "SERVER");
     assert_eq!(harness.model.requests().len(), 1);
 
-    agent.followup(user("third"));
+    agent.followup(user("third")).unwrap();
     idle(agent.as_ref()).await;
 
     let endings = harness.endings();
@@ -1169,7 +1195,7 @@ async fn a_cancel_mid_stream_keeps_the_partial_answer() {
     ])
     .await;
     let agent = harness.agent();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     waiting.notified().await;
     agent.cancel(CancelCause::User);
     idle(agent.as_ref()).await;
@@ -1221,7 +1247,7 @@ async fn a_cancel_after_the_usage_keeps_it_on_the_partial_answer() {
     events.push(Event::Usage { usage: usage() });
     let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
     let agent = harness.agent();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     waiting.notified().await;
     agent.cancel(CancelCause::User);
     idle(agent.as_ref()).await;
@@ -1252,7 +1278,7 @@ async fn a_cancel_before_any_text_keeps_no_answer() {
     )])
     .await;
     let agent = harness.agent();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     waiting.notified().await;
     agent.cancel(CancelCause::User);
     idle(agent.as_ref()).await;
@@ -1290,7 +1316,7 @@ async fn a_cancel_during_a_tool_call_answers_every_call() {
     ])])
     .await;
     let agent = harness.agent();
-    agent.followup(user("go"));
+    agent.followup(user("go")).unwrap();
     harness.stuck.notified().await;
     agent.cancel(CancelCause::Hook {
         reason: "policy stopped this turn".into(),
@@ -1328,7 +1354,7 @@ async fn a_cancel_during_a_tool_call_answers_every_call() {
     let (started, sources, code) = tool_result(&events[8]);
     assert_eq!(started.call_id, "c1");
     assert!(started.is_error);
-    assert_eq!(sources, [7]);
+    assert_eq!(sources, [events[7].seq.0]);
     assert_eq!(code.as_deref(), Some(TOOL_OUTCOME_UNKNOWN));
     let (skipped, sources, code) = tool_result(&events[9]);
     assert_eq!(skipped.call_id, "c2");
@@ -1347,8 +1373,8 @@ async fn a_cancel_during_a_tool_call_answers_every_call() {
 async fn a_cancel_right_after_a_followup_ends_its_turn_without_a_step() {
     let harness = Harness::new(vec![text("should not run")]).await;
     let agent = harness.agent();
-    agent.followup(user("drop me first"));
-    agent.followup(user("drop me second"));
+    agent.followup(user("drop me first")).unwrap();
+    agent.followup(user("drop me second")).unwrap();
     agent.cancel(CancelCause::User);
     idle(agent.as_ref()).await;
 
@@ -1376,8 +1402,8 @@ async fn a_cancel_while_idle_doesnt_stop_the_next_turn() {
 async fn two_queued_followups_run_as_two_turns() {
     let harness = Harness::new(vec![text("one"), text("two")]).await;
     let agent = harness.agent();
-    agent.followup(user("first"));
-    agent.followup(user("second"));
+    agent.followup(user("first")).unwrap();
+    agent.followup(user("second")).unwrap();
     idle(agent.as_ref()).await;
 
     // The prompt is logged once: it hasn't changed by the second turn.
@@ -1434,7 +1460,7 @@ async fn a_reloaded_session_sends_its_earlier_tool_results() {
     let ping = call("c1", "echo", r#"{"text":"ping"}"#);
     let before = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
     before.say("use the tool").await;
-    let stored = before.events();
+    let stored = before.log();
     // What storage gives back is the JSON of each event.
     let stored: Vec<Entry> = stored
         .iter()
@@ -1469,19 +1495,20 @@ async fn a_reloaded_session_sends_its_earlier_tool_results() {
             Message::user("and again"),
         ]
     );
-    let events = after.events();
+    let events = after.log();
     assert_eq!(&events[..stored.len()], stored.as_slice());
+    let later: Vec<&Entry> = events[stored.len()..]
+        .iter()
+        .filter(|entry| !matches!(entry.event, SessionEvent::InboxSpliced(_)))
+        .collect();
     assert_eq!(
-        events[stored.len()].event,
+        later[0].event,
         SessionEvent::turn_start(2),
         "the turns carry on numbering"
     );
     // A new loop's first request logs a `resume` header. The prompt and the
     // route haven't changed, so no system message and no context.
-    let after_types: Vec<&str> = events[stored.len()..]
-        .iter()
-        .map(|entry| entry.event.event_type())
-        .collect();
+    let after_types: Vec<&str> = later.iter().map(|entry| entry.event.event_type()).collect();
     assert_eq!(
         after_types,
         [
@@ -1510,9 +1537,10 @@ async fn opening_a_session_a_crash_left_open_closes_its_turn() {
     let ping = call("c1", "echo", r#"{"text":"ping"}"#);
     let crashed = Harness::new(vec![calls(std::slice::from_ref(&ping)), text("done")]).await;
     crashed.say("use the tool").await;
-    // Cut the log just after the call started, as a crash would.
-    let stored: Vec<Entry> = crashed.events().into_iter().take(8).collect();
-    assert_eq!(stored[7].event.event_type(), "tool/call");
+    // Cut the log just after the call started, as a crash would. The two
+    // inbox splices are the followup and the step's claim.
+    let stored: Vec<Entry> = crashed.log().into_iter().take(10).collect();
+    assert_eq!(stored[9].event.event_type(), "tool/call");
 
     let after = Harness::with(vec![text("recovered")], config(None), stored).await;
     let _agent = after.agent();
@@ -1536,7 +1564,7 @@ async fn a_changed_prompt_is_logged_where_it_changed() {
     let after = Harness::with(
         vec![text("two")],
         config(Some("Be thorough.")),
-        before.events(),
+        before.log(),
     )
     .await;
     after.say("second").await;
@@ -1567,11 +1595,14 @@ async fn a_removed_prompt_is_cleared_from_the_history() {
     let before = Harness::with(vec![text("one")], config(Some("Be brief.")), Vec::new()).await;
     before.say("first").await;
 
-    let after = Harness::with(vec![text("two")], config(None), before.events()).await;
+    let after = Harness::with(vec![text("two")], config(None), before.log()).await;
     after.say("second").await;
 
     let events = after.events();
-    // Seq 2 held the prompt; 7 and 8 open the new turn and its step.
+    // The first system message held the prompt; 9 and 10 open the new
+    // turn and its step.
+    let prompt = events[2].seq;
+    assert_eq!(events[2].event.event_type(), "system/message");
     let SessionEvent::SystemMessage { data, surface } = &events[11].event else {
         panic!("expected the cleared prompt, got {:?}", events[11].event);
     };
@@ -1579,11 +1610,11 @@ async fn a_removed_prompt_is_cleared_from_the_history() {
     assert_eq!(
         surface.op,
         SurfaceOp::Replace {
-            start: Seq(2),
-            end: Seq(2)
+            start: prompt,
+            end: prompt
         }
     );
-    assert_eq!(surface.sources, [Seq(2)]);
+    assert_eq!(surface.sources, [prompt]);
     let request = &after.model.requests()[0];
     assert_eq!(request.system, None);
     assert!(
@@ -1640,7 +1671,7 @@ async fn a_loop_with_another_model_resumes_with_its_own_header_and_context() {
     let after = Harness::with(
         vec![text("two")],
         LoopConfig::new(ROUTE, "mock-model-2"),
-        before.events(),
+        before.log(),
     )
     .await;
     after.say("second").await;
@@ -1712,7 +1743,9 @@ async fn a_tool_registered_between_turns_logs_a_change() {
 async fn a_request_after_a_replacement_logs_a_series() {
     let harness = Harness::new(vec![text("one"), text("two")]).await;
     harness.say("first").await;
-    // Seq 3 is the first user message.
+    // The first user message.
+    let first = harness.events()[3].seq;
+    assert_eq!(harness.events()[3].event.event_type(), "user/message");
     let summary = UserMessage::text("summary", UserSource::user(), "first, in short");
     harness
         .sessions
@@ -1722,10 +1755,10 @@ async fn a_request_after_a_replacement_logs_a_series() {
                 message: summary,
                 surface: SurfaceIntent {
                     op: SurfaceOp::Replace {
-                        start: Seq(3),
-                        end: Seq(3),
+                        start: first,
+                        end: first,
                     },
-                    sources: vec![Seq(3)],
+                    sources: vec![first],
                 },
             },
         )
@@ -1767,7 +1800,7 @@ async fn a_resumed_loop_keeps_the_effort_the_session_ran_at() {
     let same = Harness::with(
         vec![text("two")],
         LoopConfig::new(ROUTE, MODEL),
-        before.events(),
+        before.log(),
     )
     .await;
     same.say("second").await;
@@ -1784,7 +1817,7 @@ async fn a_resumed_loop_keeps_the_effort_the_session_ran_at() {
     let other = Harness::with(
         vec![text("two")],
         LoopConfig::new(ROUTE, "mock-model-2"),
-        before.events(),
+        before.log(),
     )
     .await;
     other.say("second").await;
@@ -1794,7 +1827,7 @@ async fn a_resumed_loop_keeps_the_effort_the_session_ran_at() {
     // An effort set in the config wins over the session's.
     let mut low = LoopConfig::new(ROUTE, MODEL);
     low.effort = Some(Effort::Low);
-    let configured = Harness::with(vec![text("two")], low, before.events()).await;
+    let configured = Harness::with(vec![text("two")], low, before.log()).await;
     configured.say("second").await;
     assert_eq!(configured.model.requests()[0].effort, Some(Effort::Low));
     assert_eq!(
@@ -1814,7 +1847,7 @@ async fn a_resumed_loop_keeps_the_effort_the_session_ran_at() {
 async fn an_effort_from_another_provider_doesnt_carry_on() {
     let before = Harness::new(vec![text("one")]).await;
     before.say("first").await;
-    let mut stored = before.events();
+    let mut stored = before.log();
     let mut config = CallConfig::new("someone-else", MODEL);
     config.reasoning_effort = Some("max".into());
     stored.push(Entry {
@@ -2105,7 +2138,7 @@ async fn a_call_publishes_start_chunks_and_a_committed_end() {
             r#"4 chunk a1:1 #2 Event(BlockEnd { index: 0, block: Text("hello there") })"#,
             "5 chunk a1:1 #3 Event(Usage { usage: Usage { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 } })",
             "6 chunk a1:1 #4 Event(Finish { reason: Stop })",
-            "7 end a1:1 after 5: assistant/message at 6",
+            "7 end a1:1 after 5: assistant/message at 8",
         ]
     );
     assert_eq!(harness.events()[6].event.event_type(), "assistant/message");
@@ -2144,11 +2177,11 @@ async fn a_retried_call_is_a_new_attempt() {
         [
             "1 start a1:1 turn 1 step 1",
             r#"2 chunk a1:1 #0 Failed(ModelError { kind: RateLimited, message: "busy", retry_after: None, refusal: None })"#,
-            "3 end a1:1 after 1: assistant/attempt at 6",
+            "3 end a1:1 after 1: assistant/attempt at 8",
             "4 start a1:2 turn 1 step 1",
         ]
     );
-    assert_eq!(lines[9], "10 end a1:2 after 5: assistant/message at 7");
+    assert_eq!(lines[9], "10 end a1:2 after 5: assistant/message at 9");
     let failure = frames.lock().unwrap()[1].clone();
     assert!(matches!(
         failure,
@@ -2180,7 +2213,7 @@ async fn each_step_publishes_its_own_attempt() {
         starts,
         ["1 start a1:1 turn 1 step 1", "8 start a1:2 turn 1 step 2"]
     );
-    assert_eq!(lines[6], "7 end a1:1 after 5: assistant/message at 6");
+    assert_eq!(lines[6], "7 end a1:1 after 5: assistant/message at 8");
 }
 
 /// dsh: "cancel() mid-stream ends the turn with reason aborted"
@@ -2196,14 +2229,14 @@ async fn a_cancelled_call_ends_with_what_it_settled_as() {
         let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
         let agent = harness.agent();
         let (frames, _subscription) = listen(agent.as_ref());
-        agent.followup(user("go"));
+        agent.followup(user("go")).unwrap();
         waiting.notified().await;
         agent.cancel(CancelCause::User);
         idle(agent.as_ref()).await;
 
         let lines = frame_lines(&frames);
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert_eq!(lines[2], format!("3 end a1:1 after 1: {settled} at 6"));
+        assert_eq!(lines[2], format!("3 end a1:1 after 1: {settled} at 8"));
     }
 }
 
@@ -2383,7 +2416,7 @@ async fn a_cancelled_call_embeds_what_streamed() {
         let waiting = Arc::new(Notify::new());
         let harness = Harness::new(vec![Reply::Hang(events, Arc::clone(&waiting))]).await;
         let agent = harness.agent();
-        agent.followup(user("go"));
+        agent.followup(user("go")).unwrap();
         waiting.notified().await;
         agent.cancel(CancelCause::User);
         idle(agent.as_ref()).await;
@@ -2703,7 +2736,7 @@ async fn a_resumed_session_doesnt_resend_its_snapshot() {
         .context(None, PromptContext::new("policy", 0.0, "Mode: read-only."))
         .unwrap();
     before.say("first").await;
-    let stored = before.events();
+    let stored = before.log();
 
     let after = Harness::with(vec![text("two"), text("three")], config(None), stored).await;
     let mode = Arc::new(Mutex::new("read-only".to_owned()));
@@ -2800,7 +2833,7 @@ async fn a_cancel_from_a_context_provider_commits_nothing() {
             ),
         )
         .unwrap();
-    agent.followup(user("do not commit"));
+    agent.followup(user("do not commit")).unwrap();
     idle(agent.as_ref()).await;
     assert_eq!(evaluations.load(Ordering::SeqCst), 2);
     assert!(harness.model.requests().is_empty());
@@ -2815,4 +2848,546 @@ async fn a_cancel_from_a_context_provider_commits_nothing() {
         harness.endings(),
         [TurnEndReason::Aborted(CancelCause::User)]
     );
+}
+
+// The durable inbox: steer, inject, and what a cancel and a restore do to
+// what is queued. (dsh: `agent.spec.ts`, `loop.spec.ts` and `inbox.spec.ts`.)
+
+/// Every event, the inbox's splices included.
+fn log_types(harness: &Harness) -> Vec<String> {
+    harness
+        .sessions
+        .events(&id())
+        .unwrap()
+        .iter()
+        .map(|entry| entry.event.event_type().to_owned())
+        .collect()
+}
+
+/// Every `agent/inbox/spliced`, in order.
+fn splices(harness: &Harness) -> Vec<InboxSplice> {
+    harness
+        .sessions
+        .events(&id())
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::InboxSpliced(splice) => Some(splice),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The texts of the user messages the log admitted, in order.
+fn admitted(harness: &Harness) -> Vec<String> {
+    harness
+        .sessions
+        .events(&id())
+        .unwrap()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::UserMessage { message, .. }
+                if !matches!(message.source, UserSource::RuntimeContext(_)) =>
+            {
+                Some(
+                    message
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<String>(),
+                )
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The inbox as clients see it.
+fn inbox(harness: &Harness) -> Value {
+    let session = harness.sessions.get(&id()).unwrap();
+    harness.projections.snapshot(&session, None).values["inbox"].clone()
+}
+
+fn notice(text: &str) -> UserMessage {
+    UserMessage::text(
+        format!("notice-{text}"),
+        UserSource::Other(json!({ "kind": "watcher" })),
+        text,
+    )
+}
+
+fn splice(
+    target: InboxTarget,
+    start: u64,
+    removed: Option<u64>,
+    inserted: Vec<UserMessage>,
+) -> InboxSplice {
+    InboxSplice {
+        target,
+        start,
+        removed_count: removed,
+        inserted,
+        outcome: None,
+        extra: Extra::new(),
+    }
+}
+
+fn entries(events: Vec<SessionEvent>) -> Vec<Entry> {
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(seq, event)| Entry {
+            seq: Seq(seq as u64),
+            time: Time(seq as i64 + 1),
+            ignorable: false,
+            event,
+        })
+        .collect()
+}
+
+/// A tool that queues input on its agent while it runs: steering when
+/// `steer`, else context.
+struct Queuer {
+    name: &'static str,
+    agent: Arc<OnceLock<Arc<dyn Agent>>>,
+    texts: Vec<&'static str>,
+    steer: bool,
+}
+
+impl Tool for Queuer {
+    fn schema(&self) -> ToolSchema {
+        schema(self.name)
+    }
+
+    fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async move {
+            let agent = self.agent.get().expect("the agent is set");
+            for text in &self.texts {
+                let message = notice(text);
+                if self.steer {
+                    agent.steer(message).unwrap();
+                } else {
+                    agent.inject(message).unwrap();
+                }
+            }
+            ToolOutput::ok("tool done")
+        })
+    }
+}
+
+fn queuer(harness: &Harness, name: &'static str, texts: Vec<&'static str>, steer: bool) {
+    let agent = Arc::new(OnceLock::new());
+    let _ = agent.set(harness.agent());
+    harness
+        .tools
+        .register(Arc::new(Queuer {
+            name,
+            agent,
+            texts,
+            steer,
+        }))
+        .unwrap();
+}
+
+// "idle inject() durably stages context without opening a turn", and
+// "inject() while idle durably stages context without opening a turn"
+#[tokio::test]
+async fn an_idle_inject_is_staged_durably_and_runs_nothing() {
+    let harness = Harness::new(vec![text("ok")]).await;
+    let agent = harness.agent();
+    agent.inject(notice("file changed: a.ts")).unwrap();
+    idle(agent.as_ref()).await;
+    assert_eq!(log_types(&harness), ["agent/inbox/spliced"]);
+    assert_eq!(
+        splices(&harness),
+        [splice(
+            InboxTarget::NextStep,
+            0,
+            None,
+            vec![notice("file changed: a.ts")]
+        )]
+    );
+    assert!(harness.model.requests().is_empty());
+    assert_eq!(
+        inbox(&harness),
+        json!({ "next-turn": [], "next-step": [serde_json::to_value(notice("file changed: a.ts")).unwrap()] })
+    );
+
+    // The next turn takes it, before its own prompt.
+    harness.say("go").await;
+    assert_eq!(admitted(&harness), ["file changed: a.ts", "go"]);
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(shows(&requests[0], "file changed: a.ts"));
+    assert_eq!(inbox(&harness), json!({ "next-turn": [], "next-step": [] }));
+}
+
+// A followup is a splice into next-turn, and its turn's first step takes it
+// with another, as dsh's send and claim do.
+#[tokio::test]
+async fn a_followup_is_queued_and_taken_as_splices() {
+    let harness = Harness::new(vec![text("ok")]).await;
+    harness.say("hi").await;
+    let mut expected = vec!["agent/inbox/spliced", "turn/start", "agent/inbox/spliced"];
+    expected.extend(ANSWER_STEP);
+    expected.push("turn/end");
+    assert_eq!(log_types(&harness), expected);
+    assert_eq!(
+        splices(&harness),
+        [
+            splice(InboxTarget::NextTurn, 0, None, vec![user("hi")]),
+            // Taken, not dropped: no outcome.
+            splice(InboxTarget::NextTurn, 0, Some(1), Vec::new()),
+        ]
+    );
+}
+
+// "defers inject() during tool execution until after the tool result"
+#[tokio::test]
+async fn an_inject_during_a_tool_is_taken_after_its_result() {
+    let harness = Harness::new(vec![calls(&[call("c1", "noticer", "{}")]), text("done")]).await;
+    queuer(
+        &harness,
+        "noticer",
+        vec!["mid-turn notice", "second notice"],
+        false,
+    );
+    harness.say("go").await;
+
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+    let events = harness.events();
+    let result = events
+        .iter()
+        .find(|entry| entry.event.event_type() == "tool/result")
+        .unwrap()
+        .seq;
+    let notices: Vec<Seq> = context_like(&events, "watcher");
+    assert_eq!(notices.len(), 2);
+    assert!(notices.iter().all(|seq| *seq > result));
+    assert_eq!(
+        admitted(&harness),
+        ["go", "mid-turn notice", "second notice"]
+    );
+    let second = &harness.model.requests()[1];
+    let tool_at = second
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, Block::ToolResult(_)))
+        })
+        .unwrap();
+    let notice_at = second
+        .messages
+        .iter()
+        .position(|message| message.text().contains("mid-turn notice"))
+        .unwrap();
+    assert!(notice_at > tool_at);
+}
+
+/// The seqs of the user messages from `kind`.
+fn context_like(events: &[Entry], kind: &str) -> Vec<Seq> {
+    events
+        .iter()
+        .filter(|entry| match &entry.event {
+            SessionEvent::UserMessage { message, .. } => {
+                matches!(&message.source, UserSource::Other(source) if source["kind"] == kind)
+            }
+            _ => false,
+        })
+        .map(|entry| entry.seq)
+        .collect()
+}
+
+// "steer() while idle becomes a woken prompt turn"
+#[tokio::test]
+async fn an_idle_steer_starts_a_turn() {
+    let harness = Harness::new(vec![text("ok")]).await;
+    let agent = harness.agent();
+    agent.steer(notice("steer idle")).unwrap();
+    idle(agent.as_ref()).await;
+    assert_eq!(admitted(&harness), ["steer idle"]);
+    assert_eq!(harness.model.requests().len(), 1);
+    assert_eq!(
+        splices(&harness)[0],
+        splice(InboxTarget::NextStep, 0, None, vec![notice("steer idle")])
+    );
+}
+
+// "injects steering between steps and continues the turn"
+#[tokio::test]
+async fn steering_during_a_tool_enters_the_next_step() {
+    let harness = Harness::new(vec![
+        calls(&[call("c1", "slow", "{}")]),
+        text("addressed the steering"),
+    ])
+    .await;
+    queuer(&harness, "slow", vec!["change of plans"], true);
+    harness.say("start").await;
+
+    let events = harness.events();
+    let steering = context_like(&events, "watcher")[0];
+    let second_step = events
+        .iter()
+        .filter(|entry| entry.event.event_type() == "step/start")
+        .nth(1)
+        .unwrap()
+        .seq;
+    assert!(steering > second_step);
+    assert!(shows(&harness.model.requests()[1], "change of plans"));
+    assert_eq!(harness.endings(), [TurnEndReason::Completed]);
+}
+
+// "starts idle steering synchronously and enters later steering at the
+// next step": steering that lands while a final answer streams keeps the
+// turn going for one more step.
+#[tokio::test]
+async fn steering_during_a_final_answer_runs_another_step() {
+    let agent = Arc::new(OnceLock::<Arc<dyn Agent>>::new());
+    let steering = Arc::clone(&agent);
+    let harness = Harness::new(vec![
+        Reply::Before(
+            Box::new(move || {
+                steering
+                    .get()
+                    .unwrap()
+                    .steer(notice("second steer"))
+                    .unwrap()
+            }),
+            Box::new(text("first")),
+        ),
+        text("second"),
+    ])
+    .await;
+    let _ = agent.set(harness.agent());
+    harness.say("first prompt").await;
+
+    let turns = log_types(&harness)
+        .iter()
+        .filter(|kind| *kind == "turn/start")
+        .count();
+    assert_eq!(turns, 1);
+    assert_eq!(admitted(&harness), ["first prompt", "second steer"]);
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!shows(&requests[0], "second steer"));
+    assert!(shows(&requests[1], "second steer"));
+}
+
+// "stops after a throwing pre-step listener and retains later steering
+// until a wakeup", with a failed model call for the throw: Karaka has no
+// pre-step hook.
+#[tokio::test]
+async fn a_failed_turn_keeps_its_steering_until_the_next_wake() {
+    let agent = Arc::new(OnceLock::<Arc<dyn Agent>>::new());
+    let steering = Arc::clone(&agent);
+    let harness = Harness::new(vec![
+        Reply::Before(
+            Box::new(move || {
+                steering
+                    .get()
+                    .unwrap()
+                    .steer(notice("pending steering"))
+                    .unwrap()
+            }),
+            Box::new(failing(ErrorKind::InvalidRequest, "refused")),
+        ),
+        text("recovered"),
+    ])
+    .await;
+    let _ = agent.set(harness.agent());
+    harness.say("prompt").await;
+    assert!(matches!(harness.endings()[..], [TurnEndReason::Error(_)]));
+    assert_eq!(
+        inbox(&harness)["next-step"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    harness.say("resume").await;
+    let requests = harness.model.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(shows(&requests[1], "pending steering"));
+    assert!(shows(&requests[1], "resume"));
+    assert_eq!(harness.endings().len(), 2);
+}
+
+// "clears both pending lists as durable cancellations", through a cancel
+// of a running turn.
+#[tokio::test]
+async fn a_cancel_drops_both_queues_durably() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![Reply::Hang(Vec::new(), Arc::clone(&waiting))]).await;
+    let agent = harness.agent();
+    agent.followup(user("go")).unwrap();
+    waiting.notified().await;
+    agent.inject(notice("context")).unwrap();
+    agent.followup(user("later")).unwrap();
+    let before = splices(&harness).len();
+    agent.cancel(CancelCause::User);
+    idle(agent.as_ref()).await;
+
+    let canceled = |target| InboxSplice {
+        outcome: Some(SpliceOutcome::Canceled),
+        ..splice(target, 0, Some(1), Vec::new())
+    };
+    assert_eq!(
+        splices(&harness)[before..],
+        [
+            canceled(InboxTarget::NextStep),
+            canceled(InboxTarget::NextTurn)
+        ]
+    );
+    assert_eq!(inbox(&harness), json!({ "next-turn": [], "next-step": [] }));
+    assert_eq!(
+        harness.endings(),
+        [TurnEndReason::Aborted(CancelCause::User)]
+    );
+    // An empty inbox is cleared without a word.
+    let count = log_types(&harness).len();
+    agent.cancel(CancelCause::User);
+    assert_eq!(log_types(&harness).len(), count);
+}
+
+// dsh's `send`: input that doesn't wake an agent whose turn was cancelled
+// waits for the next wake; only waking input replays.
+#[tokio::test]
+async fn an_inject_after_a_cancel_waits_for_a_wake() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![
+        Reply::Hang(Vec::new(), Arc::clone(&waiting)),
+        text("ok"),
+    ])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("go")).unwrap();
+    waiting.notified().await;
+    agent.cancel(CancelCause::User);
+    agent.inject(notice("after the cancel")).unwrap();
+    idle(agent.as_ref()).await;
+    assert_eq!(harness.endings().len(), 1);
+    assert_eq!(
+        inbox(&harness)["next-step"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+// A followup sent after a cancel, while the cancelled turn winds down, runs
+// as the next turn. (dsh: the waking send latched behind an aborted
+// activity.)
+#[tokio::test]
+async fn a_followup_after_a_cancel_runs_next() {
+    let waiting = Arc::new(Notify::new());
+    let harness = Harness::new(vec![
+        Reply::Hang(Vec::new(), Arc::clone(&waiting)),
+        text("ok"),
+    ])
+    .await;
+    let agent = harness.agent();
+    agent.followup(user("go")).unwrap();
+    waiting.notified().await;
+    agent.cancel(CancelCause::User);
+    agent.steer(notice("after the cancel")).unwrap();
+    idle(agent.as_ref()).await;
+    assert_eq!(
+        harness.endings(),
+        [
+            TurnEndReason::Aborted(CancelCause::User),
+            TurnEndReason::Completed
+        ]
+    );
+    assert!(shows(&harness.model.requests()[1], "after the cancel"));
+}
+
+// What is queued survives a restore, and waits for the next wake, which
+// runs it first: dsh's resume doesn't wake on a pending inbox.
+#[tokio::test]
+async fn queued_input_survives_a_restore_and_waits_for_a_wake() {
+    let restored = entries(vec![
+        SessionEvent::InboxSpliced(splice(InboxTarget::NextTurn, 0, None, vec![user("queued")])),
+        SessionEvent::InboxSpliced(splice(
+            InboxTarget::NextStep,
+            0,
+            None,
+            vec![notice("staged")],
+        )),
+    ]);
+    let harness = Harness::with(vec![text("one"), text("two")], config(None), restored).await;
+    let agent = harness.agent();
+    idle(agent.as_ref()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(harness.model.requests().is_empty());
+    assert_eq!(
+        inbox(&harness)["next-turn"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    harness.say("go").await;
+    assert_eq!(admitted(&harness), ["staged", "queued", "go"]);
+    assert_eq!(harness.endings().len(), 2);
+    assert_eq!(inbox(&harness), json!({ "next-turn": [], "next-step": [] }));
+}
+
+// "rejects invalid durable coordinates and duplicate identities during
+// reconstruction"
+#[tokio::test]
+async fn an_invalid_inbox_history_is_refused() {
+    let out_of_range = entries(vec![SessionEvent::InboxSpliced(splice(
+        InboxTarget::NextTurn,
+        0,
+        Some(1),
+        Vec::new(),
+    ))]);
+    let harness = Harness::with(Vec::new(), config(None), out_of_range).await;
+    let error = harness
+        .agents
+        .open(id())
+        .err()
+        .expect("the open is refused");
+    assert_eq!(
+        error.to_string(),
+        "invalid persisted inbox splice at session seq 0"
+    );
+    let cause = std::error::Error::source(&error)
+        .and_then(std::error::Error::source)
+        .expect("a cause");
+    assert_eq!(cause.to_string(), "invalid inbox splice");
+    drop(harness);
+
+    let duplicate = entries(vec![
+        SessionEvent::InboxSpliced(splice(InboxTarget::NextTurn, 0, None, vec![user("x")])),
+        SessionEvent::InboxSpliced(splice(InboxTarget::NextStep, 0, None, vec![user("x")])),
+    ]);
+    let harness = Harness::with(Vec::new(), config(None), duplicate).await;
+    let error = harness
+        .agents
+        .open(id())
+        .err()
+        .expect("the open is refused");
+    assert_eq!(
+        error.to_string(),
+        "invalid persisted inbox splice at session seq 1"
+    );
+    let cause = std::error::Error::source(&error)
+        .and_then(std::error::Error::source)
+        .expect("a cause");
+    assert_eq!(cause.to_string(), "message \"user-x\" is already pending");
+}
+
+// "rejects duplicate identities": a message whose id is pending isn't
+// queued twice.
+#[tokio::test]
+async fn a_pending_id_cant_be_queued_again() {
+    let harness = Harness::new(Vec::new()).await;
+    let agent = harness.agent();
+    agent.inject(user("x")).unwrap();
+    let error = agent.followup(user("x")).unwrap_err();
+    assert_eq!(error, InboxError::AlreadyPending("user-x".into()));
+    assert_eq!(error.to_string(), "message \"user-x\" is already pending");
+    assert_eq!(splices(&harness).len(), 1);
+    assert!(harness.model.requests().is_empty());
 }
