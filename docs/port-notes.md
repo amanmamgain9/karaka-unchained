@@ -2493,8 +2493,8 @@ asks on the terminal.
 ## User approval
 
 `karaka-user-approval` ports dsh's `packages/interaction/user-approval`
-(`types.ts` and `index.ts`). Nothing asks it yet: the `tools/pre-execute`
-gate that does is the next step.
+(`types.ts` and `index.ts`). The `tools/pre-execute` gate that asks it is
+"Approvals, step B".
 
 ### What is done
 
@@ -2590,3 +2590,105 @@ gate that does is the next step.
   mid-question, `approval/asked` is logged with no `approval/decided`. In
   dsh the signal ends it as `cancelled`. This waits on tool calls getting
   a signal.
+
+## Approvals, step B: the tools/pre-execute gate
+
+dsh's `tools/pre-execute` waterfall, its `ask` resolution (`serviceAsk`),
+and the gate's place in `prepareExecution` (`core/tools/src/index.ts`)
+are now `karaka-tools`' `gate.rs`. The binary mounts user-approval, with a
+terminal approver and two options.
+
+### What is done
+
+- **The decisions:** `PreToolDecision::{Allow, Deny { reason }, Cancel,
+  Ask { reason, display_reason }}`. `DisplayReason` now lives in
+  `karaka-tools`, and `karaka-user-approval` re-exports it.
+- **The chain.** `ToolRegistry::on_pre_execute(scope, listener)` takes a
+  `PreExecuteListener`, whose `decide(call, next)` decides or hands on.
+  - A listener is global, or scoped to one session id, as the other
+    registry ports scope theirs. A call with no agent runs only the global
+    listeners.
+  - The end of the chain allows.
+  - A listener that fails gives `Error: <message>`, and the tool doesn't
+    run.
+  - A registration can be removed.
+- **dsh's order** (`prepareExecution`, then dispatch):
+  1. Parse the arguments: empty is `{}`, and text that isn't JSON stays a
+     string, as dsh's loop hands it on.
+  2. Run the gate.
+  3. Resolve `ask`.
+  4. `Cancel` gives `Error: tool call aborted before dispatch`, and `Deny`
+     gives `Error: <reason>`.
+  5. Then the unknown-name check, the object check and the schema check,
+     in that order.
+  6. Then the tool.
+
+  So the gate sees every call that reaches the registry, an unknown
+  name's and unfit arguments' too. This moves the argument check behind
+  the gate; it used to come first.
+- **`ask`** goes through `ToolApproval`, a small trait in `karaka-tools`.
+  `karaka-user-approval` implements it for `ApprovalService`, and its
+  plugin installs it with `ToolRegistry::set_approval`. The reasons are
+  dsh's:
+  - no seam: the ask's own reason, else `tool "x" requires approval (not
+    yet supported)`;
+  - no agent: `tool "x" requires approval, but the call has no agent to
+    route it through`, without asking;
+  - `rejected`: `the user rejected tool "x"`;
+  - `cancelled`: `approval for tool "x" was cancelled`;
+  - `unavailable`: `tool "x" requires approval, but no approval channel is
+    available`;
+  - an approval that fails, such as one outside an open turn: `Error:
+    <message>`, as dsh's catch gives a thrown error.
+- **The binary:**
+  - It mounts `ApprovalPlugin`, whose context line now appears in every
+    request.
+  - `TerminalApprover` shares `questions.rs`'s one stdin reader. On stderr
+    it shows `Allow tool "x"?`, the reason (the display reason's English
+    if there is one), and `Allow it once? [y/N]`. `y` or `yes` allows
+    once; anything else, an empty line included, rejects; the end of
+    stdin cancels.
+  - `--ask-before <tool>` (repeatable) adds a global pre-execute listener
+    that asks before each call to those tools, with reason `karaka was
+    started with --ask-before <tool>`.
+  - `--approval-policy ask|never` sets the default policy.
+  - Options come before the question, `--` ends them, and `--name=value`
+    works too. A bad policy prints dsh's message and the usage, and exits
+    with 2.
+  - dsh's CLI has no equivalent flags. It sets approval through its
+    config, `user-approval`'s `policy`, and permission presets, so the
+    names follow the config key.
+- **Tests:**
+  - tools.spec's pre-execute and "ask routing through ctx.approval" cases,
+    with a stand-in seam in `karaka-tools`;
+  - three more through the real service in `karaka-user-approval`: a
+    granted ask with its audit pair, `never` and no answerer, and outside
+    an open turn;
+  - the approver's rendering and parsing;
+  - CLI cases: `--ask-before` with `y`, with an empty line and with EOF,
+    the `never` policy rejecting without a prompt, chat routing the line
+    after an approval to it, and a bad policy;
+  - the deepseek `ask` body now expects the approval line.
+
+### Left out
+
+- **Tool guards** (`ToolGuard`), which run after the chain and can only
+  deny. See open ends.
+- **The signal checks.** dsh checks the caller's signal before the
+  gate, after it, and before dispatch, and "cancellation overtakes the
+  approval" gives the before-dispatch result. A Karaka call has no signal;
+  dropping its future is the cancel, and nothing after the drop runs.
+- **The deny `info`.** Results are text only.
+- **The rogue-outcome backstop.** The outcome enum is closed.
+- **The PTC collapse** that ends a call before the gate. There is no
+  `run_code` yet.
+
+### Where it differs from dsh
+
+- **The tool is looked up when the call starts.** dsh looks it up at
+  dispatch, after the gate, so a tool registered while the gate waits
+  would run there. The unknown-name error still comes after the gate.
+- **An empty chain skips the gate.** It would allow anyway.
+- **Approval requires the tool registry.** The kernel has no optional
+  port, so `ApprovalPlugin` requires `ToolRegistry` to install itself as
+  the seam. dsh's registry takes `ctx.approval` when one is mounted.

@@ -19,11 +19,21 @@
 //!
 //! When stdin ends with a question open, the answer is `ASK_ABORTED`, and
 //! the tool's result says so; nothing waits.
+//!
+//! # Approvals
+//!
+//! [`TerminalApprover`] is the approval service's answerer, on the same
+//! reader: it names the tool and the reason on stderr, and reads `y` or `n`.
+//! Anything but `y` or `yes` rejects, an empty line included, so the
+//! default is no; the end of stdin cancels.
 
 use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use karaka_user_approval::{
+    ApprovalAnswerer, ApprovalFuture, ApprovalNext, ApprovalOutcome, ApprovalRequest,
+};
 use karaka_user_questions::{
     AnswerFuture, AnswerNext, AskUserQuestionAnswer, AskUserQuestionAnswerItem,
     AskUserQuestionItem, QuestionAnswerer, QuestionError, QuestionRequest, UserQuestionError,
@@ -134,6 +144,77 @@ impl TerminalAnswerer {
 impl QuestionAnswerer for TerminalAnswerer {
     fn answer<'a>(&'a self, request: &'a QuestionRequest, _: AnswerNext<'a>) -> AnswerFuture<'a> {
         Box::pin(self.ask(request))
+    }
+}
+
+/// Asks the user to approve each request, on the terminal.
+pub struct TerminalApprover {
+    lines: Arc<Lines>,
+    out: Mutex<Box<dyn Write + Send>>,
+}
+
+impl TerminalApprover {
+    /// An approver that reads from `lines` and writes to `out`, stderr in
+    /// the binary.
+    pub fn new(lines: Arc<Lines>, out: Box<dyn Write + Send>) -> Self {
+        Self {
+            lines,
+            out: Mutex::new(out),
+        }
+    }
+
+    async fn decide(&self, request: &ApprovalRequest) -> io::Result<ApprovalOutcome> {
+        {
+            let mut out = self.out.lock().unwrap_or_else(PoisonError::into_inner);
+            out.write_all(render_approval(request).as_bytes())?;
+            out.flush()?;
+        }
+        let line = match &request.signal {
+            Some(signal) => tokio::select! {
+                line = self.lines.next() => line?,
+                () = signal.wait() => return Ok(ApprovalOutcome::Cancelled),
+            },
+            None => self.lines.next().await?,
+        };
+        Ok(match line {
+            Some(line) => parse_approval(&line),
+            // stdin ended: nobody is left to decide.
+            None => ApprovalOutcome::Cancelled,
+        })
+    }
+}
+
+impl ApprovalAnswerer for TerminalApprover {
+    fn answer<'a>(
+        &'a self,
+        request: &'a ApprovalRequest,
+        _: ApprovalNext<'a>,
+    ) -> ApprovalFuture<'a> {
+        Box::pin(async move { Ok(self.decide(request).await?) })
+    }
+}
+
+/// How an approval shows: the tool, the reason, shown in English when
+/// there is one to display, and the prompt.
+pub fn render_approval(request: &ApprovalRequest) -> String {
+    let mut text = format!("\nAllow tool \"{}\"?\n", request.tool_name);
+    let reason = request
+        .display_reason
+        .as_ref()
+        .map(|reason| reason.en.as_str())
+        .or(request.reason.as_deref());
+    if let Some(reason) = reason {
+        text.push_str(&format!("  Reason: {reason}\n"));
+    }
+    text.push_str("Allow it once? [y/N] ");
+    text
+}
+
+/// `y` or `yes`, in any case, allows once; anything else rejects.
+pub fn parse_approval(line: &str) -> ApprovalOutcome {
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => ApprovalOutcome::AllowedOnce,
+        _ => ApprovalOutcome::Rejected,
     }
 }
 
@@ -371,6 +452,89 @@ mod tests {
         );
         assert!(shown.contains("\n(2/2) Any note?\n"), "{shown}");
         assert!(shown.ends_with("> |bye"), "{shown}");
+    }
+
+    #[test]
+    fn y_or_yes_allows_and_anything_else_rejects() {
+        use karaka_user_approval::ApprovalOutcome::{AllowedOnce, Rejected};
+        for (line, outcome) in [
+            ("y", AllowedOnce),
+            (" YES ", AllowedOnce),
+            ("", Rejected),
+            ("n", Rejected),
+            ("no", Rejected),
+            ("sure", Rejected),
+        ] {
+            assert_eq!(super::parse_approval(line), outcome, "{line:?}");
+        }
+    }
+
+    /// An agent with only an id.
+    struct Nobody(karaka_agent::FrameListeners, karaka_session::SessionId);
+
+    impl karaka_agent::Agent for Nobody {
+        fn id(&self) -> &karaka_session::SessionId {
+            &self.1
+        }
+
+        fn followup(&self, _: karaka_session::UserMessage) -> Result<(), karaka_agent::InboxError> {
+            Ok(())
+        }
+
+        fn steer(&self, _: karaka_session::UserMessage) -> Result<(), karaka_agent::InboxError> {
+            Ok(())
+        }
+
+        fn inject(&self, _: karaka_session::UserMessage) -> Result<(), karaka_agent::InboxError> {
+            Ok(())
+        }
+
+        fn cancel(&self, _: karaka_session::CancelCause) {}
+
+        fn when_idle(&self) -> karaka_agent::WhenIdle<'_> {
+            Box::pin(async {})
+        }
+
+        fn subscribe(
+            &self,
+            listener: karaka_agent::FrameListener,
+        ) -> karaka_agent::FrameSubscription {
+            self.0.subscribe(listener)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_names_the_tool_and_reason_and_ends_with_stdin() {
+        use karaka_user_approval::{ApprovalOutcome, ApprovalRequest, DisplayReason};
+
+        let agent = Arc::new(Nobody(
+            karaka_agent::FrameListeners::new(),
+            karaka_session::SessionId::new("s"),
+        ));
+        let request = ApprovalRequest {
+            reason: Some("logged reason".into()),
+            ..ApprovalRequest::new(agent, "working_directory")
+        };
+        assert_eq!(
+            super::render_approval(&request),
+            "\nAllow tool \"working_directory\"?\n  Reason: logged reason\nAllow it once? [y/N] "
+        );
+        let shown = ApprovalRequest {
+            display_reason: Some(DisplayReason::en("shown reason")),
+            ..request.clone()
+        };
+        assert!(super::render_approval(&shown).contains("  Reason: shown reason\n"));
+
+        let lines = Arc::new(Lines::new(Cursor::new("yes\n".to_owned())));
+        let approver = super::TerminalApprover::new(Arc::clone(&lines), Box::new(Shown::default()));
+        assert_eq!(
+            approver.decide(&request).await.unwrap(),
+            ApprovalOutcome::AllowedOnce
+        );
+        assert_eq!(
+            approver.decide(&request).await.unwrap(),
+            ApprovalOutcome::Cancelled
+        );
     }
 
     #[tokio::test]

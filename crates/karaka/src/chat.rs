@@ -30,13 +30,17 @@ use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tool_ask_user::{AskUserConfig, AskUserPlugin};
 use karaka_tool_todo::{TodoConfig, TodoToolPlugin};
 use karaka_tool_working_directory::WorkingDirectoryToolPlugin;
-use karaka_tools::{ToolRegistry, ToolsPlugin};
+use karaka_tools::{
+    PreExecuteFuture, PreExecuteListener, PreExecuteNext, PreToolDecision, ToolExecution,
+    ToolRegistry, ToolsPlugin,
+};
+use karaka_user_approval::{ApprovalConfig, ApprovalPlugin, ApprovalPolicy, ApprovalService};
 use karaka_user_questions::{UserQuestions, UserQuestionsPlugin};
 use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
 use crate::current_time::CurrentTime;
-use crate::questions::{Lines, TerminalAnswerer};
+use crate::questions::{Lines, TerminalAnswerer, TerminalApprover};
 
 /// The session a chat runs in, unless `KARAKA_SESSION` names another.
 const SESSION: &str = "chat";
@@ -50,7 +54,7 @@ const SHORT_RESULT: usize = 80;
 /// tool, the user-questions service with the `ask_user_question` tool, the
 /// agent loop, and the retry plugin, which retries a failed request as the
 /// provider's policy says before the turn gives up.
-pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
+pub fn loop_plugins(config: Config, approvals: &Approvals) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
@@ -82,27 +86,78 @@ pub fn loop_plugins(config: Config) -> Vec<Box<dyn DynPlugin>> {
     // which is what dsh's bundles mount (`tool-ask-user` with no config in
     // `bundle/web-app/presets/*.patch.yml`).
     plugins.push(Box::new(UserQuestionsPlugin));
+    // Approvals, which a tool call may need before it runs, under the
+    // policy `--approval-policy` chose.
+    plugins.push(Box::new(ApprovalPlugin::new(ApprovalConfig {
+        policy: approvals.policy,
+    })));
     plugins.push(Box::new(AskUserPlugin::new(AskUserConfig::default())));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins
 }
 
-/// Puts the model's questions to the user on the terminal: written to
-/// stderr, answered from `lines`.
-pub fn answer_on_the_terminal(runtime: &Runtime, lines: &Arc<Lines>) {
+/// What the command line says about approvals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Approvals {
+    /// `--approval-policy`: `ask` by default.
+    pub policy: ApprovalPolicy,
+    /// `--ask-before`: the tools that need the user's approval each time.
+    pub ask_before: Vec<String>,
+}
+
+/// Puts the model's questions, and the approvals its tool calls need, to
+/// the user on the terminal: written to stderr, answered from `lines`.
+/// The tools `approvals` names ask before each call.
+pub fn answer_on_the_terminal(runtime: &Runtime, lines: &Arc<Lines>, approvals: &Approvals) {
     let answerer = TerminalAnswerer::new(Arc::clone(lines), Box::new(io::stderr()));
     // For the runtime's life.
     let _ = runtime
         .get::<UserQuestions>()
         .answerer(None, Arc::new(answerer));
+    let approver = TerminalApprover::new(Arc::clone(lines), Box::new(io::stderr()));
+    let _ = runtime
+        .get::<ApprovalService>()
+        .answerer(None, Arc::new(approver));
+    if !approvals.ask_before.is_empty() {
+        let _ = runtime.get::<ToolRegistry>().on_pre_execute(
+            None,
+            Arc::new(AskBefore {
+                tools: approvals.ask_before.clone(),
+            }),
+        );
+    }
+}
+
+/// Asks before each call to one of `tools`. (`--ask-before`.)
+struct AskBefore {
+    tools: Vec<String>,
+}
+
+impl PreExecuteListener for AskBefore {
+    fn decide<'a>(
+        &'a self,
+        call: &'a ToolExecution,
+        next: PreExecuteNext<'a>,
+    ) -> PreExecuteFuture<'a> {
+        if !self.tools.contains(&call.name) {
+            return next.run();
+        }
+        let reason = format!("karaka was started with --ask-before {}", call.name);
+        Box::pin(async move {
+            Ok(PreToolDecision::Ask {
+                reason: Some(reason),
+                display_reason: None,
+            })
+        })
+    }
 }
 
 /// Runs the chat until stdin ends.
-pub async fn chat(config: Config) -> Result<(), String> {
+pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
     let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
     let sessions = config.sessions.clone();
-    let mut plugins = loop_plugins(config);
+    let mut plugins = loop_plugins(config, &approvals);
     if let Some(root) = sessions.clone() {
         // The store's sessions kept as JSONL files under the root.
         plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root))));
@@ -118,7 +173,7 @@ pub async fn chat(config: Config) -> Result<(), String> {
     // stdin's one reader, shared by the chat's messages and the model's
     // questions (see `questions.rs`).
     let lines = Arc::new(Lines::new(BufReader::new(io::stdin())));
-    answer_on_the_terminal(&runtime, &lines);
+    answer_on_the_terminal(&runtime, &lines, &approvals);
 
     // A stored session is resumed, and repaired if a crash left a turn
     // open, before the agent sees it.

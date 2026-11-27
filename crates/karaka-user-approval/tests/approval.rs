@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use karaka_agent::{Agent, FrameListener, FrameListeners, FrameSubscription, InboxError, WhenIdle};
 use karaka_fs::{AbortController, AbortSignal};
 use karaka_kernel::Runtime;
+use karaka_model::{ToolCall, ToolSchema};
 use karaka_session::{
     CancelCause, Entry, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEnd,
     TurnEndReason, TurnStart, UserMessage, UserSource,
@@ -28,6 +29,10 @@ use karaka_session::{
 use karaka_session_projection::SessionProjectionsPlugin;
 use karaka_system_prompt::{
     AssembleContext, Scope, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
+};
+use karaka_tools::{
+    PreExecuteFuture, PreExecuteListener, PreExecuteNext, PreToolDecision, Tool, ToolExecution,
+    ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin,
 };
 use karaka_user_approval::{
     ASK_SENTENCE, AnswererError, ApprovalAnswerer, ApprovalConfig, ApprovalError, ApprovalFuture,
@@ -75,6 +80,7 @@ impl Agent for Stub {
 
 struct Bench {
     service: Arc<ApprovalService>,
+    tools: Arc<ToolRegistry>,
     sessions: Arc<SessionStore>,
     prompt: Arc<SystemPrompt>,
     _runtime: Runtime,
@@ -85,12 +91,14 @@ async fn mounted(policy: ApprovalPolicy) -> Bench {
         Box::new(SessionsPlugin),
         Box::new(SessionProjectionsPlugin),
         Box::new(SystemPromptPlugin::new(SystemPromptConfig::default())),
+        Box::new(ToolsPlugin),
         Box::new(ApprovalPlugin::new(ApprovalConfig { policy })),
     ])
     .await
     .expect("the runtime starts");
     Bench {
         service: runtime.get::<ApprovalService>(),
+        tools: runtime.get::<ToolRegistry>(),
         sessions: runtime.get::<SessionStore>(),
         prompt: runtime.get::<SystemPrompt>(),
         _runtime: runtime,
@@ -769,4 +777,107 @@ async fn a_restored_session_keeps_its_override() {
         bench.service.effective_policy(&session),
         ApprovalPolicy::Never
     );
+}
+
+// The tool registry's `ask`, through the service: the plugin makes it the
+// registry's approval seam. (dsh: tools.spec's "ask routing through
+// ctx.approval", with the real service.)
+
+/// Answers `done`.
+struct Done;
+
+impl Tool for Done {
+    fn schema(&self) -> ToolSchema {
+        ToolSchema {
+            name: "echo".into(),
+            description: "Says done.".into(),
+            parameters: r#"{"type":"object","properties":{}}"#.into(),
+        }
+    }
+
+    fn execute<'a>(&'a self, _: Value, _: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async { ToolOutput::ok("done") })
+    }
+}
+
+/// Asks before every call.
+struct AskFirst;
+
+impl PreExecuteListener for AskFirst {
+    fn decide<'a>(&'a self, _: &'a ToolExecution, _: PreExecuteNext<'a>) -> PreExecuteFuture<'a> {
+        Box::pin(async {
+            Ok(PreToolDecision::Ask {
+                reason: Some("hook wants a human".into()),
+                display_reason: None,
+            })
+        })
+    }
+}
+
+impl Bench {
+    fn gated(&self) {
+        self.tools.register(Arc::new(Done)).unwrap();
+        let _ = self.tools.on_pre_execute(None, Arc::new(AskFirst));
+    }
+
+    async fn call(&self, agent: &Arc<Stub>) -> ToolOutput {
+        self.tools
+            .execute(
+                &ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                },
+                Some(Arc::clone(agent) as Arc<dyn Agent>),
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_tool_calls_ask_is_this_services_request() {
+    let bench = mounted(ApprovalPolicy::Ask).await;
+    bench.gated();
+    bench.register(answering(ApprovalOutcome::AllowedOnce));
+    let agent = bench.agent("gated");
+    assert_eq!(bench.call(&agent).await, ToolOutput::ok("done"));
+    let audit = bench.audit(&agent);
+    assert_eq!(audit[0].1["toolName"], "echo");
+    assert_eq!(audit[0].1["callId"], "c1");
+    assert_eq!(audit[0].1["reason"], "hook wants a human");
+    assert_eq!(audit[1].1["outcome"], "allowed-once");
+}
+
+#[tokio::test]
+async fn a_tool_calls_ask_under_never_or_with_no_answerer_is_denied() {
+    let bench = mounted(ApprovalPolicy::Never).await;
+    bench.gated();
+    let agent = bench.agent("never-gated");
+    assert_eq!(
+        bench.call(&agent).await,
+        ToolOutput::error("Error: the user rejected tool \"echo\"")
+    );
+    let bench = mounted(ApprovalPolicy::Ask).await;
+    bench.gated();
+    let agent = bench.agent("unanswered-gated");
+    assert_eq!(
+        bench.call(&agent).await,
+        ToolOutput::error(
+            "Error: tool \"echo\" requires approval, but no approval channel is available"
+        )
+    );
+}
+
+// An ask outside an open turn fails the call with dsh's message, as its
+// registry turns the thrown error into the result.
+#[tokio::test]
+async fn a_tool_calls_ask_outside_a_turn_fails_the_call() {
+    let bench = mounted(ApprovalPolicy::Ask).await;
+    bench.gated();
+    let agent = bench.agent_with("idle-gated", Vec::new());
+    assert_eq!(
+        bench.call(&agent).await,
+        ToolOutput::error(format!("Error: {OUTSIDE_TURN}"))
+    );
+    assert!(bench.audit(&agent).is_empty());
 }

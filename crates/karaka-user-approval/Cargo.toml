@@ -18,6 +18,9 @@ karaka-session.workspace = true
 karaka-session-projection.workspace = true
 # The policy line in the runtime context.
 karaka-system-prompt.workspace = true
+# The tool registry's approval seam, which an `ask` decision before a tool
+# call goes through.
+karaka-tools.workspace = true
 # The cancel a request carries: a cause-less signal, as dsh's
 # `AbortSignal`, the one `karaka-user-questions` uses.
 karaka-fs.workspace = true
@@ -28,4 +31,5 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true, features = ["macros"] }
 
 [dev-dependencies]
+karaka-model.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

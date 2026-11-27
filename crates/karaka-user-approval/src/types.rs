@@ -2,13 +2,16 @@
 //! service logs, in dsh's JSON. (dsh: `user-approval/src/types.ts`, and
 //! the policy types in `index.ts`.)
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use karaka_agent::Agent;
 use karaka_fs::AbortSignal;
+/// The reason, localized for display only: never logged. (dsh:
+/// `displayReason`.) The tool registry's, since its `ask` decision carries
+/// one.
+pub use karaka_tools::DisplayReason;
 use serde::{Deserialize, Serialize};
 
 /// The `approval/asked` event type.
@@ -139,25 +142,6 @@ impl TryFrom<String> for ApprovalPolicy {
 
     fn try_from(text: String) -> Result<Self, PolicyError> {
         text.parse()
-    }
-}
-
-/// The reason, localized for display only: never logged. (dsh:
-/// `displayReason`, `{ en, [locale]: string }`.)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DisplayReason {
-    pub en: String,
-    /// Other locales, by their tag.
-    pub others: BTreeMap<String, String>,
-}
-
-impl DisplayReason {
-    /// A reason in English only.
-    pub fn en(text: impl Into<String>) -> Self {
-        Self {
-            en: text.into(),
-            others: BTreeMap::new(),
-        }
     }
 }
 

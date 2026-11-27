@@ -441,7 +441,7 @@ fn help_prints_the_usage_and_exits_with_2() {
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert_eq!(text(&output.stdout), "", "{args:?}");
         assert!(
-            text(&output.stderr).starts_with("Usage: karaka ask <question...>\n"),
+            text(&output.stderr).starts_with("Usage: karaka ask [options] <question...>\n"),
             "{args:?}"
         );
     }
@@ -481,14 +481,15 @@ fn asks_deepseek_in_the_messages_format() {
     );
     assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
     // After the question, the runtime context: the session's working
-    // directory, which for `ask` is the process's own. The tools are the
-    // legacy `ask_user_question`, `todo_write`, parallel work allowed, and
-    // `working_directory`.
+    // directory, which for `ask` is the process's own, then the approval
+    // policy. The tools are the legacy `ask_user_question`, `todo_write`,
+    // parallel work allowed, and `working_directory`.
     let directory = std::env::current_dir().unwrap();
     let context = format!(
         "Current runtime context. This snapshot supersedes earlier runtime-context \
-         snapshots.\n\nCurrent working directory: {}.",
-        serde_json::to_string(directory.to_str().unwrap()).unwrap()
+         snapshots.\n\nCurrent working directory: {}.\n\n{}",
+        serde_json::to_string(directory.to_str().unwrap()).unwrap(),
+        karaka_user_approval::ASK_SENTENCE
     );
     assert_eq!(
         body,
@@ -1060,5 +1061,184 @@ fn the_end_of_stdin_cancels_an_open_question() {
     assert_eq!(
         result_text(&result),
         "Error: ask_user_question was aborted before the user answered"
+    );
+}
+
+/// Anthropic's events for a call to `working_directory`, with no `cd`.
+fn anthropic_reads_the_directory() -> String {
+    anthropic_asks(&serde_json::json!({})).replace(
+        "\"name\":\"ask_user_question\"",
+        "\"name\":\"working_directory\"",
+    )
+}
+
+/// The first text of the tool result a request carries back.
+fn tool_result_text(request: &str) -> (bool, String) {
+    let result = ask_result(request);
+    (result["is_error"] == true, result_text(&result))
+}
+
+// `--ask-before` asks before each call to the tool it names, on stderr,
+// and a `y` on stdin lets it run.
+#[test]
+fn ask_before_asks_and_y_allows_the_call() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_reads_the_directory()),
+        streamed(&anthropic_text("You are in the project.")),
+    ]);
+
+    let output = karaka(
+        &[
+            "ask",
+            "--ask-before",
+            "working_directory",
+            "where",
+            "am",
+            "I?",
+        ],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "y\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "\nAllow tool \"working_directory\"?\n  Reason: karaka was started with \
+             --ask-before working_directory\nAllow it once? [y/N] "
+        ),
+        "{stderr}"
+    );
+    let sent = server.join().expect("the server ran");
+    let (is_error, text) = tool_result_text(&sent[1]);
+    assert!(!is_error, "{text}");
+    assert_eq!(
+        text,
+        std::env::current_dir().unwrap().to_str().unwrap(),
+        "the directory"
+    );
+}
+
+// An empty line, or the end of stdin, withholds the approval, and the
+// model reads why.
+#[test]
+fn ask_before_without_a_yes_denies_the_call() {
+    for (stdin, reason) in [
+        ("\n", "Error: the user rejected tool \"working_directory\""),
+        (
+            "",
+            "Error: approval for tool \"working_directory\" was cancelled",
+        ),
+    ] {
+        let (address, server) = serve(vec![
+            streamed(&anthropic_reads_the_directory()),
+            streamed(&anthropic_text("I couldn't look.")),
+        ]);
+        let output = karaka(
+            &[
+                "ask",
+                "--ask-before",
+                "working_directory",
+                "where",
+                "am",
+                "I?",
+            ],
+            &[
+                ("ANTHROPIC_API_KEY", "test-key".into()),
+                ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            ],
+            stdin,
+        );
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let sent = server.join().expect("the server ran");
+        assert_eq!(tool_result_text(&sent[1]), (true, reason.to_owned()));
+    }
+}
+
+// `--approval-policy never` rejects without asking anyone.
+#[test]
+fn the_never_policy_rejects_without_asking() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_reads_the_directory()),
+        streamed(&anthropic_text("I couldn't look.")),
+    ]);
+    let output = karaka(
+        &[
+            "ask",
+            "--approval-policy",
+            "never",
+            "--ask-before",
+            "working_directory",
+            "where",
+            "am",
+            "I?",
+        ],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "y\n",
+    );
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("Allow tool"), "{stderr}");
+    let sent = server.join().expect("the server ran");
+    assert_eq!(
+        tool_result_text(&sent[1]),
+        (
+            true,
+            "Error: the user rejected tool \"working_directory\"".to_owned()
+        )
+    );
+    // The model is told the policy, in the runtime context.
+    assert!(
+        body(&sent[0]).contains("Approval prompts are disabled in this session"),
+        "{}",
+        body(&sent[0])
+    );
+}
+
+// In chat, the line after an approval prompt answers it; the next one is
+// the next message.
+#[test]
+fn chat_routes_the_next_line_to_an_open_approval() {
+    let (address, server) = serve(vec![
+        streamed(&anthropic_reads_the_directory()),
+        streamed(&anthropic_text("I couldn't look.")),
+        streamed(&anthropic_text("Fine.")),
+    ]);
+    let output = karaka(
+        &["chat", "--ask-before", "working_directory"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+        ],
+        "where am I?\nn\nnever mind\n",
+    );
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let sent = server.join().expect("the server ran");
+    assert_eq!(
+        tool_result_text(&sent[1]),
+        (
+            true,
+            "Error: the user rejected tool \"working_directory\"".to_owned()
+        )
+    );
+    let third = body(&sent[2]);
+    assert!(third.contains("never mind"), "{third}");
+    assert!(!third.contains(r#""text":"n""#), "{third}");
+}
+
+#[test]
+fn a_bad_approval_policy_prints_why_and_the_usage() {
+    let output = karaka(&["chat", "--approval-policy", "sometimes"], &[], "");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("karaka: approval policy must be one of \"ask\" or \"never\"\nUsage:"),
+        "{stderr}"
     );
 }

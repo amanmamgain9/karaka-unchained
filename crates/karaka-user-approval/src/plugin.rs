@@ -7,6 +7,7 @@ use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_session::{SessionId, SessionStore};
 use karaka_session_projection::SessionProjections;
 use karaka_system_prompt::{ContextOrder, PromptContext, SystemPrompt, Text};
+use karaka_tools::{ToolApproval, ToolRegistry};
 
 use crate::service::{ApprovalService, ApprovalStateProjection};
 use crate::types::ApprovalPolicy;
@@ -31,8 +32,13 @@ pub struct ApprovalConfig {
 /// no agent gets an empty line. It is optional runtime context, as dsh's
 /// is: neither literal nor required.
 ///
-/// It requires the session store, the session projections and the system
-/// prompt.
+/// It makes the service the tool registry's approval seam, so a
+/// `tools/pre-execute` listener's `ask` is decided here. dsh's registry
+/// takes the approval service when one is mounted; the kernel has no
+/// optional port, so this plugin requires the registry instead.
+///
+/// It requires the session store, the session projections, the system
+/// prompt and the tool registry.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ApprovalPlugin {
     config: ApprovalConfig,
@@ -58,6 +64,7 @@ impl Plugin for ApprovalPlugin {
             PortId::of::<SessionStore>(),
             PortId::of::<SessionProjections>(),
             PortId::of::<SystemPrompt>(),
+            PortId::of::<ToolRegistry>(),
         ]
     }
 
@@ -84,6 +91,8 @@ impl Plugin for ApprovalPlugin {
                 }),
             ),
         )?;
+        ctx.get::<ToolRegistry>()
+            .set_approval(Arc::clone(&service) as Arc<dyn ToolApproval>);
         ctx.provide(service);
         Ok(())
     }

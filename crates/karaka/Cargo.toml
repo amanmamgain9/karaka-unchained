@@ -37,6 +37,8 @@ karaka-tool-todo.workspace = true
 # binary answers them on the terminal.
 karaka-user-questions.workspace = true
 karaka-tool-ask-user.workspace = true
+# Approvals, which a tool call may need, answered on the terminal too.
+karaka-user-approval.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

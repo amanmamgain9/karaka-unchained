@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-27, after the user-approval service (step A of approvals).
+Last updated 2026-11-27, after the `tools/pre-execute` gate and terminal approvals (step B of approvals).
 
 ## Needs you
 
@@ -58,14 +58,18 @@ Last updated 2026-11-27, after the user-approval service (step A of approvals).
     called by hand;
   - session-postgres will need a drain on dispose.
 - **Hooks.** Some exist as small registry ports: request errors, inbox
-  signals, prompt assembly listeners, and the user-questions and approval
-  answerer chains. Still missing: `tools/execute`, `tools/pre-execute`,
-  `tools/post-execute`, `agent/pre-step`, `agent/turn-stopping`. (Kernel
-  gaps)
+  signals, prompt assembly listeners, the user-questions and approval
+  answerer chains, and the tool registry's `tools/pre-execute` gate.
+  Still missing: `tools/execute`, `tools/post-execute`, `agent/pre-step`,
+  `agent/turn-stopping`. (Kernel gaps)
+- **Tool guards.** dsh's registry runs monotonic guards (`ToolGuard`)
+  after `tools/pre-execute`, which can only deny. They aren't ported.
+  (Approvals, step B)
 - **Per-agent composition.** Each agent preset needs its own tools,
   prompt and skills, and main-agent's approval gate must fire only for
-  main-agent. Prompt contributions and answerers can be scoped to one
-  session, but tools can't yet. (Kernel gaps)
+  main-agent. Prompt contributions, answerers and `tools/pre-execute`
+  listeners can be scoped to one session, but tools can't yet. (Kernel
+  gaps)
 - **A logger.** dsh warns on a torn log tail and a failed background
   batch. Karaka writes nothing, or prints to stderr. (Durable sessions,
   parts A and B)
@@ -81,11 +85,13 @@ Last updated 2026-11-27, after the user-approval service (step A of approvals).
   but a tool has none to pass on. So `ask_user_question`'s request carries
   no signal, and an answerer sees a cancel only as its own future being
   dropped. An approval asked from a tool call is the same: it can't log
-  `cancelled`, since the dropped future logs no `approval/decided`. (The
-  ask_user_question tool; User approval)
+  `cancelled`, since the dropped future logs no `approval/decided`. The
+  gate has no signal checks either, so dsh's "cancellation overtakes the
+  approval" result can't arise; a dropped call simply never runs. (The
+  ask_user_question tool; User approval; Approvals, step B)
 - **Tool results carry text only.** dsh's also carry images, a
-  structured error `{ name, code, reason }`, presentation data and extra
-  context for the next step. Play This Life shows its upgrade prompt on
+  structured error `{ name, code, reason }` (a gate denial's `info`
+  included), presentation data and extra context for the next step. Play This Life shows its upgrade prompt on
   the `pro_required` code. (Audit: what Play This Life reads)
 - **Developer messages for tool additions and removals.** Only the
   request header records a change of tools. (Agent loop, step one)

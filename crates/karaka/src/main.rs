@@ -25,13 +25,14 @@ use karaka_model::{Model, ModelRegistry};
 use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSource};
 
 use crate::answer::Printer;
+use crate::chat::Approvals;
 use crate::config::Config;
 use crate::questions::Lines;
 
 const USAGE: &str = "\
-Usage: karaka ask <question...>
-       karaka ask [-]
-       karaka chat
+Usage: karaka ask [options] <question...>
+       karaka ask [options] [-]
+       karaka chat [options]
 
 ask asks a model one question and prints the answer as it is written.
 With no question, or with -, the question is read from stdin. A request
@@ -39,14 +40,21 @@ that fails for a reason worth retrying is tried again first.
 
 chat reads messages from stdin, one per line, and answers each through
 the agent loop and its tools. Each tool call is printed on a line of its
-own, then the answer.
+own, then the answer. A request that fails for a reason worth retrying,
+such as a rate limit, is tried again first. With KARAKA_SESSIONS set, the
+chat is stored there, and the next chat in the same session carries on
+the conversation.
 
 Either may ask you a question on stderr. Answer it on stdin with an
 option's number (numbers separated by commas where several may be
-picked), or type your own answer; an empty line skips it. A request that fails for a
-reason worth retrying, such as a rate limit, is tried again first. With
-KARAKA_SESSIONS set, the chat is stored there, and the next chat in the
-same session carries on the conversation.
+picked), or type your own answer; an empty line skips it.
+
+Options, before the question:
+  --ask-before <tool>       ask for your approval, on stderr, before each
+                            call to <tool>; y allows it once, anything else
+                            rejects it. May be given more than once
+  --approval-policy <p>     ask (the default) asks you; never rejects
+                            every approval without asking
 
 Settings come from the environment:
   KARAKA_PROVIDER     anthropic (the default), deepseek or openai. deepseek
@@ -89,26 +97,71 @@ Settings come from the environment:
 #[derive(Debug, PartialEq)]
 enum Command {
     /// Ask the question given on the command line.
-    Ask(String),
+    Ask(String, Approvals),
     /// Ask a question read from stdin.
-    AskFromStdin,
+    AskFromStdin(Approvals),
     /// Hold a conversation read from stdin.
-    Chat,
+    Chat(Approvals),
     /// Print the usage text: for `--help`, or a command line that isn't right.
     Usage,
+    /// Print this, then the usage text.
+    Invalid(String),
 }
 
 /// Reads the arguments that follow the program's name.
 fn parse_args(args: &[String]) -> Command {
-    match args {
-        [command, rest @ ..] if command == "ask" => match rest {
-            [] => Command::AskFromStdin,
-            [dash] if dash == "-" => Command::AskFromStdin,
-            words => Command::Ask(words.join(" ")),
-        },
-        [command] if command == "chat" => Command::Chat,
+    let Some((command, rest)) = args.split_first() else {
+        return Command::Usage;
+    };
+    if command != "ask" && command != "chat" {
+        return Command::Usage;
+    }
+    let (approvals, words) = match options(rest) {
+        Ok(parsed) => parsed,
+        Err(message) => return Command::Invalid(message),
+    };
+    match (command.as_str(), words) {
+        ("ask", []) => Command::AskFromStdin(approvals),
+        ("ask", [dash]) if dash == "-" => Command::AskFromStdin(approvals),
+        ("ask", words) => Command::Ask(words.join(" "), approvals),
+        ("chat", []) => Command::Chat(approvals),
         _ => Command::Usage,
     }
+}
+
+/// The options at the front of `args`, and the words after them. `--`
+/// ends the options.
+fn options(mut args: &[String]) -> Result<(Approvals, &[String]), String> {
+    let mut approvals = Approvals::default();
+    while let Some((first, rest)) = args.split_first() {
+        let (name, inline) = match first.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(value.to_owned())),
+            _ => (first.as_str(), None),
+        };
+        if name == "--" {
+            return Ok((approvals, rest));
+        }
+        if name != "--ask-before" && name != "--approval-policy" {
+            break;
+        }
+        let (value, rest) = match inline {
+            Some(value) => (value, rest),
+            None => match rest.split_first() {
+                Some((value, rest)) => (value.clone(), rest),
+                None => return Err(format!("{name} needs a value")),
+            },
+        };
+        if value.is_empty() {
+            return Err(format!("{name} needs a value"));
+        }
+        if name == "--ask-before" {
+            approvals.ask_before.push(value);
+        } else {
+            approvals.policy = value.parse().map_err(|error| format!("{error}"))?;
+        }
+        args = rest;
+    }
+    Ok((approvals, args))
 }
 
 #[tokio::main]
@@ -119,12 +172,17 @@ async fn main() -> ExitCode {
         .map(OsString::into_string)
         .collect();
     let result = match args.map(|args| parse_args(&args)) {
-        Ok(Command::Ask(question)) => ask(Some(question)).await,
-        Ok(Command::AskFromStdin) => ask(None).await,
-        Ok(Command::Chat) => match Config::from_env(|name| std::env::var(name).ok()) {
-            Ok(config) => chat::chat(config).await,
+        Ok(Command::Ask(question, approvals)) => ask(Some(question), approvals).await,
+        Ok(Command::AskFromStdin(approvals)) => ask(None, approvals).await,
+        Ok(Command::Chat(approvals)) => match Config::from_env(|name| std::env::var(name).ok()) {
+            Ok(config) => chat::chat(config, approvals).await,
             Err(message) => Err(message),
         },
+        Ok(Command::Invalid(message)) => {
+            eprintln!("karaka: {message}");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
         Ok(Command::Usage) | Err(_) => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -142,7 +200,7 @@ async fn main() -> ExitCode {
 
 /// Asks the model one question and prints the answer. With no question, it
 /// is read from stdin.
-async fn ask(question: Option<String>) -> Result<(), String> {
+async fn ask(question: Option<String>, approvals: Approvals) -> Result<(), String> {
     // The settings are read before stdin, so a mistake in them shows at once,
     // not after someone has typed out a question.
     let config = Config::from_env(|name| std::env::var(name).ok())?;
@@ -159,7 +217,7 @@ async fn ask(question: Option<String>) -> Result<(), String> {
     // through the agent loop and is retried as the provider's policy says.
     // The answer is printed from the loop's live frames as it is written.
     let route = config.provider.route().to_owned();
-    let runtime = Runtime::start(chat::loop_plugins(config))
+    let runtime = Runtime::start(chat::loop_plugins(config, &approvals))
         .await
         .map_err(|error| error.to_string())?;
     // Checked before the turn, so an unknown route lists the routes there
@@ -168,7 +226,11 @@ async fn ask(question: Option<String>) -> Result<(), String> {
     // The model's questions are put on the terminal, and answered from
     // stdin, which `ask` otherwise reads only for a question it wasn't
     // given: `printf '1\n' | karaka ask "…"` picks the first option.
-    chat::answer_on_the_terminal(&runtime, &Arc::new(Lines::new(BufReader::new(io::stdin()))));
+    chat::answer_on_the_terminal(
+        &runtime,
+        &Arc::new(Lines::new(BufReader::new(io::stdin()))),
+        &approvals,
+    );
 
     let id = SessionId::new("ask");
     let agent = runtime
@@ -237,7 +299,9 @@ mod tests {
     use karaka_model::ModelRegistry;
     use karaka_openai::OpenAiModel;
 
-    use super::{Command, model_at, parse_args};
+    use karaka_user_approval::ApprovalPolicy;
+
+    use super::{Approvals, Command, model_at, parse_args};
 
     fn parse(args: &[&str]) -> Command {
         let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
@@ -248,25 +312,89 @@ mod tests {
     fn the_words_after_ask_are_the_question() {
         assert_eq!(
             parse(&["ask", "what", "is", "2 + 2?"]),
-            Command::Ask("what is 2 + 2?".into())
+            Command::Ask("what is 2 + 2?".into(), Approvals::default())
         );
     }
 
     #[test]
     fn no_question_or_a_dash_reads_stdin() {
-        assert_eq!(parse(&["ask"]), Command::AskFromStdin);
-        assert_eq!(parse(&["ask", "-"]), Command::AskFromStdin);
+        assert_eq!(parse(&["ask"]), Command::AskFromStdin(Approvals::default()));
+        assert_eq!(
+            parse(&["ask", "-"]),
+            Command::AskFromStdin(Approvals::default())
+        );
     }
 
     #[test]
     fn a_dash_among_other_words_is_part_of_the_question() {
-        assert_eq!(parse(&["ask", "-", "why"]), Command::Ask("- why".into()));
+        assert_eq!(
+            parse(&["ask", "-", "why"]),
+            Command::Ask("- why".into(), Approvals::default())
+        );
     }
 
     #[test]
     fn chat_takes_no_arguments() {
-        assert_eq!(parse(&["chat"]), Command::Chat);
+        assert_eq!(parse(&["chat"]), Command::Chat(Approvals::default()));
         assert_eq!(parse(&["chat", "hello"]), Command::Usage);
+    }
+
+    #[test]
+    fn approval_options_come_before_the_question() {
+        let approvals = Approvals {
+            policy: ApprovalPolicy::Never,
+            ask_before: vec!["working_directory".into(), "todo_write".into()],
+        };
+        assert_eq!(
+            parse(&[
+                "ask",
+                "--ask-before",
+                "working_directory",
+                "--approval-policy=never",
+                "--ask-before=todo_write",
+                "where",
+                "am",
+                "I?"
+            ]),
+            Command::Ask("where am I?".into(), approvals.clone())
+        );
+        assert_eq!(
+            parse(&[
+                "chat",
+                "--approval-policy",
+                "never",
+                "--ask-before",
+                "working_directory",
+                "--ask-before",
+                "todo_write"
+            ]),
+            Command::Chat(approvals)
+        );
+        // `--` ends the options, and an option after the question is a word.
+        assert_eq!(
+            parse(&["ask", "--", "--ask-before", "x"]),
+            Command::Ask("--ask-before x".into(), Approvals::default())
+        );
+        assert_eq!(
+            parse(&["ask", "why", "--ask-before", "x"]),
+            Command::Ask("why --ask-before x".into(), Approvals::default())
+        );
+    }
+
+    #[test]
+    fn a_bad_approval_option_is_refused() {
+        assert_eq!(
+            parse(&["chat", "--approval-policy", "sometimes"]),
+            Command::Invalid("approval policy must be one of \"ask\" or \"never\"".into())
+        );
+        assert_eq!(
+            parse(&["ask", "--ask-before"]),
+            Command::Invalid("--ask-before needs a value".into())
+        );
+        assert_eq!(
+            parse(&["ask", "--ask-before=", "why"]),
+            Command::Invalid("--ask-before needs a value".into())
+        );
     }
 
     #[test]

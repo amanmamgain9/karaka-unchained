@@ -45,6 +45,7 @@ use karaka_session::{
     UserMessage, UserSource,
 };
 use karaka_session_projection::{Projection, SessionProjections};
+use karaka_tools::{ToolApproval, ToolApprovalFuture, ToolApprovalOutcome, ToolApprovalRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -421,6 +422,34 @@ impl std::fmt::Debug for ApprovalService {
             .field("default_policy", &self.default_policy)
             .field("answerers", &lock(&self.answerers).list.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The tool registry's approval seam: an `ask` decision before a tool call
+/// is this service's request, with no signal, as a tool call has none.
+/// (dsh: `serviceAsk`'s `approval.request`.) A request that fails, such as
+/// one outside an open turn, fails the call with its message.
+impl ToolApproval for ApprovalService {
+    fn request<'a>(&'a self, request: ToolApprovalRequest) -> ToolApprovalFuture<'a> {
+        Box::pin(async move {
+            let request = ApprovalRequest {
+                agent: request.agent,
+                tool_name: request.tool_name,
+                call_id: Some(request.call_id),
+                reason: request.reason,
+                display_reason: request.display_reason,
+                signal: None,
+            };
+            let outcome = ApprovalService::request(self, &request)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(match outcome {
+                ApprovalOutcome::AllowedOnce => ToolApprovalOutcome::AllowedOnce,
+                ApprovalOutcome::Rejected => ToolApprovalOutcome::Rejected,
+                ApprovalOutcome::Cancelled => ToolApprovalOutcome::Cancelled,
+                ApprovalOutcome::Unavailable => ToolApprovalOutcome::Unavailable,
+            })
+        })
     }
 }
 
