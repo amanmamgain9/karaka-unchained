@@ -2790,3 +2790,124 @@ signal, `snapshot` with `complete`, lookups by `cwd` and scope, and
   panic is a bug.
 - **Runtime skill bodies** are cloned when loaded. dsh hands back the
   registered object itself.
+
+## Skills, step B: skill-filesystem
+
+`karaka-skill-filesystem` ports dsh's `packages/skill/skill-filesystem`
+(`index.ts`). It is a crate of its own, not a module of `karaka-skill`, for
+two reasons. dsh keeps it a package apart, and the registry stays free of
+the filesystem seam and the YAML parser.
+
+### What is done
+
+- **The roots, ranks and sources are dsh's:**
+  - the project's `.dsh/skills` (100, `project-dsh`) and `.agents/skills`
+    (200, `project-agents`), from the nearest directory up from the
+    lookup's `cwd` holding `.git`, else the `cwd` itself;
+  - each custom directory (300, `custom`);
+  - `~/.dsh/skills` (400, `user-dsh`), with its `.system` skipped, and
+    `~/.agents/skills` (500, `user-agents`);
+  - the bundled root (600, `bundled`).
+
+  `include_default_roots: false` drops the project and user roots and the
+  environment's bundled root. The homes come from the config, then
+  `$DSH_HOME` and `$DSH_AGENTS_HOME` (blank counts as unset), then
+  `~/.dsh` and `~/.agents`, with `~` expanded. dsh's environment names are
+  kept.
+- **Discovery:**
+  - A root's entries are listed through the filesystem seam. A directory
+    is a bundle, `<name>/SKILL.md`, with that directory as its resource
+    base. A `.md` file is a flat skill, with the root as its base.
+  - A candidate's `path` is the file's real path (`process_path`), and its
+    base is the path as listed, so a linked skill keeps its link's root.
+  - A missing root is empty. Any other failure fails the provider's
+    listing, which the registry skips as incomplete.
+- **Reading** follows dsh's filesystem path:
+  - resolve, stat, then read;
+  - absent, or not a regular file, is `None`;
+  - a file that isn't text is `None`, with dsh's warning;
+  - anything else is an error;
+  - the lookup's signal reaches `stat` and `read_text`.
+- **Frontmatter**, exactly as dsh splits it:
+  - a first line of `---`, YAML, and a closing `---` line, `\r\n` or
+    `\n`;
+  - YAML that isn't a mapping counts as missing;
+  - the body is trimmed.
+
+  The YAML parser is `yaml-rust2` (=0.13.0, a YAML 1.2 parser, as dsh's
+  `yaml` is), turned into JSON with a mapping's keys as strings.
+- **Validation** has dsh's warning texts: invalid YAML, missing
+  frontmatter, `frontmatter requires name and description`, an invalid
+  name, and invalid invocation frontmatter.
+  - `disable-model-invocation` and `user-invocable` take dsh's spellings:
+    a boolean, `1`/`0`, and `true`/`yes`/`on`/`false`/`no`/`off` in any
+    case.
+  - The legacy keys are refused.
+  - `whenToUse` and a `metadata` mapping are read.
+  - The invocation errors carry dsh's `Error:` or `TypeError:` name, as
+    dsh's `String(error)` gives them.
+- **Watching:**
+  - Each root is watched through the filesystem seam: the root and each
+    of its directories, or, while it is missing, its nearest existing
+    ancestor.
+  - Every change re-plans the root's watches and invalidates the catalogs,
+    coalesced into one invalidation per burst.
+  - A watch failure is warned of (`skill-filesystem: watcher for … failed:
+    …`), and the root is watched again.
+  - A watch that won't start is warned of (`skill-filesystem: failed to
+    watch …: …`) and makes the listing incomplete, so it isn't cached and
+    is tried again.
+  - Project roots are held least-recently-used, at most
+    `watch_max_projects` (128). An evicted project's watches close and
+    the catalogs are invalidated.
+  - The registration's end, or `dispose`, closes everything. Later events
+    and observations do nothing.
+- **`observe_host_mutation(path)`** invalidates at once when the path may
+  be a skill file under a held root. dsh calls it on `fs/observed` after
+  a model's write or edit.
+- **Warnings go through the registry.** `SkillProviderControl` gains
+  `warn(message)`, which keeps the message among the registry's warnings,
+  since there is no logger. This is Karaka's own addition: dsh's providers
+  log through their context.
+- **The plugin**, `SkillFilesystemPlugin`, checks the config, then
+  registers the provider globally. It requires the skill registry and the
+  filesystem.
+- **Tests:** 21 integration and 2 unit tests.
+  - dsh's `TestFileSystem` is `Fake`, over the local filesystem, with
+    injected failures and a scripted watch, so the watcher cases run
+    without inotify.
+  - One case watches the real filesystem, and skips where the system has
+    no inotify instances left, as it does here.
+
+### Left out
+
+- **Chokidar's tunables:** polling, the write-stability threshold, the
+  poll interval and symlink following. The seam's watch has none of them.
+  A watch here follows the link to a linked skill directory, since it
+  watches the listed target's real path.
+- **Event filtering.** A Karaka watch says only that something changed, so
+  any change to a watched directory invalidates, where dsh ignores
+  non-skill files.
+- **The trusted bundled root.** dsh reads it with Node's `fs`, past
+  `ctx.fs`. Here every read goes through the seam.
+- **dsh's native path** (Node's `fs` when no `ctx.fs` is mounted), and
+  its symlink warning. Karaka always has the seam.
+- **`fs/observed`,** which waits on the filesystem observation policy (see
+  open ends).
+- **Per-preset mounting.** Play This Life mounts the provider inside each
+  preset, with `includeDefaultRoots: false`, `customSkillDirs: []` and
+  guide SKILL.md files. Presets don't exist yet, so the plugin registers
+  globally. `FileSystemSkillProvider` can be registered with a session
+  scope by hand.
+- **Spec cases:** the Cordis metadata case; the no-filesystem variant of
+  the linked-skills case; the native read failure; and the watcher spec's
+  Chokidar options, event filtering, close failures and disposal races.
+
+### Where it differs from dsh
+
+- **Entries sort by bytes**, as the seam lists them, where dsh uses
+  `localeCompare`. See the listing-order open end.
+- **The YAML parser's error text** differs from the `yaml` package's.
+  The warning's prefix is dsh's.
+- **A missing root's ancestor** is watched for its direct entries. dsh
+  polls the next path down with `watchFile`.

@@ -4,21 +4,26 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-27, after the skill registry (step A of skills).
+Last updated 2026-11-27, after skill-filesystem (step B of skills).
 
 ## Needs you
 
 - **The Anthropic key is refused.** The key in founder-game-todo's
   `.env.local` gets "invalid x-api-key". It may have been rotated or
   revoked. Real calls use DeepSeek until it's replaced.
-- **Three file-watch tests skip on this machine.** This account has used
+- **Four file-watch tests skip on this machine.** This account has used
   up its inotify instances, about 219 against a limit of 128. To run them,
   close some editors, or run
   `sudo sysctl fs.inotify.max_user_instances=512`, then
-  `cargo test -p karaka-fs-local --test watch -- --nocapture`.
+  `cargo test -p karaka-fs-local --test watch -- --nocapture` and
+  `cargo test -p karaka-skill-filesystem --test filesystem the_real_watches -- --nocapture`.
+  The skill provider's real-watch case has never run here; its scripted
+  watch cases do.
 - **Directory listing order.** Karaka sorts names by their bytes, so
   capitals come first. dsh sorts by the machine's locale. Keep bytes, or
-  switch to a case-insensitive sort that comes close to dsh.
+  switch to a case-insensitive sort that comes close to dsh. Skill
+  discovery follows the same order, where dsh sorts a root's entries with
+  `localeCompare`.
 - **Service tokens between the app and Karaka.** The proposed changes to
   `@karaka-ai/server-auth`, the SDK and `delegated-access` need your
   approval under founder-game-todo's `AGENTS.md`. Nothing has been
@@ -71,13 +76,17 @@ Last updated 2026-11-27, after the skill registry (step A of skills).
   listeners, skill providers and runtime skills can be scoped to one
   session, but tools can't yet. A skill scope has no parent, so an agent
   can't inherit its preset's skill layer, and dsh's re-parenting on
-  recompose has nothing to follow; both wait on presets. (Kernel gaps;
-  Skills, step A)
+  recompose has nothing to follow; both wait on presets. Play This
+  Life mounts `skill-filesystem` inside each preset, with
+  `includeDefaultRoots: false` and `customSkillDirs: []`, plus guides that
+  are SKILL.md files; that mount waits on presets too, and the plugin
+  registers globally until then. (Kernel gaps; Skills, steps A and B)
 - **A logger.** dsh warns on a torn log tail and a failed background
   batch. Karaka writes nothing, or prints to stderr. The skill registry
   keeps its warnings (ignored duplicates, skipped providers, panicking
-  change listeners) for `SkillRegistry::warnings()`, until a logger takes
-  them. (Durable sessions, parts A and B; Skills, step A)
+  change listeners, and what a provider reports through its control's
+  `warn`, such as skipped skill files and failed watches) for
+  `SkillRegistry::warnings()`, until a logger takes them. (Durable sessions, parts A and B; Skills, steps A and B)
 
 ### The agent loop
 
@@ -148,7 +157,9 @@ Last updated 2026-11-27, after the skill registry (step A of skills).
 - **Sandbox policy.** File-write sandboxing, and the policy line in the
   runtime context. (Filesystem; Working directory)
 - **The filesystem observation policy:** the `fs/write-intent`,
-  `fs/edit-intent` and `fs/observed` events. (Filesystem)
+  `fs/edit-intent` and `fs/observed` events. Until then nothing calls
+  the skill provider's `observe_host_mutation`, which dsh calls on
+  `fs/observed` after a model's write or edit. (Filesystem; Skills, step B)
 - **Compaction.** It needs the context-overflow error, which exists now.
   (Agent loop, step one)
 - **System-prompt sections** from other plugins: plan mode, per-tool
@@ -162,7 +173,7 @@ From Play This Life's plugin list:
   service), `session-query-sqlite`, `storage`, `credentials-local`.
 - **Presets and personas:** `agent-preset`, `agent-preset-registry`,
   `persona`.
-- **Skills:** `skill-filesystem`, then `tool-skill`.
+- **Skills:** `tool-skill`.
 - **The rest:** `mcp-client`, `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 

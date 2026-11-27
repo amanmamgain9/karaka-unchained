@@ -95,6 +95,15 @@ pub struct SkillProviderControl {
 }
 
 impl SkillProviderControl {
+    /// Keeps `message` among the registry's warnings, where dsh's provider
+    /// would log it: Karaka has no logger yet. (Karaka's own: dsh's
+    /// providers log through their context.)
+    pub fn warn(&self, message: impl Into<String>) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.warn(message.into());
+        }
+    }
+
     /// Drops the cached catalogs and tells the change listeners, while this
     /// exact registration is live; afterwards it does nothing.
     pub fn invalidate(&self) {

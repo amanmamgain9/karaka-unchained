@@ -1,0 +1,31 @@
+[package]
+name = "karaka-skill-filesystem"
+description = "The local skill provider: SKILL.md files under project, custom, user and bundled roots, read through the filesystem seam and watched for changes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the provider.
+karaka-kernel.workspace = true
+# The registry it provides into.
+karaka-skill.workspace = true
+# Roots are listed, files read and directories watched through the
+# filesystem seam, as dsh reads through `ctx.fs`.
+karaka-fs.workspace = true
+# The frontmatter's parsed metadata.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# dsh parses frontmatter with the `yaml` package, a YAML 1.2 parser; this is
+# a YAML 1.2 parser too. Pinned to a release some weeks old. No default
+# features: those add input decoding, and frontmatter is already text.
+yaml-rust2 = { version = "=0.13.0", default-features = false }
+# `rt` to run a watch's follow-up work, `sync` to open one root's watches
+# at a time.
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+karaka-fs-local.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
