@@ -64,7 +64,9 @@ use std::pin::Pin;
 use std::sync::{Arc, PoisonError};
 use std::task::{Context, Poll};
 
-use karaka_agent::{Agent, RequestError, RequestErrorAction, SettledAs, StreamChunk};
+use karaka_agent::{
+    Agent, PreStep, PreStepDecision, RequestError, RequestErrorAction, SettledAs, StreamChunk,
+};
 use karaka_tools::ToolOutput;
 use serde_json::Value;
 
@@ -187,6 +189,12 @@ impl Inner {
             if let Some(cause) = cancel.cause() {
                 return Err(Stop::Aborted(cause));
             }
+            // The pre-step hook may reject the step, or change what enters
+            // it (`agent.ts:274-289`).
+            let input = match self.pre_step(turn, step + 1, input, cancel, caller).await? {
+                PreStepDecision::Reject => return Ok(TurnEndReason::Blocked),
+                PreStepDecision::Enter { messages } => messages,
+            };
             if let Some(reason) = ending.take_if(|_| input.is_empty()) {
                 return Ok(reason);
             }
@@ -231,6 +239,45 @@ impl Inner {
                 return Ok(reason);
             }
             target = InboxTarget::NextStep;
+        }
+    }
+
+    /// Runs the pre-step hook for step `step`, which `input` was claimed
+    /// for, raced against the turn's cancel. With no listener, the step
+    /// enters with its input. (dsh: the `agent/pre-step` waterfall in
+    /// `preStep`.)
+    async fn pre_step(
+        &self,
+        turn: u64,
+        step: u64,
+        input: Vec<UserMessage>,
+        cancel: &Cancel,
+        caller: &Arc<dyn Agent>,
+    ) -> Result<PreStepDecision, Stop> {
+        let hooks = &self.shared.pre_step;
+        if hooks.is_empty_for(self.session.id()) {
+            return Ok(PreStepDecision::Enter { messages: input });
+        }
+        let proposed = PreStep {
+            agent: Arc::clone(caller),
+            messages: input,
+            turn,
+            step,
+            cancel: cancel.clone(),
+        };
+        let decided = tokio::select! {
+            biased;
+            cause = cancel.cancelled() => return Err(Stop::Aborted(cause)),
+            decided = CatchUnwind(hooks.run(&proposed)) => decided,
+        };
+        match decided {
+            Ok(Ok(decision)) => Ok(decision),
+            Ok(Err(_)) | Err(_) if cancel.cause().is_some() => {
+                Err(Stop::Aborted(cancel.cause().unwrap_or(CancelCause::User)))
+            }
+            Ok(Err(error)) => Err(Stop::Failed(other_failure(&*error))),
+            // A dsh listener that throws ends the turn with its text.
+            Err(Panicked(message)) => Err(Stop::Failed(panicked(message))),
         }
     }
 

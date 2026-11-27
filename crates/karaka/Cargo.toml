@@ -39,6 +39,11 @@ karaka-user-questions.workspace = true
 karaka-tool-ask-user.workspace = true
 # Approvals, which a tool call may need, answered on the terminal too.
 karaka-user-approval.workspace = true
+# Skills: the registry, the provider that finds SKILL.md files on disk, and
+# the model's `skill` tool with the session catalog.
+karaka-skill.workspace = true
+karaka-skill-filesystem.workspace = true
+karaka-tool-skill.workspace = true
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use karaka_agent::{Agent, Agents, InboxHooks, OpenError, RequestErrorHooks};
+use karaka_agent::{Agent, Agents, InboxHooks, OpenError, PreStepHooks, RequestErrorHooks};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
 use karaka_session::{SessionId, SessionStore};
@@ -58,6 +58,8 @@ pub(crate) struct Shared {
     pub(crate) hooks: Arc<RequestErrorHooks>,
     /// Who hears messages leave an agent's inbox.
     pub(crate) inbox_hooks: Arc<InboxHooks>,
+    /// Run before each step starts.
+    pub(crate) pre_step: Arc<PreStepHooks>,
     /// Each step's prompt and tool list are assembled from it.
     pub(crate) prompt: Arc<SystemPrompt>,
     /// Where each agent's inbox is folded, as the `inbox` projection.
@@ -84,6 +86,8 @@ pub struct LoopHooks {
     pub request_error: Arc<RequestErrorHooks>,
     /// Told when a message leaves an agent's inbox.
     pub inbox: Arc<InboxHooks>,
+    /// Run before each step starts.
+    pub pre_step: Arc<PreStepHooks>,
 }
 
 impl AgentLoop {
@@ -109,6 +113,7 @@ impl AgentLoop {
                 sessions,
                 hooks: hooks.request_error,
                 inbox_hooks: hooks.inbox,
+                pre_step: hooks.pre_step,
                 prompt,
                 projections,
             }),
@@ -176,7 +181,7 @@ impl fmt::Debug for AgentLoop {
 /// session projections and the system prompt. It registers the `inbox`
 /// projection, which holds each agent's pending input, and the prompt
 /// variables `provider` (its route) and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
-/// and [`InboxHooks`] ports beside `Agents`, empty: the loop
+/// [`InboxHooks`] and [`PreStepHooks`] ports beside `Agents`, empty: the loop
 /// runs the hooks, so it owns the lists. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
 ///
@@ -203,6 +208,7 @@ impl Plugin for AgentLoopPlugin {
             PortId::of::<dyn Agents>(),
             PortId::of::<RequestErrorHooks>(),
             PortId::of::<InboxHooks>(),
+            PortId::of::<PreStepHooks>(),
         ]
     }
 
@@ -240,6 +246,7 @@ impl Plugin for AgentLoopPlugin {
         ctx.provide(agents);
         ctx.provide(hooks.request_error);
         ctx.provide(hooks.inbox);
+        ctx.provide(hooks.pre_step);
         Ok(())
     }
 }

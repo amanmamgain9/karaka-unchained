@@ -37,6 +37,12 @@ const VARIABLES: &[&str] = &[
     "DEEPSEEK_THINKING",
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
+    // The skill roots' homes. Each test points them at a directory that
+    // doesn't exist, unless it names its own, so no test ever reads the
+    // real `~/.dsh` or `~/.agents`.
+    "DSH_HOME",
+    "DSH_AGENTS_HOME",
+    "DSH_BUNDLED_SKILL_DIR",
 ];
 
 /// Runs `karaka` with `args`, `env` as its only settings, and `stdin` as its
@@ -97,14 +103,27 @@ fn check_stored_streams(root: &Path) {
 
 /// Runs the binary with `env` as its only settings.
 fn run(args: &[&str], env: &[(&str, String)], stdin: &str) -> Output {
+    run_in(None, args, env, stdin)
+}
+
+/// Runs the binary in `cwd`, or in the test's own directory, with `env` as
+/// its only settings.
+fn run_in(cwd: Option<&Path>, args: &[&str], env: &[(&str, String)], stdin: &str) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_karaka"));
     command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     for name in VARIABLES {
         command.env_remove(name);
+    }
+    let nowhere = std::env::temp_dir().join(format!("karaka-cli-no-skills-{}", std::process::id()));
+    for name in ["DSH_HOME", "DSH_AGENTS_HOME", "DSH_BUNDLED_SKILL_DIR"] {
+        command.env(name, nowhere.join(name));
     }
     for (name, value) in env {
         command.env(name, value);
@@ -482,8 +501,9 @@ fn asks_deepseek_in_the_messages_format() {
     assert!(!head.contains("\r\nanthropic-beta:"), "{head}");
     // After the question, the runtime context: the session's working
     // directory, which for `ask` is the process's own, then the approval
-    // policy. The tools are the legacy `ask_user_question`, `todo_write`,
-    // parallel work allowed, and `working_directory`.
+    // policy. The tools are the legacy `ask_user_question`, `skill`,
+    // `todo_write`, parallel work allowed, and `working_directory`. There
+    // are no skills, so there is no catalog.
     let directory = std::env::current_dir().unwrap();
     let context = format!(
         "Current runtime context. This snapshot supersedes earlier runtime-context \
@@ -503,6 +523,7 @@ fn asks_deepseek_in_the_messages_format() {
                 r#""system":"You are an AI agent powered by Karaka.\n\nBe brief.","#,
                 r#""tools":[{{"name":"ask_user_question","description":{ask},"#,
                 r#""input_schema":{ask_parameters}}},"#,
+                r#"{{"name":"skill","description":{skill},"input_schema":{skill_parameters}}},"#,
                 r#"{{"name":"todo_write","description":{todo},"#,
                 r#""input_schema":{{"type":"object","properties":{{"todos":{{"type":"array","#,
                 r#""description":"The COMPLETE task list, replacing any previous list.","#,
@@ -523,10 +544,82 @@ fn asks_deepseek_in_the_messages_format() {
             context = serde_json::to_string(&context).unwrap(),
             todo = serde_json::to_string(&karaka_tool_todo::description(true)).unwrap(),
             ask = serde_json::to_string(karaka_tool_ask_user::LEGACY_DESCRIPTION).unwrap(),
+            skill = serde_json::to_string(karaka_tool_skill::DESCRIPTION).unwrap(),
+            skill_parameters = karaka_tool_skill::PARAMETERS,
             ask_parameters =
                 karaka_tool_ask_user::parameters(karaka_tool_ask_user::Mode::Legacy, 120)
         )
     );
+}
+
+// A skill under the project's `.agents/skills` is in the catalog after the
+// question, and `/demo` in the question loads it at once, after the
+// catalog. The project is the directory `ask` runs in.
+#[test]
+fn ask_shows_the_projects_skills_and_loads_an_invoked_one() {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let project = std::env::temp_dir().join(format!(
+        "karaka-cli-skills-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let skill = project.join(".agents/skills/demo");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: Say hello the demo way.\n---\n\nSay hello, world.\n",
+    )
+    .unwrap();
+    let (address, server) = serve_once(streamed(DEEPSEEK_HELLO));
+
+    let output = run_in(
+        Some(&project),
+        &["ask", "/demo", "please"],
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
+        ],
+        "",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(text(&output.stdout), "Hello, world\n");
+    let sent = server.join().expect("the server ran");
+    let (_, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let texts: Vec<&str> = body["messages"][0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts.len(), 4, "{texts:?}");
+    assert_eq!(texts[0], "/demo please");
+    assert!(
+        texts[1]
+            .contains("<available_skills>\n- `demo`: Say hello the demo way.\n</available_skills>"),
+        "{}",
+        texts[1]
+    );
+    let base = std::fs::canonicalize(&skill).unwrap();
+    assert_eq!(
+        texts[2],
+        format!(
+            "<skill_content name=\"demo\">\n<skill_resources>\nBase directory for this skill: {}\n\
+             Resolve relative paths mentioned by this skill against the base directory before \
+             using them. Load referenced resources only as needed.\n</skill_resources>\n\n\
+             <skill_instructions>\nSay hello, world.\n</skill_instructions>\n</skill_content>",
+            base.display()
+        )
+    );
+    assert!(
+        texts[3].starts_with("Current runtime context."),
+        "{}",
+        texts[3]
+    );
+    let _ = std::fs::remove_dir_all(&project);
 }
 
 #[test]

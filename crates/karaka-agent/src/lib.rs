@@ -22,17 +22,23 @@
 //! [`Cancellation`] (`cancel.rs`). And each agent publishes live
 //! [`AssistantStreamFrame`]s of its model calls, for a view that shows the
 //! answer as it is written (`stream.rs`). [`InboxHooks`] tell plugins when
-//! a message leaves an agent's inbox (`inbox_hooks.rs`).
+//! a message leaves an agent's inbox (`inbox_hooks.rs`), and
+//! [`PreStepHooks`] may reject a step or change the messages that enter it
+//! (`pre_step.rs`).
 
 mod cancel;
 mod inbox;
 mod inbox_hooks;
+mod pre_step;
 mod request_error;
 mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
 pub use inbox::{InboxError, SpliceCause};
 pub use inbox_hooks::{InboxHooks, InboxListener};
+pub use pre_step::{
+    PreStep, PreStepDecision, PreStepFuture, PreStepHooks, PreStepListener, PreStepNext,
+};
 pub use request_error::{
     HandlerError, HookFuture, Next, RequestError, RequestErrorAction, RequestErrorHandler,
     RequestErrorHooks,

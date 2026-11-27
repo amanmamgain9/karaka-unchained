@@ -45,6 +45,12 @@ such as a rate limit, is tried again first. With KARAKA_SESSIONS set, the
 chat is stored there, and the next chat in the same session carries on
 the conversation.
 
+Both load skills: a directory holding a SKILL.md file, under the
+project's .dsh/skills or .agents/skills, or ~/.dsh/skills or
+~/.agents/skills. The model is shown each skill's name and description
+and loads the ones a task needs; /name in a message loads that skill for
+the model at once. A chat sees skills added or changed while it runs.
+
 Either may ask you a question on stderr. Answer it on stdin with an
 option's number (numbers separated by commas where several may be
 picked), or type your own answer; an empty line skips it.
@@ -91,6 +97,13 @@ Settings come from the environment:
                       no KARAKA_EFFORT
   OPENAI_BASE_URL     needed for openai, such as https://api.openai.com/v1
   OPENAI_API_KEY      for openai (optional)
+  DSH_HOME            where ~/.dsh is: its skills are DSH_HOME/skills
+                      (optional)
+  DSH_AGENTS_HOME     where ~/.agents is: its skills are
+                      DSH_AGENTS_HOME/skills (optional)
+  DSH_BUNDLED_SKILL_DIR
+                      one more directory of skills, after the others
+                      (optional)
 ";
 
 /// What the command line asks for.
@@ -217,7 +230,7 @@ async fn ask(question: Option<String>, approvals: Approvals) -> Result<(), Strin
     // through the agent loop and is retried as the provider's policy says.
     // The answer is printed from the loop's live frames as it is written.
     let route = config.provider.route().to_owned();
-    let runtime = Runtime::start(chat::loop_plugins(config, &approvals))
+    let runtime = Runtime::start(chat::loop_plugins(config, &approvals, false))
         .await
         .map_err(|error| error.to_string())?;
     // Checked before the turn, so an unknown route lists the routes there

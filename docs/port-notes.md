@@ -2911,3 +2911,218 @@ the filesystem seam and the YAML parser.
   The warning's prefix is dsh's.
 - **A missing root's ancestor** is watched for its direct entries. dsh
   polls the next path down with `watchFile`.
+
+## Skills, step C: the skill tool
+
+`karaka-tool-skill` ports dsh's `packages/skill/tool-skill` (`index.ts`).
+It gives the model three things, all looked up as the calling agent sees
+the registry, from its working directory and with its session as the
+scope:
+
+- the `skill` tool, which loads one skill's full instructions;
+- a catalog of the model-invocable skills, added to a step's messages;
+- `/name` invocations, which load a skill a person names in a prompt.
+
+The last two are listeners of dsh's `agent/pre-step` hook, which Karaka
+lacked, so this step ports that hook first.
+
+### The pre-step hook
+
+`karaka-agent` gains `PreStepHooks`, a registry port like
+`RequestErrorHooks` and `InboxHooks`, and the loop provides it. (dsh: the
+`agent/pre-step` waterfall, `agent/src/runtime-types.ts` and the loop's
+`preStep` in `agent-loop/src/agent.ts`.)
+
+- Before each step, after the step claims its input and its prompt is
+  assembled, the loop proposes a `PreStep`: the agent, the claimed
+  messages, the turn, the step and the turn's cancel switch.
+- Each listener gets the proposal and a `PreStepNext`, usually runs the
+  rest of the chain first, and changes what it answered. The end of the
+  chain enters with the claimed messages.
+- Listeners are global or scoped to one session, and run in the order
+  they were added, for the runtime's life.
+- `PreStepDecision::Reject` ends the turn as `blocked`, with no step. A
+  listener that fails ends the turn as an error, or as aborted if the
+  turn was cancelled meanwhile. A panic ends it as an error too.
+- The loop stops waiting for the chain the moment the turn is cancelled.
+
+### The tool
+
+- **Its name, description and parameters are dsh's,** as `defineTool`
+  compiles them: one required string, `name`.
+- **A call runs dsh's steps in order:**
+  1. a name that isn't a skill name is `invalid skill name "X"`;
+  2. the lookup's `cwd` is the agent's working directory (`ensure`), and
+     its scope is the agent; a call with no agent looks up with neither;
+  3. a name the list doesn't hold is `skill "X" is unknown or no longer
+     available`;
+  4. a listed skill models may not invoke is `skill "X" is not available
+     for model invocation`, before its body is loaded;
+  5. the body is loaded, and checked again: gone is "unknown", and
+     model-disabled is "not available for model invocation".
+- **The result is the skill's `<skill_content>` block,** rendered by
+  `render_skill_content`, as dsh's `render` does. It goes back to the
+  model as the tool's result, and stays in the history like any other
+  result.
+- An error is `Error: <message>`, as dsh's tool layer shows a thrown
+  error.
+
+### The catalog
+
+The catalog is a user message, not a system-prompt section, as in dsh.
+Before each step the catalog listener:
+
+1. runs the rest of the chain, and passes a reject through;
+2. takes a snapshot of the registry for the agent; while any provider's
+   discovery is incomplete, it changes nothing, so the last good catalog
+   stands;
+3. makes the entries: each model-invocable skill's name, and its
+   description with whitespace runs folded to one space, trimmed, and cut
+   to `catalog_description_max_length` (500) with `...`;
+4. reads the session's history, newest first, for readable `skill-catalog`
+   messages: whether any was ever published, and the entries of the
+   newest one still on the surface;
+5. compares them, as dsh does:
+   - the visible catalog matches: a matching catalog already among the
+     step's messages is dropped;
+   - a catalog among the step's messages matches: it is kept;
+   - nothing was ever published and there are no entries: a stale
+     catalog among the step's messages is dropped, and nothing is added;
+   - otherwise a catalog is published, the first one or, after that, an
+     update, which replaces a stale one among the step's messages or is
+     added after them.
+
+- **The texts are dsh's:**
+  - the first catalog's `<system-reminder>` with its `<available_skills>`
+    block;
+  - the update's "The available skill catalog changed." with its two
+    availability lines;
+  - the empty update's tombstone lines.
+
+  Each entry line is ``- `name`: description``, with the description
+  escaped for the frame.
+- **The source is dsh's:** `{kind: "skill-catalog", form: "catalog",
+  entries}`, with `update: true` on a replacement. The entries are what
+  identify a catalog, never its prose.
+- **A readable catalog** has entries that are an array of objects, each
+  with a non-empty string name and a string description. Anything else
+  with the `skill-catalog` kind isn't a catalog, so a malformed seed can't
+  fail the step.
+- A catalog hidden by compaction is published again, as an update.
+
+### Invocations
+
+The invocation listener:
+
+1. runs the rest of the chain, and passes a reject through;
+2. scans the claimed messages whose source is `user`, text blocks only,
+   for dsh's `SKILL_GESTURE`: a `/`, at the start or after whitespace, a
+   skill name, then whitespace or the end;
+3. keeps each name once, in the order first seen;
+4. loads each name. A skill people may invoke joins the step as a user
+   message with dsh's `skill-invocation` source (`{kind, name, form:
+   "instructions"}`) and its `<skill_content>` block as the text. An
+   unknown name, or a skill people may not invoke, stays plain prose.
+
+The invocation listener is registered before the catalog listener, as in
+dsh. So it extends the list the catalog listener gave back, and an invoked
+skill comes after the catalog and every other message the hook added.
+
+The `/` is matched by hand. Whitespace is JavaScript's `\s`, which counts
+U+FEFF and not U+0085, where Rust's `char::is_whitespace` is the other way
+round. The catalog's whitespace folding uses the same rule.
+
+### The plugin
+
+- `ToolSkillPlugin` checks the config. A description cap below 3 fails
+  the start with `tool-skill: catalogDescriptionMaxLength must be an integer
+  greater than or equal to 3`.
+- It registers the tool, then the invocation listener, then the catalog
+  listener, all globally.
+- It requires the tool registry, the skill registry, the working
+  directory, the pre-step hooks and the session store.
+
+### The binary
+
+`ask` and `chat` mount `SkillsPlugin`, `SkillFilesystemPlugin` and
+`ToolSkillPlugin`, as dsh's base bundle mounts `skill`, `skill-filesystem`
+and `tool-skill` (`bundle/base/cordis.patch.yml`).
+
+- **The default roots are on,** with no config, as in dsh. A skill under
+  the project's `.dsh/skills` or `.agents/skills`, or the user's homes,
+  is in the catalog. `DSH_HOME`, `DSH_AGENTS_HOME` and
+  `DSH_BUNDLED_SKILL_DIR` move the homes and add a bundled root.
+- **Watching:**
+  - `chat` watches the roots, dsh's default, so a skill added during a
+    chat reaches its next step.
+  - `ask` doesn't, since one question has no next step.
+  - A watch that won't start leaves the catalog incomplete, and so leaves
+    it out, as in dsh. On this machine, whose inotify instances are used
+    up, `chat` should therefore show no catalog. This hasn't been tried
+    live.
+- **The usage text** explains skills and the three environment
+  variables.
+- **The CLI tests** point the three variables at a directory that doesn't
+  exist, so no test reads the real `~/.dsh` or `~/.agents`. The `ask`
+  request's tools now include `skill`.
+- A new CLI case runs `ask "/demo please"` in a temp project with
+  `.agents/skills/demo`. The request is then the question, the catalog,
+  the invoked skill, and the runtime context, in that order.
+
+### Tests
+
+- 29 integration tests, 2 unit tests, 2 loop tests for the pre-step hook,
+  and 1 CLI case.
+- The integration tests run on a real runtime: sessions, projections, the
+  system prompt, tools, models, the loop, the local filesystem, the
+  working directory, the skills, the filesystem provider over temp homes,
+  and this plugin.
+- dsh's `fireStep` and `proposeStep` become `PreStepHooks::run`, with what
+  enters appended to the session for `fireStep`.
+- Two cases go through the loop with a scripted model:
+  - the model reads the catalog and loads a skill with the tool;
+  - a person invokes one with `/demo`.
+
+### Left out
+
+- **Tool visibility.** dsh publishes the catalog only while the calling
+  agent resolves this plugin's own tool, so a restricted agent, or one
+  with a scoped tool named `skill`, gets no catalog. Karaka's tools have
+  no per-agent restriction or scoping yet, and a tool is never replaced,
+  so the tool is always visible and the catalog always published. The
+  two spec cases wait on per-agent tools.
+- **The abort signal.** dsh passes the step's signal to `ensure` and to
+  every registry lookup, and throws once it fires. A pre-step has a
+  cancel switch, and the loop drops the chain on a cancel, so the lookups
+  get no signal. The tool's calls have none either (see open ends). The
+  "forwards the step abort signal" case is skipped.
+- **The tool's output schema.** dsh's tool returns a structured value,
+  checks it against an output schema, and renders it. Karaka's tools
+  return text, so the rendered text is the result, and dsh's
+  `INVALID_TOOL_OUTPUT` for an unknown resource-base kind can't arise: a
+  resource base is a Rust enum. That case is skipped.
+- **`presentCall`** (`Load skill <name>`), with the rest of the
+  presentation layer.
+- **Dispose.** The kernel unloads no plugin, so the tool and listeners
+  stay.
+- **dsh's missing-event error** (`skill catalog cannot read seq …`): a
+  Karaka session's events have no holes.
+
+### Where it differs from dsh
+
+- **Catalogs are compared by their entries,** not by sha256 digests of
+  them. The result is the same.
+- **The history is scanned each step,** newest first, over a copy of the
+  session's events, as dsh's `eventAt` loop scans it.
+- **Message ids** are `skill-catalog-<n>` and `skill-invocation-<name>-<n>`,
+  with `n` the session's length, where dsh's `createUserMessage` makes
+  random ids.
+- **Runtime context.** dsh's end of the pre-step chain adds the
+  runtime-context snapshot to the step's messages. Karaka's loop logs it
+  with each attempt, after the step's messages. So the order in a request
+  is the same: the claimed messages, the catalog, an invoked skill, and
+  then the runtime context. But a listener never sees the snapshot.
+- **No `startsRequestSeries`** on the decision. It waits on compaction.
+- **Cutting a description.** dsh's `slice` counts UTF-16 units and can
+  split a surrogate pair. Here lengths are counted in UTF-16 units too,
+  but a character that would be split is dropped whole.

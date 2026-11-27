@@ -26,8 +26,11 @@ use karaka_session::{
 use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_session_projection::SessionProjectionsPlugin;
+use karaka_skill::SkillsPlugin;
+use karaka_skill_filesystem::{SkillFilesystemConfig, SkillFilesystemPlugin};
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tool_ask_user::{AskUserConfig, AskUserPlugin};
+use karaka_tool_skill::ToolSkillPlugin;
 use karaka_tool_todo::{TodoConfig, TodoToolPlugin};
 use karaka_tool_working_directory::WorkingDirectoryToolPlugin;
 use karaka_tools::{
@@ -52,9 +55,18 @@ const SHORT_RESULT: usize = 80;
 /// prompt, the tools and sessions, the sessions' projections, the host's
 /// files and each session's working directory with its tool, the todo
 /// tool, the user-questions service with the `ask_user_question` tool, the
-/// agent loop, and the retry plugin, which retries a failed request as the
-/// provider's policy says before the turn gives up.
-pub fn loop_plugins(config: Config, approvals: &Approvals) -> Vec<Box<dyn DynPlugin>> {
+/// skills with the `skill` tool, the agent loop, and the retry plugin,
+/// which retries a failed request as the provider's policy says before the
+/// turn gives up.
+///
+/// `watch_skills` says whether the skill roots are watched for changes, as
+/// dsh watches them by default: a chat's next step sees a skill added
+/// meanwhile. A single question has no next step to see one.
+pub fn loop_plugins(
+    config: Config,
+    approvals: &Approvals,
+    watch_skills: bool,
+) -> Vec<Box<dyn DynPlugin>> {
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
@@ -92,6 +104,21 @@ pub fn loop_plugins(config: Config, approvals: &Approvals) -> Vec<Box<dyn DynPlu
         policy: approvals.policy,
     })));
     plugins.push(Box::new(AskUserPlugin::new(AskUserConfig::default())));
+    // Skills, found on disk under dsh's default roots: the project's
+    // `.dsh/skills` and `.agents/skills`, then `~/.dsh/skills` and
+    // `~/.agents/skills`, as dsh's base bundle mounts `skill-filesystem`
+    // with no config (`bundle/base/cordis.patch.yml`). `DSH_HOME`,
+    // `DSH_AGENTS_HOME` and `DSH_BUNDLED_SKILL_DIR` move the homes, and add
+    // a bundled root. The model loads one with the `skill` tool, from the
+    // catalog each step is given, or a person with `/name` in a message.
+    plugins.push(Box::new(SkillsPlugin::default()));
+    plugins.push(Box::new(SkillFilesystemPlugin::new(
+        SkillFilesystemConfig {
+            watch: watch_skills,
+            ..SkillFilesystemConfig::default()
+        },
+    )));
+    plugins.push(Box::new(ToolSkillPlugin::default()));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
     plugins
@@ -157,7 +184,7 @@ impl PreExecuteListener for AskBefore {
 pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
     let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
     let sessions = config.sessions.clone();
-    let mut plugins = loop_plugins(config, &approvals);
+    let mut plugins = loop_plugins(config, &approvals, true);
     if let Some(root) = sessions.clone() {
         // The store's sessions kept as JSONL files under the root.
         plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root))));

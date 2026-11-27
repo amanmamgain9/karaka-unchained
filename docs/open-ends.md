@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-27, after skill-filesystem (step B of skills).
+Last updated 2026-11-27, after tool-skill (step C of skills).
 
 ## Needs you
 
@@ -18,7 +18,11 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
   `cargo test -p karaka-fs-local --test watch -- --nocapture` and
   `cargo test -p karaka-skill-filesystem --test filesystem the_real_watches -- --nocapture`.
   The skill provider's real-watch case has never run here; its scripted
-  watch cases do.
+  watch cases do. For the same reason `karaka chat` should show no
+  skill catalog here (not yet tried live): its watches won't start, so
+  the catalog is incomplete and left out, as dsh leaves it. `karaka ask`
+  doesn't watch, and its CLI test shows the catalog.
+  (Skills, step C)
 - **Directory listing order.** Karaka sorts names by their bytes, so
   capitals come first. dsh sorts by the machine's locale. Keep bytes, or
   switch to a case-insensitive sort that comes close to dsh. Skill
@@ -45,6 +49,10 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
 - **pi-ai's per-message effort markers** aren't ported. (Second audit)
 - **Assistant messages that stopped with an error** stay in the history
   sent to the model. (Second audit)
+- **The skill catalog scans the whole log each step.** It looks for the
+  newest catalog still on the surface over a copy of every event, as dsh
+  does. A long session would want the latest catalog kept as the log
+  grows. (Skills, step C)
 - **Piped answers aren't echoed.** With `printf '2\n' | karaka ask …`,
   the model's reply starts on the question's `> ` prompt line, because
   nothing ends that line. In a terminal, the Enter key does. The terminal
@@ -63,10 +71,12 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
     called by hand;
   - session-postgres will need a drain on dispose.
 - **Hooks.** Some exist as small registry ports: request errors, inbox
-  signals, prompt assembly listeners, the user-questions and approval
-  answerer chains, and the tool registry's `tools/pre-execute` gate.
-  Still missing: `tools/execute`, `tools/post-execute`, `agent/pre-step`,
-  `agent/turn-stopping`. (Kernel gaps)
+  signals, the pre-step hook, prompt assembly listeners, the
+  user-questions and approval answerer chains, and the tool registry's
+  `tools/pre-execute` gate. Still missing: `tools/execute`,
+  `tools/post-execute`, `agent/turn-stopping`. The pre-step decision has
+  no `startsRequestSeries`, which waits on compaction. (Kernel gaps;
+  Skills, step C)
 - **Tool guards.** dsh's registry runs monotonic guards (`ToolGuard`)
   after `tools/pre-execute`, which can only deny. They aren't ported.
   (Approvals, step B)
@@ -80,7 +90,11 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
   Life mounts `skill-filesystem` inside each preset, with
   `includeDefaultRoots: false` and `customSkillDirs: []`, plus guides that
   are SKILL.md files; that mount waits on presets too, and the plugin
-  registers globally until then. (Kernel gaps; Skills, steps A and B)
+  registers globally until then. dsh publishes the skill catalog only
+  while the agent resolves `tool-skill`'s own `skill` tool, so a
+  restricted agent, or one with a scoped tool of that name, gets none;
+  with no per-agent tools, Karaka always publishes it. (Kernel gaps;
+  Skills, steps A, B and C)
 - **A logger.** dsh warns on a torn log tail and a failed background
   batch. Karaka writes nothing, or prints to stderr. The skill registry
   keeps its warnings (ignored duplicates, skipped providers, panicking
@@ -101,8 +115,11 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
   dropped. An approval asked from a tool call is the same: it can't log
   `cancelled`, since the dropped future logs no `approval/decided`. The
   gate has no signal checks either, so dsh's "cancellation overtakes the
-  approval" result can't arise; a dropped call simply never runs. (The
-  ask_user_question tool; User approval; Approvals, step B)
+  approval" result can't arise; a dropped call simply never runs. The
+  `skill` tool's lookups, and the pre-step's catalog and invocation
+  lookups, get no signal either: the loop drops the pre-step chain on a
+  cancel. (The ask_user_question tool; User approval; Approvals, step B;
+  Skills, step C)
 - **Tool results carry text only.** dsh's also carry images, a
   structured error `{ name, code, reason }` (a gate denial's `info`
   included), presentation data and extra context for the next step. Play This Life shows its upgrade prompt on
@@ -145,7 +162,8 @@ Last updated 2026-11-27, after skill-filesystem (step B of skills).
   way to answer it later from `chat` (`UserQuestions::answer`), which
   isn't built. (The ask_user_question tool)
 - **No presentation layer.** `presentCall` and other card data for UIs
-  aren't ported. (The todo_write tool)
+  aren't ported, `skill`'s `Load skill <name>` among them. (The
+  todo_write tool; Skills, step C)
 
 ### Platform
 
@@ -173,7 +191,6 @@ From Play This Life's plugin list:
   service), `session-query-sqlite`, `storage`, `credentials-local`.
 - **Presets and personas:** `agent-preset`, `agent-preset-registry`,
   `persona`.
-- **Skills:** `tool-skill`.
 - **The rest:** `mcp-client`, `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 

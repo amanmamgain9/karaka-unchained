@@ -646,8 +646,11 @@ dependencies = [
  "karaka-session-jsonl",
  "karaka-session-persistence",
  "karaka-session-projection",
+ "karaka-skill",
+ "karaka-skill-filesystem",
  "karaka-system-prompt",
  "karaka-tool-ask-user",
+ "karaka-tool-skill",
  "karaka-tool-todo",
  "karaka-tool-working-directory",
  "karaka-tools",
@@ -863,6 +866,27 @@ dependencies = [
  "karaka-system-prompt",
  "karaka-tools",
  "karaka-user-questions",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-tool-skill"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "karaka-agent",
+ "karaka-agent-loop",
+ "karaka-fs-local",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-skill",
+ "karaka-skill-filesystem",
+ "karaka-system-prompt",
+ "karaka-tools",
+ "karaka-working-directory",
  "serde_json",
  "tokio",
 ]

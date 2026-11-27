@@ -3464,3 +3464,94 @@ async fn the_registry_finds_live_agents_without_making_them() {
     let other = harness.agents.open(SessionId::new("b1")).unwrap();
     assert_ne!(other.instance(), agent.instance());
 }
+
+/// Adds `notice` to every step, after what the rest of the chain gives,
+/// and keeps what it was proposed. (A dsh `agent/pre-step` listener.)
+struct Adds(Mutex<Vec<(u64, u64, Vec<String>)>>);
+
+impl karaka_agent::PreStepListener for Adds {
+    fn decide<'a>(
+        &'a self,
+        step: &'a karaka_agent::PreStep,
+        next: karaka_agent::PreStepNext<'a>,
+    ) -> karaka_agent::PreStepFuture<'a> {
+        Box::pin(async move {
+            self.0.lock().unwrap().push((
+                step.turn,
+                step.step,
+                step.messages
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect(),
+            ));
+            match next.run().await? {
+                karaka_agent::PreStepDecision::Enter { mut messages } => {
+                    messages.push(notice(&format!("added at {}", step.step)));
+                    Ok(karaka_agent::PreStepDecision::Enter { messages })
+                }
+                reject => Ok(reject),
+            }
+        })
+    }
+}
+
+// dsh's `agent/pre-step`: each step's claimed input is proposed, with its
+// turn and step, and what the chain enters with is what the step logs and
+// sends.
+#[tokio::test]
+async fn the_pre_step_hook_changes_what_enters_each_step() {
+    let harness = Harness::new(vec![text("one")]).await;
+    let heard = Arc::new(Adds(Mutex::new(Vec::new())));
+    harness
+        ._runtime
+        .get::<karaka_agent::PreStepHooks>()
+        .register(
+            None,
+            Arc::clone(&heard) as Arc<dyn karaka_agent::PreStepListener>,
+        );
+    harness.say("first").await;
+    assert_eq!(
+        *heard.0.lock().unwrap(),
+        [(1, 1, vec!["user-first".to_owned()])]
+    );
+    let logged: Vec<String> = harness
+        .events()
+        .into_iter()
+        .filter_map(|entry| match entry.event {
+            SessionEvent::UserMessage { message, .. } => Some(message.id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        logged.starts_with(&["user-first".to_owned(), "notice-added at 1".to_owned()]),
+        "{logged:?}"
+    );
+    let request = &harness.model.requests()[0];
+    assert!(shows(request, "added at 1"));
+}
+
+struct Rejects;
+
+impl karaka_agent::PreStepListener for Rejects {
+    fn decide<'a>(
+        &'a self,
+        _: &'a karaka_agent::PreStep,
+        _: karaka_agent::PreStepNext<'a>,
+    ) -> karaka_agent::PreStepFuture<'a> {
+        Box::pin(async { Ok(karaka_agent::PreStepDecision::Reject) })
+    }
+}
+
+// A rejected step ends its turn as `blocked`, with no step and no call.
+#[tokio::test]
+async fn a_rejected_step_blocks_the_turn() {
+    let harness = Harness::new(Vec::new()).await;
+    harness
+        ._runtime
+        .get::<karaka_agent::PreStepHooks>()
+        .register(None, Arc::new(Rejects));
+    harness.say("blocked").await;
+    assert_eq!(harness.endings(), [TurnEndReason::Blocked]);
+    assert!(!harness.types().iter().any(|kind| kind == "step/start"));
+    assert!(harness.model.requests().is_empty());
+}

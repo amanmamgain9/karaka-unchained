@@ -1,0 +1,35 @@
+[package]
+name = "karaka-tool-skill"
+description = "The skill tool, which loads a skill's instructions, and the session's skill catalog and /name invocations, added before each step"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that registers the tool and the listeners.
+karaka-kernel.workspace = true
+# The tool seam, and the schema the model sees.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+# The skills, as the calling agent sees them.
+karaka-skill.workspace = true
+# The calling agent, and the pre-step hook the catalog and invocations go
+# through.
+karaka-agent.workspace = true
+# The catalog's history in the session, and its messages.
+karaka-session.workspace = true
+# A lookup is for the calling agent's working directory.
+karaka-working-directory.workspace = true
+# The model's arguments, and the catalog's message source.
+serde_json = { workspace = true, features = ["preserve_order"] }
+
+[dev-dependencies]
+karaka-agent-loop.workspace = true
+karaka-fs-local.workspace = true
+karaka-session-projection.workspace = true
+karaka-skill-filesystem.workspace = true
+karaka-system-prompt.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
