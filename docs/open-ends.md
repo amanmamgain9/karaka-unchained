@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-27, after the `tools/pre-execute` gate and terminal approvals (step B of approvals).
+Last updated 2026-11-27, after the skill registry (step A of skills).
 
 ## Needs you
 
@@ -67,12 +67,17 @@ Last updated 2026-11-27, after the `tools/pre-execute` gate and terminal approva
   (Approvals, step B)
 - **Per-agent composition.** Each agent preset needs its own tools,
   prompt and skills, and main-agent's approval gate must fire only for
-  main-agent. Prompt contributions, answerers and `tools/pre-execute`
-  listeners can be scoped to one session, but tools can't yet. (Kernel
-  gaps)
+  main-agent. Prompt contributions, answerers, `tools/pre-execute`
+  listeners, skill providers and runtime skills can be scoped to one
+  session, but tools can't yet. A skill scope has no parent, so an agent
+  can't inherit its preset's skill layer, and dsh's re-parenting on
+  recompose has nothing to follow; both wait on presets. (Kernel gaps;
+  Skills, step A)
 - **A logger.** dsh warns on a torn log tail and a failed background
-  batch. Karaka writes nothing, or prints to stderr. (Durable sessions,
-  parts A and B)
+  batch. Karaka writes nothing, or prints to stderr. The skill registry
+  keeps its warnings (ignored duplicates, skipped providers, panicking
+  change listeners) for `SkillRegistry::warnings()`, until a logger takes
+  them. (Durable sessions, parts A and B; Skills, step A)
 
 ### The agent loop
 
@@ -157,7 +162,7 @@ From Play This Life's plugin list:
   service), `session-query-sqlite`, `storage`, `credentials-local`.
 - **Presets and personas:** `agent-preset`, `agent-preset-registry`,
   `persona`.
-- **Skills:** `skill`, `tool-skill`, `skill-filesystem`.
+- **Skills:** `skill-filesystem`, then `tool-skill`.
 - **The rest:** `mcp-client`, `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 

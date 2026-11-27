@@ -2692,3 +2692,101 @@ terminal approver and two options.
 - **Approval requires the tool registry.** The kernel has no optional
   port, so `ApprovalPlugin` requires `ToolRegistry` to install itself as
   the seam. dsh's registry takes `ctx.approval` when one is mounted.
+
+## Skills, step A: the registry
+
+`karaka-skill` ports dsh's `packages/skill/skill` (`index.ts`). The
+filesystem provider and the `skill` tool are steps B and C. Its API is
+shaped for them: the provider trait, the control's `invalidate` and
+signal, `snapshot` with `complete`, lookups by `cwd` and scope, and
+`render_skill_content`.
+
+### What is done
+
+- **The types**, with dsh's camelCase JSON where they serialize:
+  `SkillSummary`, `SkillCandidate`, `SkillDefinition`,
+  `SkillRegistration`, `SkillInvocationPolicy`, `SkillResourceBase`
+  (`directory`, `url`, `opaque`), `SkillCatalogSnapshot`,
+  `SkillProviderObservation` and `SkillLookupOptions`.
+  - The source is a string, with dsh's buckets as constants in `source`.
+  - `Invocable` gives `is_model_invocable` and `is_user_invocable` on
+    summaries, candidates and definitions.
+  - `is_skill_name` is dsh's `^[a-z0-9]+(?:-[a-z0-9]+)*$`, checked
+    without a regex.
+  - `BUNDLED_SKILL_RANK` is 600, and runtime skills rank 250.
+  - `render_skill_content` and `escape_text` produce dsh's output byte
+    for byte.
+- **The message source.** dsh declares `skill-invocation` on dsh-llm, not
+  `skill`: `{kind: "skill-invocation", name, form: "instructions"}`.
+  `skill_invocation_source(name)` builds it as a `UserSource::Other`, as
+  the other ports build theirs.
+- **The registry:**
+  - `register_provider(scope, create)` hands `create` a
+    `SkillProviderControl`. Its `invalidate` works only while that exact
+    registration is live, and its `signal` fires when the registration is
+    refused or removed. `runtime` is reserved, and a provider name is
+    unique per layer, with dsh's two messages.
+  - `register(scope, skill)` adds a runtime skill. A bad name or an empty
+    description is refused with dsh's text. A duplicate in the same layer
+    is warned of and gets a registration that removes nothing.
+  - Every change bumps the revision, drops the cache, and calls the
+    `on_change` listeners (dsh's `skills/change`). A panicking listener is
+    contained and warned of.
+  - `list`, `snapshot` and `get` take `SkillLookupOptions { cwd, signal,
+    scope }`. Providers get the same options.
+- **dsh's merge rules.** Within a layer, runtime skills come first in name
+  order, then providers in registration order. The lowest rank wins, then
+  the earliest registration, then the provider's own order; a lower
+  duplicate is warned of. Across layers, the scope's entry replaces the
+  global one whatever its rank.
+- **A failed provider** is skipped with dsh's warning, and the catalog is
+  incomplete and uncached. A candidate that breaks the contract (bad name,
+  empty description, non-finite rank, another provider's name) fails the
+  read with dsh's text.
+- **`get`:**
+  - `None` for an invalid name or an unknown skill.
+  - Cancellation is rechecked after the catalog, even a cached one, and
+    the load is raced against the signal.
+  - A load failure is `SkillError::Load` with the provider's message.
+  - The loaded definition is re-validated. One whose name changed gives
+    `None`, and invalidates only if its exact registration is still live.
+- **The cache** is keyed by `(cwd, scope, revision)` and holds at most
+  `collect_cache_max_entries`, 128 by default and at least 1, oldest out
+  first. A read whose revision changed while it ran tries once more, and
+  then gives its result uncached. A provider's incomplete observation is
+  listed and loadable but never cached.
+- **The plugin**, `SkillsPlugin`, provides `SkillRegistry`. It requires
+  nothing.
+- **Tests:** 35. They cover `skill.spec`'s cases, but for what is listed
+  below, plus the name rule, the source, `escape_text`, the
+  duplicate-name warning and the plugin.
+
+### Left out
+
+- **The type checks.** Candidates, definitions, invocation policies and
+  provider observations can't be the wrong type in Rust, so most of
+  dsh's validation and its "malformed" cases have nothing to check. What a
+  typed value can still get wrong is checked and tested.
+- **A factory that throws, or a failing Cordis effect.** A factory here
+  can't fail, and there are no effects.
+- **A hostile thrown value or abort reason.** A Rust error always
+  renders, and a Karaka signal has no reason. An abort is
+  `SkillError::Aborted`, "This operation was aborted", the web default.
+- **A rejecting async change listener.** Listeners are synchronous.
+- **Scope chains.** dsh's scope can have a parent (an agent inherits its
+  preset's layer), and a recompose re-parents it. Karaka's scope is a
+  session with no parent, so a view is the global layer plus that one.
+  This waits on presets (see open ends).
+- **HMR disposal.** It is a registration's `remove` here.
+
+### Where it differs from dsh
+
+- **Warnings are kept, not logged.** There is no logger, so the registry
+  keeps its last 256 warnings for `warnings()`. A provider failure's text
+  is `Error: <message>`, as dsh's `String(error)` gives for an `Error`.
+- **Registration takes the scope as an argument.** dsh files it by the
+  calling context's scope.
+- **A provider that panics** isn't contained, unlike a failing one: a
+  panic is a bug.
+- **Runtime skill bodies** are cloned when loaded. dsh hands back the
+  registered object itself.
