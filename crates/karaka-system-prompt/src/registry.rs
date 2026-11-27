@@ -61,6 +61,8 @@ impl SectionOrder {
 pub enum ContextOrder {
     /// The working-directory service's context.
     WorkingDirectory,
+    /// The approval service's policy line.
+    ApprovalPolicy,
 }
 
 impl ContextOrder {
@@ -68,6 +70,7 @@ impl ContextOrder {
     pub fn order(self) -> f64 {
         match self {
             Self::WorkingDirectory => 100.0,
+            Self::ApprovalPolicy => 115.0,
         }
     }
 }

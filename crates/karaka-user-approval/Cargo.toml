@@ -1,0 +1,31 @@
+[package]
+name = "karaka-user-approval"
+description = "Approvals: the answerer chain that decides whether an action may go ahead, its audit pair in the session log, and each session's approval policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that provides the service.
+karaka-kernel.workspace = true
+# The agent a request is for, and the inbox a policy switch's notice joins.
+karaka-agent.workspace = true
+# The audit and policy events, and the notice's message.
+karaka-session.workspace = true
+# The session's policy and whether a turn is open, folded from its log.
+karaka-session-projection.workspace = true
+# The policy line in the runtime context.
+karaka-system-prompt.workspace = true
+# The cancel a request carries: a cause-less signal, as dsh's
+# `AbortSignal`, the one `karaka-user-questions` uses.
+karaka-fs.workspace = true
+serde.workspace = true
+# `preserve_order`, so the events keep dsh's key order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# `macros` to race the answerers against the cancel.
+tokio = { workspace = true, features = ["macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }

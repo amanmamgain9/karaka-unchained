@@ -31,5 +31,6 @@ karaka-fs-local.workspace = true
 karaka-agent-loop.workspace = true
 karaka-model.workspace = true
 karaka-tools.workspace = true
+karaka-user-approval.workspace = true
 futures-core.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

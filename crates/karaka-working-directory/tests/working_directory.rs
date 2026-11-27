@@ -3,8 +3,8 @@
 //! `working-directory/tests/working-directory.spec.ts`, and the directory
 //! half of `admission.spec.ts`.)
 //!
-//! Deferred: the admission case's file-policy and approval lines, which
-//! need `dsh-sandbox-policy` and `dsh-user-approval`; the `working_directory`
+//! Deferred: the admission case's file-policy line, which needs
+//! `dsh-sandbox-policy`; the `working_directory`
 //! tool's case, which is a plugin of its own; and "refuses an Agent
 //! disposed during directory inspection", since Karaka's agents live as long
 //! as the runtime.
@@ -41,6 +41,9 @@ use karaka_system_prompt::{
     render_context_snapshot, render_prompt,
 };
 use karaka_tools::ToolsPlugin;
+use karaka_user_approval::{
+    ASK_SENTENCE, ApprovalConfig, ApprovalPlugin, ApprovalPolicy, ApprovalService,
+};
 use karaka_working_directory::{
     WorkingDirectory, WorkingDirectoryConfig, WorkingDirectoryError, WorkingDirectoryPlugin,
 };
@@ -287,6 +290,8 @@ struct Fixture {
     hooks: Arc<RequestErrorHooks>,
     model: Arc<Scripted>,
     wd: Arc<WorkingDirectory>,
+    /// With [`Options::approval`].
+    approval: Option<Arc<ApprovalService>>,
     _runtime: Runtime,
 }
 
@@ -298,6 +303,8 @@ struct Options {
     config: Option<ConfigOf>,
     include_runtime_context: bool,
     replies: Vec<Result<&'static str, ErrorKind>>,
+    /// Mounts the approval service with this default policy.
+    approval: Option<ApprovalPolicy>,
 }
 
 async fn start(dir: TempDir, options: Options) -> Result<Fixture, String> {
@@ -314,8 +321,12 @@ async fn start(dir: TempDir, options: Options) -> Result<Fixture, String> {
         Some(config) => config(&dir.root()),
         None => WorkingDirectoryConfig::default(),
     };
-    let runtime = Runtime::start(vec![
-        Box::new(SessionsPlugin),
+    let mut plugins: Vec<Box<dyn karaka_kernel::DynPlugin>> = Vec::new();
+    if let Some(policy) = options.approval {
+        plugins.push(Box::new(ApprovalPlugin::new(ApprovalConfig { policy })));
+    }
+    plugins.extend([
+        Box::new(SessionsPlugin) as Box<dyn karaka_kernel::DynPlugin>,
         Box::new(SessionProjectionsPlugin),
         Box::new(SystemPromptPlugin::new(SystemPromptConfig {
             include_harness_identity: false,
@@ -327,9 +338,8 @@ async fn start(dir: TempDir, options: Options) -> Result<Fixture, String> {
         Box::new(AgentLoopPlugin::new(LoopConfig::new(ROUTE, "mock-model"))),
         Box::new(FsPlugin(Arc::clone(&fs))),
         Box::new(WorkingDirectoryPlugin::new(config)),
-    ])
-    .await
-    .map_err(|error| {
+    ]);
+    let runtime = Runtime::start(plugins).await.map_err(|error| {
         let mut message = error.to_string();
         let mut source = std::error::Error::source(&error);
         while let Some(cause) = source {
@@ -354,6 +364,7 @@ async fn start(dir: TempDir, options: Options) -> Result<Fixture, String> {
         prompt: runtime.get::<SystemPrompt>(),
         hooks: runtime.get::<RequestErrorHooks>(),
         wd: runtime.get::<WorkingDirectory>(),
+        approval: options.approval.map(|_| runtime.get::<ApprovalService>()),
         model,
         dir,
         _runtime: runtime,
@@ -957,6 +968,7 @@ async fn a_notice_that_cant_be_queued_is_warned_and_the_change_stands() {
 /// request again.
 struct ChangeThenRetry {
     wd: Arc<WorkingDirectory>,
+    approval: Option<Arc<ApprovalService>>,
     agents: Arc<dyn Agents>,
     to: String,
     done: AtomicUsize,
@@ -970,14 +982,20 @@ impl RequestErrorHandler for ChangeThenRetry {
             }
             let agent = self.agents.open(error.session.id().clone())?;
             self.wd.set(agent.as_ref(), &self.to, None).await?;
+            if let Some(approval) = &self.approval {
+                approval.set_policy(agent.as_ref(), ApprovalPolicy::Ask)?;
+            }
             Ok(Some(RequestErrorAction::Retry))
         })
     }
 }
 
-// admission.spec: "admits current directory ... with optional context":
-// a change made after the step's assembly, here between two attempts of
-// its request, is what the next attempt shows.
+// admission.spec: "admits current directory and permissions with optional
+// context": a change made after the step's assembly, here between two
+// attempts of its request, is what the next attempt shows. The approval
+// policy switches from `never` to `ask` with the directory; its line is
+// optional context, so it shows only when optional context does. (The
+// file-policy line waits for the sandbox policy.)
 #[tokio::test]
 async fn a_request_shows_the_directory_as_it_is_when_it_is_sent() {
     for optional in [false, true] {
@@ -990,6 +1008,7 @@ async fn a_request_shows_the_directory_as_it_is_when_it_is_sent() {
                     Ok("first reply"),
                     Ok("notice received"),
                 ],
+                approval: Some(ApprovalPolicy::Never),
                 ..Options::default()
             },
         )
@@ -998,6 +1017,7 @@ async fn a_request_shows_the_directory_as_it_is_when_it_is_sent() {
         let selected = f.mkdir("selected");
         f.hooks.register(Arc::new(ChangeThenRetry {
             wd: Arc::clone(&f.wd),
+            approval: f.approval.clone(),
             agents: Arc::clone(&f.agents),
             to: selected.clone(),
             done: AtomicUsize::new(0),
@@ -1028,6 +1048,11 @@ async fn a_request_shows_the_directory_as_it_is_when_it_is_sent() {
         let retried = latest(&requests[1]);
         assert!(retried.contains(&current(&selected)), "{retried}");
         assert!(!retried.contains(&current(&f.root())), "{retried}");
+        assert_eq!(retried.contains(ASK_SENTENCE), optional, "{retried}");
+        assert!(
+            !retried.contains("Approval prompts are disabled"),
+            "{retried}"
+        );
         let session = f.session(agent.as_ref());
         assert_eq!(f.wd.get(&session), selected);
         assert_eq!(session.header().cwd.as_deref(), Some(f.root().as_str()));

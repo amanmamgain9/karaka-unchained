@@ -2489,3 +2489,104 @@ asks on the terminal.
 - **The CLI prints a step's text on a line of its own**, so an `ask` whose
   model asked a question prints a blank line before the answer. That is
   the printer's behaviour after any tool call.
+
+## User approval
+
+`karaka-user-approval` ports dsh's `packages/interaction/user-approval`
+(`types.ts` and `index.ts`). Nothing asks it yet: the `tools/pre-execute`
+gate that does is the next step.
+
+### What is done
+
+- **The types:**
+  - `ApprovalOutcome`: `allowed-once`, `rejected`, `cancelled` and
+    `unavailable`.
+  - `ApprovalRequestId`.
+  - `ApprovalPolicy`: `ask` or `never`. A string becomes one through
+    `FromStr` or serde, with dsh's `approval policy must be one of "ask"
+    or "never"`.
+  - `ApprovalRequest`: the agent, tool name, call id, reason, display
+    reason and signal.
+  - The three events' shapes: `ApprovalAsked`, `ApprovalDecided` and
+    `ApprovalPolicyChange`, the last with an optional `source:
+    "delegation"`.
+- **The events stay passthroughs.** The session crate already lists
+  `approval/asked`, `approval/decided` and `approval/policy` among v4's
+  known types, and keeps every plugin type it doesn't model as a
+  passthrough, as `todo/write` and `working-directory/change` are. So the
+  service writes them through serde structs, in dsh's key order, with no
+  surface op.
+- **`request`**, in dsh's order:
+  1. Refuse outside an open turn, with dsh's message, before anything is
+     logged.
+  2. Log `approval/asked` `{id, toolName, callId?, reason?}`.
+     `displayReason` goes to the answerers and is never logged.
+  3. Decide: an aborted signal gives `cancelled`; then `never` gives
+     `rejected`, before any answerer; then the chain, raced against the
+     signal.
+  4. Log `approval/decided` `{id, outcome}`.
+- **The answerer chain** is dsh's `approval/request` waterfall:
+  - `ApprovalAnswerer::answer(request, next)` answers or hands on.
+  - Answerers are global, or scoped to one session id, in registration
+    order, as `karaka-user-questions` does them.
+  - The end of the chain is `unavailable`.
+  - An answerer that returns an error, panics in its future, or panics
+    before returning one gives `unavailable`. dsh contains a throw,
+    synchronous or not, the same way.
+  - dsh also turns a value outside the vocabulary into `unavailable`. A
+    Rust answerer can't return one, because `ApprovalOutcome` is a closed
+    enum.
+- **The cancel** is `karaka-fs`'s `AbortSignal`, the type
+  `karaka-user-questions` uses. A fired signal wins the race (`biased`,
+  signal first), and the answerer's future is dropped, so its late answer
+  has nowhere to go. A tool call has no signal to hand on (see the open
+  end).
+- **Policy:**
+  - `set_approval_policy(session, policy)` appends `approval/policy`.
+  - The effective policy is the last override, else the config default,
+    `ask`.
+  - `set_policy(agent, policy)` does nothing if the policy is unchanged.
+    Otherwise it appends the event and injects dsh's notice: `The approval
+    policy changed from "…" to "…" (changed by the user).`, with source
+    `{kind: "user-approval"}`.
+- **A projection instead of a log scan.** dsh scans the log backwards on
+  every read, both for whether a turn is open and for the override. Here
+  a host-only projection, `ApprovalStateProjection` (key `approval`),
+  folds both, so neither a request nor the context line copies the log.
+- **The runtime context**: `approval:policy` at a new
+  `ContextOrder::ApprovalPolicy`, 115, with dsh's exact ASK and NEVER
+  sentences. An assembly for no agent, or for an agent with no session,
+  gets an empty string. Like dsh's, it is optional runtime context,
+  neither literal nor required.
+- **The plugin**, `ApprovalPlugin::new(ApprovalConfig { policy })`,
+  provides `ApprovalService`. It requires the session store, the session
+  projections and the system prompt.
+- **Tests:**
+  - `approval.spec`, but for what is listed below;
+  - a restored session keeps its override;
+  - working-directory's deferred approval half of `admission.spec`: the
+    policy switches from `never` to `ask` between two attempts of one
+    request, and the retried request shows `Approval policy: ask.` exactly
+    when optional context is on, and never the `never` sentence.
+
+### Left out
+
+- **The two observer-throw cases.** A Karaka `SessionListener` can't fail.
+- **"propagates an append failure".** A passthrough always fits the log,
+  so a test can't make that append fail. The service does propagate a
+  `LogError`.
+- **The rogue-value case.** The enum is closed.
+- **HMR disposal** of an answerer and of the context. The kernel unloads
+  nothing; a removed registration stands in for the answerer case.
+
+### Where it differs from dsh
+
+- **The request id** is `approval-{seq}`, after the session's length.
+  dsh's is a random UUID. It is still fresh per request in a session.
+- **The notice's message id** is `user-approval-{seq}`. dsh's is random.
+- **No session for the agent** is an error, `approval: no session "id"`.
+  dsh's agent always carries its session.
+- **A dropped request.** If the future of `request` is dropped
+  mid-question, `approval/asked` is logged with no `approval/decided`. In
+  dsh the signal ends it as `cancelled`. This waits on tool calls getting
+  a signal.

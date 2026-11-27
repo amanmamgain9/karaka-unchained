@@ -873,6 +873,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-user-approval"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent",
+ "karaka-fs",
+ "karaka-kernel",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-system-prompt",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-user-questions"
 version = "0.1.0"
 dependencies = [
@@ -906,6 +921,7 @@ dependencies = [
  "karaka-session-projection",
  "karaka-system-prompt",
  "karaka-tools",
+ "karaka-user-approval",
  "serde_json",
  "tokio",
 ]

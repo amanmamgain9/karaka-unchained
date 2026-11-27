@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-26, after the `ask_user_question` tool and the terminal answerer.
+Last updated 2026-11-27, after the user-approval service (step A of approvals).
 
 ## Needs you
 
@@ -58,9 +58,10 @@ Last updated 2026-11-26, after the `ask_user_question` tool and the terminal ans
     called by hand;
   - session-postgres will need a drain on dispose.
 - **Hooks.** Some exist as small registry ports: request errors, inbox
-  signals, prompt assembly listeners. Still missing: `tools/execute`,
-  `tools/pre-execute`, `tools/post-execute`, `agent/pre-step`,
-  `agent/turn-stopping`, `approval/request`. (Kernel gaps)
+  signals, prompt assembly listeners, and the user-questions and approval
+  answerer chains. Still missing: `tools/execute`, `tools/pre-execute`,
+  `tools/post-execute`, `agent/pre-step`, `agent/turn-stopping`. (Kernel
+  gaps)
 - **Per-agent composition.** Each agent preset needs its own tools,
   prompt and skills, and main-agent's approval gate must fire only for
   main-agent. Prompt contributions and answerers can be scoped to one
@@ -76,9 +77,12 @@ Last updated 2026-11-26, after the `ask_user_question` tool and the terminal ans
 - **`concludesTurn`**, which lets a tool end the turn. (Agent loop, step
   one)
 - **Tool calls have no cancel signal.** A cancelled call's future is
-  dropped. So `ask_user_question`'s request carries no signal, and an
-  answerer sees a cancel only as its own future being dropped. (The
-  ask_user_question tool)
+  dropped. Questions and approvals both take a `karaka-fs` `AbortSignal`,
+  but a tool has none to pass on. So `ask_user_question`'s request carries
+  no signal, and an answerer sees a cancel only as its own future being
+  dropped. An approval asked from a tool call is the same: it can't log
+  `cancelled`, since the dropped future logs no `approval/decided`. (The
+  ask_user_question tool; User approval)
 - **Tool results carry text only.** dsh's also carry images, a
   structured error `{ name, code, reason }`, presentation data and extra
   context for the next step. Play This Life shows its upgrade prompt on
@@ -88,7 +92,8 @@ Last updated 2026-11-26, after the `ask_user_question` tool and the terminal ans
 - **Inbox:** the `inserted` signal and the inbox's `replace` and `remove`
   aren't ported. (Agent inbox)
 - **Child agents.** There are none, so `DELEGATED_CALLER` in user
-  questions isn't checked. (User questions)
+  questions isn't checked, and no `approval/policy` with `source:
+  "delegation"` is seeded into a child. (User questions; User approval)
 - **`Agents::open` is synchronous.** (Durable sessions, part B)
 
 ### Sessions
@@ -131,9 +136,6 @@ Last updated 2026-11-26, after the `ask_user_question` tool and the terminal ans
 
 - **Sandbox policy.** File-write sandboxing, and the policy line in the
   runtime context. (Filesystem; Working directory)
-- **Approvals** (`user-approval`): the approval-policy line in the runtime
-  context, and the approval half of working-directory's admission test.
-  (Working directory)
 - **The filesystem observation policy:** the `fs/write-intent`,
   `fs/edit-intent` and `fs/observed` events. (Filesystem)
 - **Compaction.** It needs the context-overflow error, which exists now.
@@ -145,7 +147,6 @@ Last updated 2026-11-26, after the `ask_user_question` tool and the terminal ans
 
 From Play This Life's plugin list:
 
-- **Questions and approvals:** `user-approval`.
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.
 - **Presets and personas:** `agent-preset`, `agent-preset-registry`,
