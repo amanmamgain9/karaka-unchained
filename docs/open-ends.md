@@ -18,10 +18,10 @@ Last updated 2026-11-27, after tool-skill (step C of skills).
   `cargo test -p karaka-fs-local --test watch -- --nocapture` and
   `cargo test -p karaka-skill-filesystem --test filesystem the_real_watches -- --nocapture`.
   The skill provider's real-watch case has never run here; its scripted
-  watch cases do. For the same reason `karaka chat` should show no
-  skill catalog here (not yet tried live): its watches won't start, so
-  the catalog is incomplete and left out, as dsh leaves it. `karaka ask`
-  doesn't watch, and its CLI test shows the catalog.
+  watch cases do. For the same reason `karaka chat` shows no skill
+  catalog here (tried live: the model answered "none"): its watches
+  won't start, so the catalog is incomplete and left out, as dsh leaves
+  it. `karaka ask` doesn't watch, and a live `ask` loaded the skill.
   (Skills, step C)
 - **Directory listing order.** Karaka sorts names by their bytes, so
   capitals come first. dsh sorts by the machine's locale. Keep bytes, or
