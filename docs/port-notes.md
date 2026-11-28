@@ -5186,3 +5186,287 @@ this was the open end to close now.
 - **There is no transport disposal.**
 
 All six are in open ends.
+
+## HTTP ingress, step 4: browser access
+
+This step ports Karaka's `@karaka-ai/browser-auth` (`src/index.ts`) as
+`karaka-browser-auth`, and the server half of `transport-http`'s browser
+access (`browser-routes.ts`, `browser-socket.ts`, the browser parts of
+`index.ts` and `application.ts`'s `authorizeBrowser`) into
+`karaka-transport-http`. The HTTP ingress is complete.
+
+`browser.ts` is the browser's own client, which Play This Life's frontend
+imports from `@karaka-ai/transport-http`. It stays TypeScript. Its frames
+are the contract the server here speaks, and they are matched to it.
+`@karaka-ai/sdk` has no browser client.
+
+### Credentials (`karaka-browser-auth`)
+
+- **The choice: ring plus a small SPKI parse, not a JWT crate.**
+  - jose's `jwtVerify` makes many checks. A JWT crate makes its own, with
+    defaults that differ: leeway, `nbf` handling, accepted algorithms. So
+    the checks are written here, one for one, and ring only verifies
+    signatures.
+  - **Cost: no new crates.** ring is already in the tree. The new code is
+    a DER reader for SPKI (about 100 lines) and base64.
+  - **Verifiers:** ES256 is ring's `ECDSA_P256_SHA256_FIXED` (JOSE's raw
+    `r || s`), RS256 is `RSA_PKCS1_2048_8192_SHA256`, and EdDSA is
+    `ED25519`.
+- **Keys** (`importSPKI`):
+  - a `PUBLIC KEY` PEM, else jose's `"spki" must be SPKI formatted string`;
+  - the key type must be the algorithm's: P-256 `ecPublicKey` for ES256,
+    `rsaEncryption` for RS256, Ed25519 for EdDSA;
+  - an RSA key under 2048 bits gets jose's `RS256 requires key
+    modulusLength to be 2048 bits or larger`, at import rather than at
+    verify;
+  - Ed448 has no ring verifier (open ends);
+  - duplicate ids get Karaka's `browser-auth: verification key ids must be
+    unique`.
+
+  Every key imports before the service is provided, so a bad one fails
+  the start.
+- **`jwtVerify`, check for check, with Karaka's options:**
+  - three compact segments, base64url;
+  - a JSON-object protected header;
+  - `crit` only as `["b64"]`, and an unencoded payload refused (`JWTs MUST
+    NOT use unencoded payload`);
+  - `alg` among the configured keys' algorithms;
+  - Karaka's resolver: the `kid`'s key, with exactly its algorithm;
+  - the signature over `protected.payload`;
+  - a JSON-object payload.
+- **`validateClaimsSet`, with no clock tolerance:**
+  - required presence, which a JSON `null` passes, for Karaka's claims
+    plus jose's `iss`, `aud` and `iat`;
+  - `iss` equal;
+  - `aud` a string equal to the audience, or an array holding it;
+  - `iat`, `nbf` and `exp` numbers if present;
+  - `nbf` not after now;
+  - `exp` after now;
+  - `iat` not in the future;
+  - age at most `maxTokenAgeSeconds`.
+
+  "Now" is epoch seconds, floored.
+- **Karaka's post-checks:**
+  - `applicationId` is this deployment's;
+  - `tenantId`, `userId` and `chatId` are non-empty strings;
+  - finite `exp` after `iat`, by at most `maxTokenAgeSeconds`.
+- **Results.** Every failure is no caller. jose's JOSE errors are the
+  only failures verification has, so there is no thrown case.
+  `check(token, now)` says which of jose's error classes failed, for
+  tests. `BrowserCaller` has `owner`, `chat_id`, and `expires_at` in ms.
+- **The config.** `BrowserAuthConfig::from_json` reads Karaka's row:
+  - `applicationId`, `issuer`, `audience`;
+  - `maxTokenAgeSeconds`, 1 to 2147483;
+  - `keys`, at least one, each with an `id`, `algorithm` and SPKI PEM
+    `publicKey`.
+
+  `BrowserAuthPlugin` provides `BrowserAuthentication`.
+
+### The WebSocket (`ws.rs`): hand-rolled, not tokio-tungstenite
+
+- **Why:** tungstenite isn't in the tree, and the server side of RFC 6455
+  that `ws` exercises fits in one file with every case visible.
+- **Cost: no new crates.** SHA-1 for the accept key comes from ring.
+- **What it does:**
+  - the handshake: `Sec-WebSocket-Accept`, and ws's key check
+    `/^[+/0-9A-Za-z]{22}==$/`;
+  - versions 13 and 8, else 400 `Bad Request`, as ws's `abortHandshake`;
+  - masked client frames;
+  - fragmentation;
+  - ping answered with pong;
+  - the close handshake: the peer's close is echoed, and a close is sent
+    then the peer's reply awaited, up to ws's 30 s;
+  - close codes validated;
+  - the payload limit, `maxPayload` = `maxBodyBytes`, counted over a
+    message's data frames: 1009 with no reason, as ws closes;
+  - invalid UTF-8 is 1007;
+  - protocol errors are 1002.
+- **What it leaves out:** `perMessageDeflate`, which ws's server leaves off
+  by default.
+- **"Terminate"** drops the connection with no close frame, which a client
+  sees as 1006.
+- **Cancel safety:** frames are read by a task of their own, so a frame is
+  never cut mid-read.
+
+### The browser routes (`browser.rs`)
+
+- **`BrowserConfig`** holds `browserPath`, `browserOrigins`,
+  `browserAgentIds`, `browserMethods` (default all six), `browserEvents`
+  (default both) and `browserHeartbeatMs` (default 15000).
+  - Karaka's checks keep their errors: `Browser transport requires
+    explicit origins`, `Browser transport requires explicit Agent
+    presets`, `Browser and backend paths must be disjoint`,
+    `browserHeartbeatMs must be a positive safe integer`.
+  - An unknown method or event is refused too, where Zod's enum refuses
+    it.
+- **HTTP, in Karaka's order:**
+  1. 503 `STARTING`.
+  2. An `Origin` that isn't listed is 403 `ORIGIN_FORBIDDEN`. Every later
+     answer carries `access-control-allow-origin: <origin>` and `vary:
+     Origin`.
+  3. `OPTIONS` answers 204, with `access-control-allow-methods: POST` and
+     `access-control-allow-headers: authorization,content-type`.
+  4. The `Authorization` bearer (the server-auth parse) must verify, else
+     401 `UNAUTHORIZED` `Invalid browser credential`.
+  5. Anything but `POST` is 405 `METHOD_FORBIDDEN` `POST required`.
+  6. The body, at most `maxBodyBytes`.
+  7. Then `events`, `result`, or a mounted method. Anything else is 403
+     `METHOD_FORBIDDEN` `Browser method is unavailable`.
+- **Results and failures:**
+  - a result is `{"ok":true,"value":…}`;
+  - a failure is `{"ok":false,"error":{"code","message","details":{}}}`;
+  - `forbidden` and `CHAT_FORBIDDEN` are 403 `gateway/forbidden`;
+  - `BAD_REQUEST` is 400 `gateway/bad-request`;
+  - anything else is 500 `gateway/internal` `Browser operation failed`.
+- **The methods** take the owner from the signed claims:
+  - `applicationAgents`: the agents, filtered to `browserAgentIds`;
+  - `applicationCreate`;
+  - `applicationPrompt`;
+  - `applicationHistory`: the raw stored events, not projected;
+  - `applicationCancel`;
+  - `applicationFollow`: SSE of `{ok, value}` frames.
+
+  Their bodies are the SDK schemas without `tenantId` and `userId`,
+  strict, so an owner field is 400.
+- **`authorizeBrowser`** (controller), called by `prepare` for every
+  browser request:
+  - the caller's signed chat must be the target, and its owner the
+    address's (`Browser credential does not authorize this chat`);
+  - a known owner must be the caller (`Chat is owned by another caller`);
+  - a requested preset must be allowed (`Browser Agent preset is
+    unavailable`);
+  - the stored and live headers must be a root of an allowed preset
+    (`Browser target is not an allowed root chat`);
+  - another preset is `session/conflict`.
+- **Follow frames** are `application.ts`'s `FollowFrame`:
+  - `{ type: 'snapshot', header, hasMore: false, projections: { asOfSeq,
+    values: {} }, cursor, records: [{ type: 'event', event }] }`;
+  - `{ type: 'event', event }`;
+  - `{ type: 'text-delta', cursor, text }`.
+
+  Events are their stored v4 JSON, and the header is dsh's in-memory
+  shape with `version` (open ends: its key order).
+- **Interactions:**
+  - With `browserEvents`, the transport is an approval answerer and a
+    question answerer, registered before the backend one, as Karaka
+    prepends them.
+  - A request from a root of an allowed preset with an application owner
+    goes to that owner's channels on that chat:
+    - `{ type: 'interaction', eventId, chatId, event, request }`;
+    - an approval's request is `{ agent: { id }, toolName, reason?, callId?
+      }`;
+    - a question's is `{ agent: { id }, questions }`.
+  - With no recipient it goes down the chain. A recipient's `result`
+    either answers (an approval outcome, or a strict answer), or
+    delegates, and once every recipient has delegated the chain goes on.
+  - However it ends, every channel of the chat and owner gets `{ type:
+    'cancel', eventId }`.
+  - A cancelled request is `Interaction cancelled`.
+  - A channel that leaves stays out of `recipients`, and a pending
+    interaction replays to the same owner and chat when they join again.
+- **`result`** checks, before and after authorizing the chat:
+  - the channel by `clientId`, its owner and chat the caller's;
+  - the interaction's chat and owner;
+  - that the channel is a recipient.
+
+  Else 403 `CHAT_FORBIDDEN` (`Interaction is unavailable to this caller`).
+  An invalid value is 400. It answers `{"ok":true,"value":null}`.
+- **`events`**: SSE of the channel's events, opening with `{ type:
+  'ready', clientId, host: { home } }`, where `home` is `$HOME`, as
+  `os.homedir()` reads it.
+- **The socket** at `<browserPath>/socket`:
+  - **Refusals:** 503 while starting; 403 for an unlisted or missing
+    origin, both with `connection: close`; then ws's handshake checks.
+  - **Authentication:**
+    - the first message must be `hello` within two heartbeats, else 4401
+      `Authentication timed out`;
+    - a bad credential is 4401 `Invalid browser credential`;
+    - a refused admission is 4403 `Chat access is forbidden` or 4500
+      `Browser operation failed`;
+    - then `ready` with `heartbeatMs`, and pending interactions.
+  - **Messages** are checked strictly:
+    - `hello`, `follow { id, chatId }`, `stop { id }`, `pong`;
+    - a binary frame, bad JSON or an unknown type is 4400 `Invalid
+      message`;
+    - another message before or during authentication is 4400
+      `Authenticate first`;
+    - a second `hello` is 4400 `Already authenticated`;
+    - a reused follow id is 4400 `Duplicate follow id`.
+  - **Follows** send `{ type: 'frame', id, result: { ok, value } }` frames
+    from the snapshot on, failures as `result: { ok: false, error }`. Then
+    `{ type: 'end', id }`, which `stop` also produces. A disabled
+    `applicationFollow` is a `gateway/forbidden` frame.
+  - **Heartbeat.** Every `browserHeartbeatMs` the server sends `{ type:
+    'ping' }`. A client that sent no message during the interval is
+    terminated. The timers are polled first, so a hello timer due with a
+    heartbeat wins, as Node fires the earlier-made one.
+  - **Expiry** closes with 4401 `Browser credential expired`.
+  - A socket closed during admission never becomes a recipient: its
+    admission is dropped with it.
+
+### The binary
+
+- **A `browser-auth` row** (or `@karaka-ai/browser-auth`) takes Karaka's
+  config, PEM included, and its keys import when the file is read.
+- **The `application-http` row's browser fields** are read, checked and
+  mounted. The step 3 warning is gone.
+- **`browserPath` needs a `browser-auth` row.** This is checked when the
+  file is read. Karaka would instead answer each browser request 500
+  (`Browser authentication is not configured`).
+- **The usage text** describes both.
+
+### Tests
+
+- **22 new.**
+- **`karaka-browser-auth`, 7**, from `authentication.spec.ts`:
+  - the owner, chat and expiry;
+  - the 13 denied claims, plus `nbf`, a non-number `iat`, and an audience
+    array;
+  - the exact chat;
+  - malformed tokens, an unknown kid, another key's signature, no kid,
+    `alg: none`, an unknown `crit`, an unencoded payload, an array
+    payload;
+  - duplicate ids and invalid keys;
+  - RS256, Ed25519 and a kid for another algorithm;
+  - the row config.
+
+  RS256 uses a token signed once offline. Its private key was not kept
+  (`tests/fixtures/README`).
+- **`karaka-transport-http`, 14**, over loopback HTTP and a real
+  WebSocket (the client is the same codec, masking):
+  - origins, preflight, credentials, POST only, and an unknown method;
+  - signed owners: refused owner fields, another chat, another preset,
+    prompt, raw history, cancel, `result` for a missing interaction, a
+    foreign user;
+  - the HTTP follow's full snapshot frame;
+  - a disabled method, over HTTP and the socket;
+  - the config's checks;
+  - socket refusals while starting and from other origins;
+  - first messages, credentials, a repeated hello, and a forbidden chat;
+  - 1009;
+  - follows through a live prompt, stop, and a duplicate id;
+  - ping and pong, and a silent client terminated;
+  - the hello timeout and expiry;
+  - a question delivered, replayed after reconnecting, a bad answer, a
+    foreign user, answered once, cancelled; then an approval in an open
+    turn, an invalid outcome, `allowed-once`, cancelled;
+  - a question waiting until both `events` channels delegate;
+  - the socket's client-message parse.
+- **CLI, 1:** `karaka serve` with a `browser-auth` row and an ES256 key.
+  A browser creates its chat over HTTP, follows it over the socket,
+  prompts, and reads the text deltas to `turn/end`.
+- **Skipped,** with reasons in each file's header:
+  - `browser.spec.ts`, the browser's client;
+  - disposal;
+  - the controller-stub failures;
+  - the absent Node request URL;
+  - a JSON operation cut at expiry.
+
+### Where it differs from Karaka
+
+- **Ed448 keys aren't taken** (open ends).
+- **A short RSA key fails at import.**
+- **A JSON browser operation runs to its end** past expiry (open ends).
+- **A missing `browser-auth` row fails the start.**
+- **Unknown methods or events in the config are refused** when the file
+  is read.

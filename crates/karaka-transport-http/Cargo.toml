@@ -14,6 +14,11 @@ karaka-startup.workspace = true
 # Who calls, and who owns each chat.
 karaka-server-auth.workspace = true
 karaka-identity.workspace = true
+karaka-browser-auth.workspace = true
+# The browser routes answer approvals for browser-owned chats.
+karaka-user-approval.workspace = true
+# An interaction's cancel signal.
+karaka-fs.workspace = true
 # The agents, their presets, their default model and the registry it
 # names.
 karaka-agent.workspace = true
@@ -33,13 +38,14 @@ bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "io-util", "time"] }
 # Random interaction and message ids, as `randomUUID`; already in the tree
 # through rustls.
 ring = "0.17"
 
 [dev-dependencies]
 futures-core.workspace = true
+karaka-user-approval.workspace = true
 karaka-agent-loop.workspace = true
 karaka-session-jsonl.workspace = true
 karaka-session-projection.workspace = true

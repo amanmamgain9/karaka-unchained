@@ -95,8 +95,16 @@ KARAKA_PLUGINS names a YAML list of global plugin rows, each with a name
                        handleQuestions (true), maxBodyBytes (1048576).
                        It needs a server-auth row, whose chatCredential
                        the application server sends, and KARAKA_SESSIONS.
-                       Its browser fields are checked, then not mounted:
-                       browser access comes later
+                       With browserPath, browsers reach the chat their
+                       credential names there, over HTTP and a WebSocket
+                       at <browserPath>/socket: browserOrigins and
+                       browserAgentIds are required; browserMethods,
+                       browserEvents and browserHeartbeatMs (15000)
+                       are optional
+  browser-auth         the browser credentials' verifier: applicationId,
+                       issuer, audience, maxTokenAgeSeconds, and keys,
+                       each an id, an algorithm (ES256, RS256 or EdDSA)
+                       and an SPKI PEM publicKey
 Karaka's package names, such as @karaka-ai/mcp-application, work too.
 An application's tools reach a session only when the application owns
 it (KARAKA_APPLICATION_ID and the rest), and only the names both its

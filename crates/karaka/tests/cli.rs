@@ -2336,3 +2336,215 @@ fn an_application_http_row_needs_stored_sessions() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An ES256 key, and its SPKI PEM.
+fn browser_key() -> (ring::signature::EcdsaKeyPair, String) {
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+    let key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let mut der = vec![
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+    der.extend_from_slice(key.public_key().as_ref());
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        karaka_browser_auth::encode_standard(&der)
+    );
+    (key, pem)
+}
+
+/// A browser credential for `chat`, signed with `key` as `browser-1`.
+fn browser_token(key: &ring::signature::EcdsaKeyPair, chat: &str) -> String {
+    use karaka_browser_auth::encode_url;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({
+        "applicationId": "app", "tenantId": "tenant", "userId": "user", "chatId": chat,
+        "iss": "https://app.example", "aud": "karaka", "iat": now, "exp": now + 300,
+    });
+    let message = format!(
+        "{}.{}",
+        encode_url(
+            serde_json::json!({ "alg": "ES256", "kid": "browser-1" })
+                .to_string()
+                .as_bytes()
+        ),
+        encode_url(claims.to_string().as_bytes())
+    );
+    let signature = key
+        .sign(&ring::rand::SystemRandom::new(), message.as_bytes())
+        .unwrap();
+    format!("{message}.{}", encode_url(signature.as_ref()))
+}
+
+// `serve` with browser access: a browser holding an application-signed
+// ES256 credential creates its chat over HTTP, follows it over the
+// WebSocket, prompts it, and reads the answer's frames.
+#[test]
+fn serve_drives_a_browser_chat_over_the_socket() {
+    use std::io::BufRead;
+
+    let dir = scratch("serve-browser");
+    let (key, pem) = browser_key();
+    let indented: String = pem
+        .lines()
+        .map(|line| format!("          {line}\n"))
+        .collect();
+    std::fs::write(
+        dir.join("plugins.yml"),
+        format!(
+            "- name: server-auth\n  config:\n    applications: [{{ id: app, chatCredential: APP_CHAT, toolCredential: APP_TOOLS }}]\n\
+             - id: browser-auth\n  config:\n    applicationId: app\n    issuer: https://app.example\n    audience: karaka\n    maxTokenAgeSeconds: 1800\n    keys:\n      - id: browser-1\n        algorithm: ES256\n        publicKey: |\n{indented}\
+             - id: application-http\n  config:\n    path: /v1\n    handleQuestions: false\n    browserPath: /karaka/browser\n    browserAgentIds: [main]\n    browserOrigins: [https://app.example]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("presets.yml"), "- id: main\n  name: Main agent\n").unwrap();
+    let (address, model) = serve(vec![streamed(&anthropic_text("Hello browser."))]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_karaka"));
+    command
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in VARIABLES {
+        command.env_remove(name);
+    }
+    let nowhere = std::env::temp_dir().join(format!("karaka-cli-no-skills-{}", std::process::id()));
+    for name in ["DSH_HOME", "DSH_AGENTS_HOME", "DSH_BUNDLED_SKILL_DIR"] {
+        command.env(name, nowhere.join(name));
+    }
+    command
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{address}"))
+        .env("KARAKA_PORT", "0")
+        .env("KARAKA_PLUGINS", dir.join("plugins.yml"))
+        .env("KARAKA_PRESETS", dir.join("presets.yml"))
+        .env("KARAKA_SESSIONS", dir.join("sessions"))
+        .env("APP_CHAT", "chat-secret");
+    let mut child = command.spawn().expect("the binary runs");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    let origin = line
+        .trim()
+        .strip_prefix("karaka: listening on http://")
+        .unwrap_or_else(|| panic!("{line:?}"))
+        .to_owned();
+    let token = browser_token(&key, "chat-1");
+
+    let browser_post = |method: &str, body: &Value| -> (u16, String) {
+        let body = body.to_string();
+        let mut socket = TcpStream::connect(&origin).unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST /karaka/browser/{method} HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).unwrap();
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        (
+            head.split(' ').nth(1).unwrap().parse().unwrap(),
+            body.to_owned(),
+        )
+    };
+    assert_eq!(
+        browser_post(
+            "applicationCreate",
+            &serde_json::json!({ "chatId": "chat-1", "agentId": "main" })
+        ),
+        (
+            200,
+            r#"{"ok":true,"value":{"chatId":"chat-1","agentId":"main"}}"#.to_owned()
+        )
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (text, kinds) = runtime.block_on(async {
+        use karaka_transport_http::ws::{self, Incoming, Reader};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(&origin).await.unwrap();
+        stream
+            .write_all(b"GET /karaka/browser/socket HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&head));
+        let (read, mut write) = tokio::io::split(stream);
+        let mut reader = Reader::new(read, false, 1 << 24);
+        let mut send = async |message: Value| {
+            let frame = ws::encode(ws::OP_TEXT, message.to_string().as_bytes(), Some([7, 7, 7, 7]));
+            write.write_all(&frame).await.unwrap();
+        };
+        let mut next = async || -> Value {
+            loop {
+                if let Ok(Incoming::Text(text)) = reader.read().await {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+        };
+        send(serde_json::json!({ "type": "hello", "credential": token })).await;
+        let ready = next().await;
+        assert_eq!(ready["type"], "ready", "{ready}");
+        send(serde_json::json!({ "type": "follow", "id": "f", "chatId": "chat-1" })).await;
+        let snapshot = next().await;
+        assert_eq!(snapshot["result"]["value"]["type"], "snapshot", "{snapshot}");
+        let prompt = serde_json::json!({ "chatId": "chat-1", "requestId": "browser-1", "content": [{ "type": "text", "text": "Hi from the browser" }] });
+        assert_eq!(
+            browser_post("applicationPrompt", &prompt),
+            (200, r#"{"ok":true,"value":{"accepted":true,"duplicate":false}}"#.to_owned())
+        );
+        let mut text = String::new();
+        let mut kinds = Vec::new();
+        loop {
+            let frame = next().await;
+            if frame["type"] == "ping" {
+                send(serde_json::json!({ "type": "pong" })).await;
+                continue;
+            }
+            let value = &frame["result"]["value"];
+            if value["type"] == "text-delta" {
+                text.push_str(value["text"].as_str().unwrap());
+            }
+            let kind = value["event"]["type"].as_str().unwrap_or(value["type"].as_str().unwrap()).to_owned();
+            kinds.push(kind.clone());
+            if kind == "turn/end" {
+                break;
+            }
+        }
+        (text, kinds)
+    });
+    assert_eq!(text, "Hello browser.");
+    assert!(kinds.contains(&"assistant/message".to_owned()), "{kinds:?}");
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(status.success(), "{rest}");
+    let sent = model.join().expect("the model ran");
+    assert!(sent[0].contains("Hi from the browser"), "{}", sent[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

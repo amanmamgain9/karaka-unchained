@@ -17,6 +17,7 @@ use karaka_agent::{AgentComposition, Agents, ModelSelection};
 use karaka_agent_default_model::AgentDefaultModelPlugin;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
+use karaka_browser_auth::BrowserAuthPlugin;
 use karaka_credentials::CredentialsPlugin;
 use karaka_fs_local::LocalFsPlugin;
 use karaka_identity::{
@@ -259,15 +260,15 @@ pub fn loop_plugins(
         ));
         // The ingress admits requests only once every plugin has started.
         plugins.push(Box::new(KarakaStartupPlugin));
-        if let Some((transport, warnings)) = global.transport {
+        if let Some(auth) = global.browser_auth {
+            plugins.push(Box::new(BrowserAuthPlugin::new(auth)));
+        }
+        if let Some(transport) = global.transport {
             if !persist {
                 return Err(format!(
                     "{}: the application-http row needs KARAKA_SESSIONS: a chat is acknowledged once it is stored",
                     global.at
                 ));
-            }
-            for warning in warnings {
-                eprintln!("karaka: {warning}");
             }
             plugins.push(Box::new(SessionQueryPlugin::with_persistence()));
             plugins.push(Box::new(AgentDefaultModelPlugin::new(default_model)));

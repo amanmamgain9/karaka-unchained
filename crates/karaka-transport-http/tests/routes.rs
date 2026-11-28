@@ -79,6 +79,7 @@ async fn bad_bodies_and_path_escapes_are_refused() {
             path: "/api".into(),
             max_body_bytes: 128,
             handle_questions: false,
+            browser: None,
         },
         ..Options::default()
     })

@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the application chat routes (step 3 of the HTTP ingress).
+Last updated 2026-11-28, after browser access (step 4, the last of the HTTP ingress).
 
 ## Needs you
 
@@ -280,12 +280,24 @@ Last updated 2026-11-28, after the application chat routes (step 3 of the HTTP i
 
 ### HTTP ingress
 
-- **The plan.** Steps 1 to 3 are built: the webserver and `karaka
-  serve`, the identity lifecycle and the startup gate, and the
-  application chat routes. Still to do: step 4, browser access:
-  `browser-auth` (ES256 JWT) and `transport-http`'s `browser*.ts` routes
-  and WebSocket. An `application-http` row's browser fields are checked
-  and left unmounted, with a warning. (HTTP ingress, steps 1 to 3)
+- **The browser's `ready` frame names the server's home directory.**
+  `{"type":"ready",…,"host":{"home":"/home/…"}}` goes to every
+  authenticated browser, as Karaka's `browser-routes.ts` sends
+  `homedir()`. Ported as is; a browser likely needs no server path, so
+  dropping or blanking it needs your call, and Play This Life's frontend
+  should be checked for a reader first. (HTTP ingress, step 4)
+- **Ed448 browser keys.** jose's `EdDSA` takes Ed25519 and Ed448 keys;
+  ring verifies Ed25519 only, so an Ed448 key fails the start. (HTTP
+  ingress, step 4)
+- **A browser operation outlives its credential.** Karaka aborts a
+  browser request and destroys its response when the credential
+  expires. Here a browser SSE stream, the `events` channel and a follow,
+  ends at expiry, and the socket closes with 4401; a JSON operation,
+  which is short, runs to its end. (HTTP ingress, step 4)
+- **The browser snapshot's header key order.** A browser follow's
+  snapshot carries dsh's in-memory `SessionHeader`, written here in the
+  stored header's key order (`version`, `id`, `createdAt`, …), which dsh's
+  in-memory object is assumed to share. (HTTP ingress, step 4)
 - **Images in application prompts.** A prompt with an image part is
   refused (`Image attachments are unavailable`, 400), as Karaka's
   controller refuses one without an attachment store. Admitting them
@@ -316,10 +328,11 @@ Last updated 2026-11-28, after the application chat routes (step 3 of the HTTP i
   `saveSelection` writes it back through the config editor. Both wait on
   dsh's settings service. (HTTP ingress, step 3)
 - **Transport disposal.** Karaka rejects pending questions with `Karaka
-  HTTP transport was disposed` and closes their streams when the plugin
+  HTTP transport was disposed` (`Browser transport disposed` for the
+  browser's), and closes their streams and sockets, when the plugin
   unloads. The kernel unloads nothing; `serve` closes every connection
-  on shutdown, and a question still pending is cut with its process.
-  (HTTP ingress, step 3)
+  on shutdown, and an interaction still pending is cut with its process.
+  (HTTP ingress, steps 3 and 4)
 - **The webserver's TLS listener.** dsh's `tls` (`certFile`, `keyFile`),
   read once before binding, and `protocol` `https:`, aren't ported.
   Karaka's own profile sets no `tls`, and a deployment terminates TLS in
@@ -369,13 +382,11 @@ From Play This Life's plugin list:
   `karaka-credentials`).
 - **The rest:** `mcp-resources`, `session-reference` (and Karaka's
   owner-aware resolver over it),
-  `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
-  `browser-auth` with `transport-http`'s browser routes (HTTP ingress,
-  step 4).
+  `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 - **Play This Life's own global rows** that `KARAKA_PLUGINS` can't name
-  yet, such as `browser-auth` and `delegated-access`; it knows
-  `mcp-client`, `application-catalog`, `server-auth`, `mcp-application`
-  and `application-http`.
+  yet, such as `delegated-access`; it knows `mcp-client`,
+  `application-catalog`, `server-auth`, `mcp-application`,
+  `application-http` and `browser-auth`.
 
 Karaka's own: `token-meter`, `compaction-basic`,
 `compaction-tool-result-pruner`, `session-checkpoint-policy`,

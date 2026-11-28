@@ -1,0 +1,23 @@
+[package]
+name = "karaka-browser-auth"
+description = "Karaka's browser credentials: application-signed JWTs, verified with SPKI public keys, as jose's jwtVerify checks them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Signature verification: ES256, RS256 and Ed25519. Already in the tree
+# through rustls; the JWT and SPKI parsing around it are this crate's.
+ring = "0.17"
+# The claims are JSON.
+serde_json.workspace = true
+# The verified owner and chat.
+karaka-identity.workspace = true
+karaka-session.workspace = true
+# The plugin that puts the verifier in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

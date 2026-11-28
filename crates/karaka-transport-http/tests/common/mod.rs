@@ -18,6 +18,9 @@ use karaka_agent::{Agent, ModelSelection};
 use karaka_agent_default_model::AgentDefaultModelPlugin;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::{AgentPresetsConfig, AgentPresetsPlugin, PresetDefinition};
+use karaka_browser_auth::{
+    Algorithm, BrowserAuthConfig, BrowserAuthPlugin, KeyConfig, encode_standard, encode_url,
+};
 use karaka_identity::{ApplicationId, KarakaIdentityPlugin};
 use karaka_kernel::Runtime;
 use karaka_model::{
@@ -33,9 +36,12 @@ use karaka_session_query::SessionQueryPlugin;
 use karaka_startup::{KarakaStartup, KarakaStartupPlugin};
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tools::ToolsPlugin;
-use karaka_transport_http::{TransportConfig, TransportHttpPlugin};
+use karaka_transport_http::{BrowserConfig, TransportConfig, TransportHttpPlugin};
+use karaka_user_approval::{ApprovalConfig, ApprovalPlugin};
 use karaka_user_questions::UserQuestionsPlugin;
 use karaka_webserver::{WebServer, WebServerConfig, WebServerPlugin};
+use ring::rand::SystemRandom;
+use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -106,6 +112,7 @@ pub struct Server {
     pub port: u16,
     pub model: Arc<Scripted>,
     pub root: PathBuf,
+    pub signer: Signer,
 }
 
 /// A fresh directory of the test's own.
@@ -122,6 +129,8 @@ pub fn scratch() -> PathBuf {
 }
 
 pub struct Options {
+    /// Browser access, verified with [`Server::signer`]'s key.
+    pub browser: Option<BrowserConfig>,
     pub root: PathBuf,
     pub config: TransportConfig,
     pub default_provider: &'static str,
@@ -131,6 +140,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            browser: None,
             root: scratch(),
             config: TransportConfig {
                 path: "/api".into(),
@@ -142,7 +152,82 @@ impl Default for Options {
     }
 }
 
+/// The browser endpoint the tests mount.
+pub fn browser() -> BrowserConfig {
+    BrowserConfig::new(
+        "/browser",
+        vec!["https://app.example".into()],
+        vec!["main".into()],
+    )
+}
+
+/// The origin browsers send.
+pub const ORIGIN: &str = "https://app.example";
+
+/// Signs browser credentials with an ES256 key whose SPKI the runtime
+/// trusts as `key`.
+pub struct Signer {
+    key: EcdsaKeyPair,
+    pub public: String,
+}
+
+const P256_SPKI: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+impl Signer {
+    pub fn new() -> Self {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let mut der = P256_SPKI.to_vec();
+        der.extend_from_slice(key.public_key().as_ref());
+        let body = encode_standard(&der);
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(64)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
+        Self {
+            public: format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+                lines.join("\n")
+            ),
+            key,
+        }
+    }
+
+    /// A credential for `user` on `chat`, valid for `seconds`.
+    pub fn token(&self, user: &str, chat: &str, seconds: u64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = json!({
+            "applicationId": "app", "tenantId": "tenant", "userId": user, "chatId": chat,
+            "iss": "issuer", "aud": "karaka", "iat": now, "exp": now + seconds,
+        });
+        let message = format!(
+            "{}.{}",
+            encode_url(
+                json!({ "alg": "ES256", "kid": "key" })
+                    .to_string()
+                    .as_bytes()
+            ),
+            encode_url(claims.to_string().as_bytes())
+        );
+        let signature = self
+            .key
+            .sign(&SystemRandom::new(), message.as_bytes())
+            .unwrap();
+        format!("{message}.{}", encode_url(signature.as_ref()))
+    }
+}
+
 pub async fn start(options: Options) -> Server {
+    let signer = Signer::new();
     let presets = AgentPresetsPlugin::new(AgentPresetsConfig::new("main"))
         .preset(PresetDefinition {
             name: Some("Main".into()),
@@ -159,6 +244,18 @@ pub async fn start(options: Options) -> Server {
         Box::new(ModelsPlugin),
         Box::new(AgentLoopPlugin::new(LoopConfig::new("mock", "chat"))),
         Box::new(UserQuestionsPlugin),
+        Box::new(ApprovalPlugin::new(ApprovalConfig::default())),
+        Box::new(BrowserAuthPlugin::new(BrowserAuthConfig {
+            application_id: "app".into(),
+            issuer: "issuer".into(),
+            audience: "karaka".into(),
+            max_token_age_seconds: 300,
+            keys: vec![KeyConfig {
+                id: "key".into(),
+                algorithm: Algorithm::Es256,
+                public_key: signer.public.clone(),
+            }],
+        })),
         Box::new(KarakaIdentityPlugin::with_persistence()),
         Box::new(ServerAuthPlugin::with(Arc::new(Fixed))),
         Box::new(presets),
@@ -172,7 +269,16 @@ pub async fn start(options: Options) -> Server {
             model: "chat".into(),
             reasoning_effort: None,
         })),
-        Box::new(TransportHttpPlugin::new(options.config, true).unwrap()),
+        Box::new(
+            TransportHttpPlugin::new(
+                TransportConfig {
+                    browser: options.browser,
+                    ..options.config
+                },
+                true,
+            )
+            .unwrap(),
+        ),
     ])
     .await
     .unwrap();
@@ -190,6 +296,7 @@ pub async fn start(options: Options) -> Server {
         port,
         model,
         root: options.root,
+        signer,
     }
 }
 
@@ -271,6 +378,59 @@ impl Server {
         Answer { status, head, body }
     }
 
+    /// A request with `headers` as given, and nothing else.
+    pub async fn with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> Answer {
+        let mut socket = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
+        let mut head = String::new();
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        socket
+            .write_all(
+                format!(
+                    "{method} {path} HTTP/1.1\r\nHost: x\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        socket.read_to_end(&mut raw).await.unwrap();
+        let raw = String::from_utf8_lossy(&raw).to_string();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        let head = head.to_ascii_lowercase();
+        let body = if head.contains("transfer-encoding: chunked") {
+            dechunk(body)
+        } else {
+            body.to_owned()
+        };
+        Answer { status, head, body }
+    }
+
+    /// A browser method call with `token`.
+    pub async fn browser(&self, method: &str, body: &Value, token: &str) -> Answer {
+        let authorization = format!("Bearer {token}");
+        self.with_headers(
+            "POST",
+            &format!("/browser/{method}"),
+            &body.to_string(),
+            &[
+                ("Origin", ORIGIN),
+                ("Authorization", &authorization),
+                ("Content-Type", "application/json"),
+            ],
+        )
+        .await
+    }
+
     pub async fn post(&self, path: &str, body: &Value) -> Answer {
         self.raw("POST", path, &body.to_string(), Some(CREDENTIAL))
             .await
@@ -278,6 +438,37 @@ impl Server {
 
     pub async fn get(&self, path: &str) -> Answer {
         self.raw("GET", path, "", Some(CREDENTIAL)).await
+    }
+
+    /// Opens a stream with `headers`.
+    pub async fn stream_with(&self, path: &str, body: &Value, headers: &[(&str, &str)]) -> Events {
+        let mut socket = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
+        let body = body.to_string();
+        let mut head = String::new();
+        for (name, value) in headers {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+        socket
+            .write_all(
+                format!(
+                    "POST {path} HTTP/1.1\r\nHost: x\r\n{head}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            head.push_str(&line.to_ascii_lowercase());
+        }
+        Events { reader, head }
     }
 
     /// Opens a stream: the response head, then its events one by one.
@@ -373,5 +564,132 @@ impl Events {
             }
         }
         seen
+    }
+}
+
+/// A WebSocket client of the browser socket, written against the codec.
+pub struct Socket {
+    reader: karaka_transport_http::ws::Reader<tokio::io::ReadHalf<TcpStream>>,
+    writer: tokio::io::WriteHalf<TcpStream>,
+}
+
+/// What the upgrade answered: a socket, or the refusal's status.
+pub enum Opened {
+    Socket(Socket),
+    Refused(u16),
+}
+
+impl Server {
+    /// Opens the browser socket from `origin`.
+    pub async fn socket(&self, origin: Option<&str>) -> Opened {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).await.unwrap();
+        let origin = origin.map_or(String::new(), |origin| format!("Origin: {origin}\r\n"));
+        stream
+            .write_all(
+                format!(
+                    "GET /browser/socket HTTP/1.1\r\nHost: x\r\n{origin}Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&head).to_string();
+        let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+        if status != 101 {
+            return Opened::Refused(status);
+        }
+        assert!(
+            head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "the accept key for the RFC's sample: {head}"
+        );
+        let (read, writer) = tokio::io::split(stream);
+        Opened::Socket(Socket {
+            reader: karaka_transport_http::ws::Reader::new(read, false, 1 << 24),
+            writer,
+        })
+    }
+
+    pub async fn open(&self) -> Socket {
+        match self.socket(Some(ORIGIN)).await {
+            Opened::Socket(socket) => socket,
+            Opened::Refused(status) => panic!("refused: {status}"),
+        }
+    }
+}
+
+/// How a socket ended, as the client saw it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// A close frame, its code and reason.
+    Closed(Option<u16>, String),
+    /// The connection cut without one: ws's 1006.
+    Cut,
+}
+
+impl Socket {
+    pub async fn frame(&mut self, opcode: u8, payload: &[u8]) {
+        let frame = karaka_transport_http::ws::encode(opcode, payload, Some([1, 2, 3, 4]));
+        self.writer.write_all(&frame).await.unwrap();
+    }
+
+    pub async fn send(&mut self, message: &Value) {
+        self.frame(
+            karaka_transport_http::ws::OP_TEXT,
+            message.to_string().as_bytes(),
+        )
+        .await;
+    }
+
+    /// The next message, or how the socket ended; pongs to the server's
+    /// WebSocket pings are left to the reader.
+    pub async fn read(&mut self) -> Result<Value, Ended> {
+        loop {
+            let read = tokio::time::timeout(std::time::Duration::from_secs(10), self.reader.read())
+                .await
+                .expect("a message within 10 s");
+            match read {
+                Ok(karaka_transport_http::ws::Incoming::Text(text)) => {
+                    return Ok(serde_json::from_str(&text).unwrap());
+                }
+                Ok(karaka_transport_http::ws::Incoming::Close(code, reason)) => {
+                    let payload = karaka_transport_http::ws::close_payload(code, &reason);
+                    let frame = karaka_transport_http::ws::encode(
+                        karaka_transport_http::ws::OP_CLOSE,
+                        &payload,
+                        Some([0; 4]),
+                    );
+                    let _ = self.writer.write_all(&frame).await;
+                    return Err(Ended::Closed(code, reason));
+                }
+                Ok(_) => continue,
+                Err(_) => return Err(Ended::Cut),
+            }
+        }
+    }
+
+    /// Reads until the socket ends.
+    pub async fn ended(&mut self) -> Ended {
+        loop {
+            if let Err(ended) = self.read().await {
+                return ended;
+            }
+        }
+    }
+
+    /// Says hello with `token`, and reads `ready`.
+    pub async fn hello(&mut self, token: &str) -> Value {
+        self.send(&json!({ "type": "hello", "credential": token }))
+            .await;
+        let ready = self.read().await.unwrap();
+        assert_eq!(ready["type"], "ready", "{ready}");
+        ready
     }
 }

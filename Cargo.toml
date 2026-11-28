@@ -82,6 +82,7 @@ karaka-startup = { path = "crates/karaka-startup" }
 karaka-agent-default-model = { path = "crates/karaka-agent-default-model" }
 karaka-session-query = { path = "crates/karaka-session-query" }
 karaka-transport-http = { path = "crates/karaka-transport-http" }
+karaka-browser-auth = { path = "crates/karaka-browser-auth" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }

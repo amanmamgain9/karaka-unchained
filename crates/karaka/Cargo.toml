@@ -65,6 +65,8 @@ karaka-startup.workspace = true
 # `serve`'s application routes, from an `application-http` row, with the
 # default model and the session query they use.
 karaka-transport-http.workspace = true
+# The verifier of the browser credentials an application signs.
+karaka-browser-auth.workspace = true
 karaka-agent-default-model.workspace = true
 karaka-session-query.workspace = true
 # Reads the presets file. The YAML 1.2 parser skill frontmatter is read
@@ -82,3 +84,8 @@ httpdate.workspace = true
 # `sync` for handing a line of stdin to whoever asked for it.
 # `signal` for `serve`'s Ctrl-C and SIGTERM.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal"] }
+
+[dev-dependencies]
+# The CLI tests sign a browser credential, and drive the socket.
+ring = "0.17"
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time"] }

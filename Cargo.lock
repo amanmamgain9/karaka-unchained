@@ -650,6 +650,7 @@ dependencies = [
  "karaka-agent-loop",
  "karaka-agent-presets",
  "karaka-anthropic",
+ "karaka-browser-auth",
  "karaka-credentials",
  "karaka-fs-local",
  "karaka-identity",
@@ -681,6 +682,7 @@ dependencies = [
  "karaka-user-questions",
  "karaka-webserver",
  "karaka-working-directory",
+ "ring",
  "serde_json",
  "tokio",
  "yaml-rust2",
@@ -754,6 +756,18 @@ dependencies = [
  "karaka-sse",
  "reqwest",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-browser-auth"
+version = "0.1.0"
+dependencies = [
+ "karaka-identity",
+ "karaka-kernel",
+ "karaka-session",
+ "ring",
  "serde_json",
  "tokio",
 ]
@@ -1143,6 +1157,8 @@ dependencies = [
  "karaka-agent-default-model",
  "karaka-agent-loop",
  "karaka-agent-presets",
+ "karaka-browser-auth",
+ "karaka-fs",
  "karaka-identity",
  "karaka-kernel",
  "karaka-model",
@@ -1157,6 +1173,7 @@ dependencies = [
  "karaka-system-prompt",
  "karaka-tool-ask-user",
  "karaka-tools",
+ "karaka-user-approval",
  "karaka-user-questions",
  "karaka-webserver",
  "ring",

@@ -1,0 +1,5 @@
+Test-only material, generated with openssl for these tests and used nowhere
+else. No private key is kept: rs256.jwt was signed once with the 2048-bit
+RSA key whose public half is rsa-2048.pub.pem (iat 1700000000, exp 120 s
+later, audience ["other", "karaka"]), and the key was then deleted. The
+1024-bit RSA and Ed448 public keys are ones the verifier refuses.

@@ -37,7 +37,7 @@ pub struct Routes {
 }
 
 /// A JSON response. (Karaka: `json`.)
-fn json_response(status: u16, value: &Value) -> Response {
+pub(crate) fn json_response(status: u16, value: &Value) -> Response {
     let mut response = Response::new(body::full(value.to_string()));
     *response.status_mut() =
         StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -58,7 +58,7 @@ fn error_response(error: &AppError) -> Response {
 
 /// The body as one JSON object, at most `max` bytes. (Karaka:
 /// `readObject`.)
-async fn read_object<B>(body: B, max: usize) -> Result<Value, AppError>
+pub(crate) async fn read_object<B>(body: B, max: usize) -> Result<Value, AppError>
 where
     B: http_body::Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
@@ -171,10 +171,10 @@ impl Routes {
         let max = self.max_body_bytes;
         if method == Method::POST && relative == "/chats" {
             let body = CreateChat::parse(&read_object(request.into_body(), max).await?)?;
-            let address = Address {
-                chat_id: SessionId::new(&body.chat_id),
-                owner: owner(application, &body.identity),
-            };
+            let address = Address::new(
+                SessionId::new(&body.chat_id),
+                owner(application, &body.identity),
+            );
             return Ok(json_response(
                 201,
                 &chats.create(&address, &body.agent_id).await?,
@@ -197,10 +197,7 @@ impl Routes {
         match operation.as_str() {
             "messages" => {
                 let body = Prompt::parse(&object)?;
-                let address = Address {
-                    chat_id: chat,
-                    owner: owner(application, &body.identity),
-                };
+                let address = Address::new(chat, owner(application, &body.identity));
                 let result = chats
                     .prompt(&address, &body.request_id, &body.content)
                     .await?;
@@ -216,10 +213,7 @@ impl Routes {
             }
             "history" => {
                 let body = wire::Address::parse(&object)?;
-                let address = Address {
-                    chat_id: chat,
-                    owner: owner(application, &body.identity),
-                };
+                let address = Address::new(chat, owner(application, &body.identity));
                 let events: Vec<Value> = chats
                     .events(&address)
                     .await?
@@ -233,18 +227,12 @@ impl Routes {
             }
             "cancel" => {
                 let body = wire::Address::parse(&object)?;
-                let address = Address {
-                    chat_id: chat,
-                    owner: owner(application, &body.identity),
-                };
+                let address = Address::new(chat, owner(application, &body.identity));
                 Ok(json_response(200, &chats.cancel(&address).await?))
             }
             "model" => {
                 let body = ModelRequest::parse(&object)?;
-                let address = Address {
-                    chat_id: chat,
-                    owner: owner(application, &body.identity),
-                };
+                let address = Address::new(chat, owner(application, &body.identity));
                 let requested = ModelSelection {
                     provider: body.provider,
                     model: body.model,
@@ -275,10 +263,7 @@ impl Routes {
             }
             _ => {
                 let body = wire::Address::parse(&object)?;
-                let address = Address {
-                    chat_id: chat,
-                    owner: owner(application, &body.identity),
-                };
+                let address = Address::new(chat, owner(application, &body.identity));
                 self.stream(address, body.cursor).await
             }
         }

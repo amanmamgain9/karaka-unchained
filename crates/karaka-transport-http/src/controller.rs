@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use karaka_agent::{Agent, Agents, ModelSelection};
 use karaka_agent_default_model::{AgentDefaultModel, list_providers, resolve_call_config};
 use karaka_agent_presets::AgentPresets;
-use karaka_identity::{ApplicationOwner, KarakaIdentity, Reservation};
+use karaka_browser_auth::BrowserCaller;
+use karaka_identity::{ApplicationOwner, KarakaIdentity, Reservation, same_owner};
 use karaka_model::ModelRegistry;
 use karaka_session::{
     CancelCause, ContentBlock, Entry, Passthrough, Session, SessionEvent, SessionHeader, SessionId,
@@ -30,11 +31,24 @@ use crate::ids::random_uuid;
 use crate::state::application_state;
 use crate::wire::Content;
 
-/// A chat and its trusted owner. (Karaka: `Address`.)
+/// A chat and its trusted owner, and the verified browser caller when a
+/// browser asked. (Karaka: `Address`.)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Address {
     pub chat_id: SessionId,
     pub owner: ApplicationOwner,
+    pub browser: Option<BrowserCaller>,
+}
+
+impl Address {
+    /// An application server's address, with no browser.
+    pub fn new(chat_id: SessionId, owner: ApplicationOwner) -> Self {
+        Self {
+            chat_id,
+            owner,
+            browser: None,
+        }
+    }
 }
 
 /// The ports the operations use.
@@ -57,6 +71,8 @@ pub struct ApplicationChats {
     hub: Arc<Hub>,
     /// The chats whose agents this controller opened. (Karaka: `handles`.)
     handles: Mutex<HashSet<SessionId>>,
+    /// The presets a browser may reach. (Karaka: `browserAgentIds`.)
+    browser_presets: Mutex<Vec<String>>,
 }
 
 /// What a follow yields after its snapshot. (Karaka: `FollowFrame`'s
@@ -142,6 +158,7 @@ impl ApplicationChats {
             ports,
             hub,
             handles: Mutex::default(),
+            browser_presets: Mutex::default(),
         })
     }
 
@@ -152,6 +169,78 @@ impl ApplicationChats {
         operation: impl Future<Output = Result<T, AppError>>,
     ) -> Result<T, AppError> {
         self.ports.identity.with_chat_lock(id, operation).await?
+    }
+
+    /// The presets a browser may use; an empty list without browser
+    /// access.
+    pub fn set_browser_presets(&self, presets: Vec<String>) {
+        *self
+            .browser_presets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = presets;
+    }
+
+    /// Checks a browser caller's signed chat and owner, and that the chat
+    /// is a root of an allowed preset, without recording ownership.
+    /// (Karaka: `authorizeBrowser`.)
+    ///
+    /// # Errors
+    ///
+    /// `CHAT_FORBIDDEN`, in Karaka's words, or `session/conflict` for a
+    /// chat under another preset than `agent_id`.
+    pub async fn authorize_browser(
+        &self,
+        address: &Address,
+        agent_id: Option<&str>,
+        caller: &BrowserCaller,
+    ) -> Result<Option<SessionHeader>, AppError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis() as u64);
+        let forbidden = |message: &str| AppError::coded("CHAT_FORBIDDEN", message);
+        if caller.expires_at <= now
+            || caller.chat_id != address.chat_id
+            || !same_owner(&caller.owner, &address.owner)
+        {
+            return Err(forbidden("Browser credential does not authorize this chat"));
+        }
+        if let Some(owner) = self.ports.identity.owner_of_id(&address.chat_id).await?
+            && !same_owner(&owner, &address.owner)
+        {
+            return Err(forbidden("Chat is owned by another caller"));
+        }
+        let allowed_presets = self
+            .browser_presets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let allowed =
+            |id: Option<&str>| id.is_some_and(|id| allowed_presets.iter().any(|known| known == id));
+        if agent_id.is_some() && !allowed(agent_id) {
+            return Err(forbidden("Browser Agent preset is unavailable"));
+        }
+        let stored = self
+            .ports
+            .durable
+            .persistence()
+            .stat(&address.chat_id)
+            .await
+            .map_err(|error| AppError::internal(error.to_string()))?
+            .map(|snapshot| snapshot.header);
+        let live = self
+            .ports
+            .store
+            .get(&address.chat_id)
+            .map(|session| session.header().clone());
+        for header in [&stored, &live].into_iter().flatten() {
+            if header.parent_session.is_some() || !allowed(header.agent_preset.as_deref()) {
+                return Err(forbidden("Browser target is not an allowed root chat"));
+            }
+            if agent_id.is_some() && header.agent_preset.as_deref() != agent_id {
+                return Err(conflict());
+            }
+        }
+        Ok(stored.or(live))
     }
 
     /// The usable presets: id, name (the id when it has none) and
@@ -199,6 +288,9 @@ impl ApplicationChats {
     /// Authorizes a chat with a known owner, or restores a stored one to
     /// this owner; a new chat passes. (Karaka: `prepare`.)
     async fn prepare(&self, address: &Address, agent_id: Option<&str>) -> Result<(), AppError> {
+        if let Some(caller) = &address.browser {
+            self.authorize_browser(address, agent_id, caller).await?;
+        }
         let identity = &self.ports.identity;
         if identity.owner_of_id(&address.chat_id).await?.is_some() {
             identity.authorize(&address.chat_id, &address.owner).await?;
