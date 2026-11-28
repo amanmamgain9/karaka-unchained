@@ -22,7 +22,7 @@ mod plugin;
 mod provider;
 mod watch;
 
-pub use plugin::SkillFilesystemPlugin;
+pub use plugin::{SkillFilesystemPlugin, SkillFilesystemPresetPlugin};
 pub use provider::{
     AGENTS_HOME_ENV, BUNDLED_SKILL_DIR_ENV, ConfigError, DEFAULT_WATCH_MAX_PROJECTS, DSH_HOME_ENV,
     FileSystemSkillProvider, SkillFilesystemConfig,

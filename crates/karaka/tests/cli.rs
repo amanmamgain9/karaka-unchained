@@ -8,6 +8,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+
+use serde_json::Value;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
@@ -28,6 +30,8 @@ const VARIABLES: &[&str] = &[
     // Removed too, so no test ever reads or writes a real session store.
     "KARAKA_SESSIONS",
     "KARAKA_SESSION",
+    "KARAKA_PRESETS",
+    "KARAKA_PRESET",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
@@ -620,6 +624,183 @@ fn ask_shows_the_projects_skills_and_loads_an_invoked_one() {
         texts[3]
     );
     let _ = std::fs::remove_dir_all(&project);
+}
+
+/// A temporary directory of this test's own.
+fn scratch(name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "karaka-cli-{name}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Two presets with their own personas and allow lists; `scout` also has a
+/// skill of its own.
+const PRESETS: &str = "
+- id: coach
+  name: Coach
+  plugins:
+    - name: persona
+      config: { prefix: You are a patient coach. }
+    - name: tool-policy
+      config: { allow: [todo_write] }
+- id: scout
+  plugins:
+    - name: '@deepseek-ai/dsh-persona'
+      config: { prefix: You are a careful scout., suffix: Report back. }
+    - name: '@karaka-ai/agent/tool-policy'
+      config: { mode: native, allow: [working_directory, skill] }
+    - name: skill-filesystem
+      config: { includeDefaultRoots: false, customSkillDirs: [skills] }
+";
+
+/// `ask hi` with `extra` options, against a fresh DeepSeek stand-in, with
+/// the presets in `dir`; gives the request body it sent.
+fn ask_with_presets(dir: &Path, extra: &[&str]) -> Value {
+    let (address, server) = serve_once(streamed(DEEPSEEK_HELLO));
+    let mut args = vec!["ask"];
+    args.extend_from_slice(extra);
+    args.push("hi");
+    let output = run_in(
+        Some(dir),
+        &args,
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
+            (
+                "KARAKA_PRESETS",
+                dir.join("presets.yml").display().to_string(),
+            ),
+        ],
+        "",
+    );
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let sent = server.join().expect("the server ran");
+    let (_, body) = sent.split_once("\r\n\r\n").expect("headers, then a body");
+    serde_json::from_str(body).unwrap()
+}
+
+fn tool_names(body: &Value) -> Vec<String> {
+    body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// Each session runs its own preset: the default for one that names none,
+// and `--preset`'s for one that picks another, each with its own persona,
+// tool list and skills.
+#[test]
+fn each_session_gets_its_presets_persona_and_tools() {
+    let dir = scratch("presets");
+    std::fs::write(dir.join("presets.yml"), PRESETS).unwrap();
+    let skill = dir.join("skills/demo");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: demo\ndescription: The scout's own skill.\n---\n\nScout around.\n",
+    )
+    .unwrap();
+
+    let coach = ask_with_presets(&dir, &[]);
+    assert_eq!(
+        coach["system"],
+        "You are an AI agent powered by Karaka.\n\nYou are a patient coach."
+    );
+    assert_eq!(tool_names(&coach), ["todo_write"]);
+    assert!(!coach.to_string().contains("available_skills"));
+
+    let scout = ask_with_presets(&dir, &["--preset", "scout"]);
+    assert_eq!(
+        scout["system"],
+        "You are an AI agent powered by Karaka.\n\nYou are a careful scout.\n\nReport back."
+    );
+    assert_eq!(tool_names(&scout), ["skill", "working_directory"]);
+    let catalog = scout["messages"][0]["content"][1]["text"].as_str().unwrap();
+    assert!(
+        catalog.contains("- `demo`: The scout's own skill."),
+        "{catalog}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn preset_mistakes_fail_before_any_call() {
+    let dir = scratch("bad-presets");
+    let presets = dir.join("presets.yml");
+    std::fs::write(&presets, "- id: a\n  plugins: [{ name: shell }]\n").unwrap();
+    let settings = |extra: Vec<(&'static str, String)>| {
+        let mut settings = vec![
+            ("KARAKA_PROVIDER", "deepseek".to_owned()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            // Nothing listens on port 1; a call that went out would fail
+            // differently.
+            ("DEEPSEEK_BASE_URL", "http://127.0.0.1:1".into()),
+        ];
+        settings.extend(extra);
+        settings
+    };
+
+    let output = karaka(
+        &["ask", "hi"],
+        &settings(vec![("KARAKA_PRESETS", presets.display().to_string())]),
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "karaka: KARAKA_PRESETS ({}): preset 1 (\"a\"), plugin 1 (shell): unknown plugin \"shell\"; a preset may use persona, tool-policy and skill-filesystem\n",
+            presets.display()
+        )
+    );
+
+    std::fs::write(&presets, "- id: a\n").unwrap();
+    let output = karaka(
+        &["ask", "hi"],
+        &settings(vec![
+            ("KARAKA_PRESETS", presets.display().to_string()),
+            ("KARAKA_PRESET", "b".into()),
+        ]),
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        text(&output.stderr).contains("KARAKA_PRESET is \"b\", but"),
+        "{}",
+        text(&output.stderr)
+    );
+
+    let output = karaka(&["ask", "--preset", "a", "hi"], &settings(Vec::new()), "");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "karaka: --preset a needs KARAKA_PRESETS: without it there are no presets\n"
+    );
+
+    let output = karaka(
+        &["ask", "--preset", "absent", "hi"],
+        &settings(vec![("KARAKA_PRESETS", presets.display().to_string())]),
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "karaka: Unknown agent preset: absent\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

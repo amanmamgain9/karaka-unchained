@@ -12,6 +12,8 @@ publish.workspace = true
 karaka-kernel.workspace = true
 # The registry it provides into.
 karaka-skill.workspace = true
+# Its preset plugin registers the provider in a preset's scope.
+karaka-agent-presets.workspace = true
 # Roots are listed, files read and directories watched through the
 # filesystem seam, as dsh reads through `ctx.fs`.
 karaka-fs.workspace = true

@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use karaka_agent::Agents;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
+use karaka_agent_presets::AgentPresets;
 use karaka_fs_local::LocalFsPlugin;
 use karaka_kernel::{DynPlugin, Runtime};
 use karaka_model::Block;
@@ -42,7 +43,7 @@ use karaka_user_questions::{UserQuestions, UserQuestionsPlugin};
 use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
-use crate::current_time::CurrentTime;
+use crate::current_time::CurrentTimePlugin;
 use crate::questions::{Lines, TerminalAnswerer, TerminalApprover};
 
 /// The session a chat runs in, unless `KARAKA_SESSION` names another.
@@ -59,14 +60,35 @@ const SHORT_RESULT: usize = 80;
 /// which retries a failed request as the provider's policy says before the
 /// turn gives up.
 ///
-/// `watch_skills` says whether the skill roots are watched for changes, as
-/// dsh watches them by default: a chat's next step sees a skill added
+/// `chat` says the plugins are for `karaka chat`, which has the
+/// `current_time` tool, and watches the skill roots for changes, as dsh
+/// watches them by default: a chat's next step sees a skill added
 /// meanwhile. A single question has no next step to see one.
+///
+/// With `KARAKA_PRESETS`, the agent preset registry goes last, so every
+/// tool a preset's policy names is registered before it is set up. The
+/// presets then own skill discovery: the global `skill-filesystem` isn't
+/// mounted, and a preset gives its agents skills with a `skill-filesystem`
+/// row, as dsh's web bundle disables the host row when presets own local
+/// discovery (`bundle/web-app/cordis.patch.yml`).
+///
+/// # Errors
+///
+/// A presets file that doesn't read or fit.
 pub fn loop_plugins(
     config: Config,
     approvals: &Approvals,
-    watch_skills: bool,
-) -> Vec<Box<dyn DynPlugin>> {
+    chat: bool,
+) -> Result<Vec<Box<dyn DynPlugin>>, String> {
+    let watch_skills = chat;
+    let presets = match &config.presets {
+        Some(path) => Some(crate::presets::load(
+            path,
+            config.preset.as_deref(),
+            watch_skills,
+        )?),
+        None => None,
+    };
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
@@ -112,16 +134,64 @@ pub fn loop_plugins(
     // a bundled root. The model loads one with the `skill` tool, from the
     // catalog each step is given, or a person with `/name` in a message.
     plugins.push(Box::new(SkillsPlugin::default()));
-    plugins.push(Box::new(SkillFilesystemPlugin::new(
-        SkillFilesystemConfig {
-            watch: watch_skills,
-            ..SkillFilesystemConfig::default()
-        },
-    )));
+    if presets.is_none() {
+        plugins.push(Box::new(SkillFilesystemPlugin::new(
+            SkillFilesystemConfig {
+                watch: watch_skills,
+                ..SkillFilesystemConfig::default()
+            },
+        )));
+    }
     plugins.push(Box::new(ToolSkillPlugin::default()));
     plugins.push(Box::new(AgentLoopPlugin::new(loop_config)));
     plugins.push(Box::new(RetryPlugin::new()));
-    plugins
+    if chat {
+        plugins.push(Box::new(CurrentTimePlugin));
+    }
+    if let Some(presets) = presets {
+        plugins.push(Box::new(presets));
+    }
+    Ok(plugins)
+}
+
+/// What the command line says: approvals, and the preset to run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    pub approvals: Approvals,
+    /// `--preset`: the preset the session runs, selected before its first
+    /// turn.
+    pub preset: Option<String>,
+}
+
+/// Makes the session `id` run `preset`, if one was asked for, through the
+/// registry's `select`: only while the session is blank.
+///
+/// # Errors
+///
+/// `--preset` without `KARAKA_PRESETS`, or the registry's refusal, in dsh's
+/// words.
+pub fn select_preset(
+    runtime: &Runtime,
+    id: &SessionId,
+    preset: Option<&str>,
+) -> Result<(), String> {
+    let Some(preset) = preset else {
+        return Ok(());
+    };
+    if !runtime.plugins().contains(&"agent-preset-registry") {
+        return Err(format!(
+            "--preset {preset} needs KARAKA_PRESETS: without it there are no presets"
+        ));
+    }
+    let session = runtime
+        .get::<SessionStore>()
+        .get(id)
+        .ok_or("the session wasn't started")?;
+    runtime
+        .get::<AgentPresets>()
+        .select(&session, preset)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// What the command line says about approvals.
@@ -181,10 +251,11 @@ impl PreExecuteListener for AskBefore {
 }
 
 /// Runs the chat until stdin ends.
-pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
+pub async fn chat(config: Config, options: Options) -> Result<(), String> {
+    let Options { approvals, preset } = options;
     let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
     let sessions = config.sessions.clone();
-    let mut plugins = loop_plugins(config, &approvals, true);
+    let mut plugins = loop_plugins(config, &approvals, true)?;
     if let Some(root) = sessions.clone() {
         // The store's sessions kept as JSONL files under the root.
         plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root))));
@@ -192,10 +263,6 @@ pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
     }
     let runtime = Runtime::start(plugins)
         .await
-        .map_err(|error| error.to_string())?;
-    runtime
-        .get::<ToolRegistry>()
-        .register(Arc::new(CurrentTime))
         .map_err(|error| error.to_string())?;
     // stdin's one reader, shared by the chat's messages and the model's
     // questions (see `questions.rs`).
@@ -218,7 +285,7 @@ pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
         }
         None => None,
     };
-    let result = converse(&runtime, &id, &lines).await;
+    let result = converse(&runtime, &id, &lines, preset.as_deref()).await;
     // Whatever happened, what the chat said is written before it exits.
     if let Some(durable) = durable {
         durable.close().await.map_err(|error| error.to_string())?;
@@ -227,12 +294,18 @@ pub async fn chat(config: Config, approvals: Approvals) -> Result<(), String> {
 }
 
 /// Reads lines and answers them until stdin ends.
-async fn converse(runtime: &Runtime, id: &SessionId, lines: &Lines) -> Result<(), String> {
+async fn converse(
+    runtime: &Runtime,
+    id: &SessionId,
+    lines: &Lines,
+    preset: Option<&str>,
+) -> Result<(), String> {
     let store = runtime.get::<SessionStore>();
     let agent = runtime
         .get::<dyn Agents>()
         .open(id.clone())
         .map_err(|error| error.to_string())?;
+    select_preset(runtime, id, preset)?;
     // Opening the agent started the session, so it is there to read.
     let session = store.get(id).ok_or("the chat's session wasn't started")?;
 

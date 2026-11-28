@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use karaka_agent_presets::{PresetContext, PresetFuture, PresetPlugin};
 use karaka_fs::FileSystem;
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_skill::{SkillProvider, SkillRegistry};
@@ -17,8 +18,8 @@ use crate::provider::{FileSystemSkillProvider, SkillFilesystemConfig};
 /// or edit; Karaka has no such event yet, so that is
 /// [`FileSystemSkillProvider::observe_host_mutation`], for a caller to
 /// call. An agent preset mounts dsh's plugin in the preset's own layer;
-/// this plugin registers globally. A preset plugin (`karaka-agent-presets`)
-/// can register a [`FileSystemSkillProvider`] in its preset's scope.
+/// that is [`SkillFilesystemPresetPlugin`], and this plugin registers
+/// globally.
 #[derive(Clone, Debug, Default)]
 pub struct SkillFilesystemPlugin {
     config: SkillFilesystemConfig,
@@ -56,5 +57,50 @@ impl Plugin for SkillFilesystemPlugin {
                     as Arc<dyn SkillProvider>
             })?;
         Ok(())
+    }
+}
+
+/// Registers a [`FileSystemSkillProvider`] in a preset's layer, so only that
+/// preset's agents see its skills, as an agent preset mounts dsh's
+/// `skill-filesystem` row. Play This Life mounts it this way, with
+/// `include_default_roots: false` and its own skill directories.
+#[derive(Clone, Debug, Default)]
+pub struct SkillFilesystemPresetPlugin {
+    config: SkillFilesystemConfig,
+}
+
+impl SkillFilesystemPresetPlugin {
+    pub fn new(config: SkillFilesystemConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl PresetPlugin for SkillFilesystemPresetPlugin {
+    fn name(&self) -> &str {
+        "skill-filesystem"
+    }
+
+    fn requires(&self) -> Vec<PortId> {
+        vec![
+            PortId::of::<SkillRegistry>(),
+            PortId::of::<dyn FileSystem>(),
+        ]
+    }
+
+    fn setup<'a, 'p>(&'a self, ctx: &'a PresetContext<'a, 'p>) -> PresetFuture<'a> {
+        Box::pin(async move {
+            self.config.validate()?;
+            let fs = ctx.get::<dyn FileSystem>();
+            let config = self.config.clone();
+            // For the runtime's life, as the preset's other registrations.
+            let _ = ctx
+                .get::<SkillRegistry>()
+                .register_provider(Some(ctx.scope()), |control| {
+                    FileSystemSkillProvider::new(fs, control, config)
+                        .expect("the config was checked")
+                        as Arc<dyn SkillProvider>
+                })?;
+            Ok(())
+        })
     }
 }

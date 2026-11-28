@@ -1,0 +1,25 @@
+[package]
+name = "karaka-tool-policy"
+description = "Karaka's tool policy preset plugin: a preset's allow and deny lists, as a restriction on its scope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The policy is a preset plugin.
+karaka-agent-presets.workspace = true
+karaka-kernel.workspace = true
+karaka-scope.workspace = true
+# The restriction it files.
+karaka-tools.workspace = true
+
+[dev-dependencies]
+karaka-agent-loop.workspace = true
+karaka-model.workspace = true
+karaka-session.workspace = true
+karaka-session-projection.workspace = true
+karaka-system-prompt.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -38,6 +38,11 @@ pub struct Config {
     pub sessions: Option<PathBuf>,
     /// The session `chat` runs in.
     pub session: Option<String>,
+    /// A YAML file of agent presets (`presets.rs`). Without it, there are
+    /// none.
+    pub presets: Option<PathBuf>,
+    /// The default preset; the file's first when unset.
+    pub preset: Option<String>,
 }
 
 /// The model provider, with its plugin's config. Kept apart from the plugin
@@ -254,6 +259,8 @@ impl Config {
             effort,
             sessions: var("KARAKA_SESSIONS").map(PathBuf::from),
             session: var("KARAKA_SESSION"),
+            presets: var("KARAKA_PRESETS").map(PathBuf::from),
+            preset: var("KARAKA_PRESET"),
         })
     }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "karaka-persona"
+description = "The persona preset plugin: a preset's own identity, shadowing the deployment persona for its agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The persona is a preset plugin.
+karaka-agent-presets.workspace = true
+karaka-kernel.workspace = true
+karaka-scope.workspace = true
+# The sections it contributes.
+karaka-system-prompt.workspace = true
+
+[dev-dependencies]
+karaka-session.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

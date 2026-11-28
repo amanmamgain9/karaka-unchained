@@ -3505,3 +3505,135 @@ session controller calls `agentPresets.mount`.
 - **The default is written into the header** only when the roster has it.
   Otherwise the session is created with no preset and refused, where dsh's
   controller fails before creating it.
+
+## Presets, step 3: persona, tool policy and the binary
+
+This step adds three preset plugins and lets the binary read presets
+from a file.
+
+### Persona
+
+`karaka-persona` ports dsh's `packages/preset/persona` (`src/index.ts`).
+`Persona { prefix, suffix, complete, include_runtime_context }` is a
+`PresetPlugin` with dsh's defaults (`Persona::new(prefix)`: an empty
+suffix, not complete, runtime context kept).
+
+- **Sections.** `apply(prompt, scope)` registers the
+  `deployment:persona-prefix` and `deployment:persona-suffix` sections at
+  `SectionOrder::DeploymentPersonaPrefix` and `DeploymentPersonaSuffix`,
+  in the scope. They shadow the deployment persona for the agents whose
+  chain holds it.
+- **The options:**
+  - `complete` marks the prefix as the complete section, so it alone is
+    the prompt, after every listener.
+  - An empty suffix, the default, shadows the deployment's suffix away.
+  - `include_runtime_context: false` suppresses optional runtime context
+    for the scope.
+- **The texts are templates.** Karaka's system prompt already interpolates
+  strictly, so a `{{name}}` resolves at render, and an unknown one fails
+  the render, as in dsh.
+- **A global mount fails loud,** as dsh's does. `apply(prompt, None)`
+  collides with the system prompt's own registration of the deployment
+  persona: `prompt section "deployment:persona-prefix" is already
+  registered …`. As a preset plugin, it always registers in its preset's
+  scope.
+- **`guides`.** dsh's persona has no `guides` field, so Play This Life's is
+  its own wrapper's. It isn't ported, and is recorded in open ends.
+
+### The tool policy
+
+`karaka-tool-policy` ports Karaka's own `@karaka-ai/agent/tool-policy`
+(`karaka/mcp-application/src/tool-policy.ts`) as `ToolPolicy { mode,
+allow, deny }`.
+
+- **Its lists become one `restrict`** on the preset's chain. `deny` wins
+  over `allow`, as `karaka-tools`' restriction already has dsh's deny.
+  An omitted list stays omitted, and with neither list nothing is filed.
+- **The names are checked when the preset is set up.** A name no global
+  tool has breaks the preset, with `restrict`'s error as its line. The
+  binary's presets therefore go last, after every plugin that registers a
+  tool. `current_time`, which `chat` used to register after the start, is
+  now a plugin (`CurrentTimePlugin`), so a policy can name it.
+- **Only mode `native` is ported.** Karaka's `ptc` mode, and taking
+  application tools out of the lists (`karakaApplicationTools`,
+  `registerPolicy`), wait on the MCP client (open ends). Its
+  `Presentation.apply` has nothing to do in native mode.
+
+### Skills in a preset
+
+`karaka-skill-filesystem` gains `SkillFilesystemPresetPlugin`. It
+registers a `FileSystemSkillProvider` in the preset's skill layer, as a
+preset mounts dsh's `skill-filesystem` row, so only that preset's agents
+see its skills.
+
+### The binary
+
+- **`KARAKA_PRESETS=<file>`** is a YAML list of preset rows: `id`, `name`,
+  `description`, `order`, and `plugins`. That is the config of dsh's
+  `agent-preset` row, as Play This Life declares its presets. It is
+  parsed with yaml-rust2, `=0.13.0`, the parser skill frontmatter already
+  uses.
+- **A plugin row** has a `name`, a `config`, and an optional `id` for
+  diagnostics. The name is short or the package's:
+  - `persona` or `@deepseek-ai/dsh-persona`, with `prefix`, `suffix`,
+    `complete` and `includeRuntimeContext`;
+  - `tool-policy` or `@karaka-ai/agent/tool-policy`, with `mode`, `allow`
+    and `deny`;
+  - `skill-filesystem` or `@deepseek-ai/dsh-skill-filesystem`, with
+    `includeDefaultRoots`, `customSkillDirs` and `watch`. A relative
+    directory is read from the file's own directory. `watch` defaults to
+    the command's (on for `chat`, off for `ask`).
+- **Mistakes fail the start** with a message that says where: an unknown
+  plugin, an unknown key, a wrong type, a missing `prefix`, `mode: ptc`,
+  an empty list, and so on.
+- **`KARAKA_PRESET=<id>`** is the default preset. I chose it over a
+  `default:` key in the file, so the file stays a plain list of rows, as
+  Play This Life's are. Without it, the file's first preset is the
+  default. An id the file doesn't have fails the start.
+- **`--preset <id>`** selects a preset for the session after its agent
+  opens and before its first turn, through `AgentPresets::select`, so a
+  started session is refused with dsh's `This session has already
+  started`. Without `KARAKA_PRESETS` it fails, as dsh's session
+  controller refuses a named preset with no roster.
+- **The presets own skill discovery.** With `KARAKA_PRESETS`, the global
+  `skill-filesystem` isn't mounted, as dsh's web bundle disables the host
+  row when presets own local discovery. Skills come from presets'
+  `skill-filesystem` rows. The `skill` tool stays global, so a policy
+  names it like any other tool.
+- **Without `KARAKA_PRESETS`,** the plugins are as before, with
+  `current_time` now registered by a plugin.
+- `loop_plugins` returns a `Result`, and the binary's options are now
+  `Options { approvals, preset }`.
+
+### Tests
+
+- **9 persona cases** from `persona.spec.ts`.
+- **2 tool-policy cases** on a real runtime:
+  - the lists restrict each preset's inherited tools: an omitted list,
+    `allow`, `deny`, and `deny` winning;
+  - an unknown name breaks the preset with `restrict`'s line.
+- **2 unit tests of the presets file,** for a file that parses and for
+  each mistake's message.
+- **1 unit test of `--preset`.**
+- **2 CLI cases:**
+  - two presets with different personas and allow lists, one with its own
+    skill. The request bodies show each session's own system prompt, tool
+    list, and only the scout's skill catalog. The second session picks
+    its preset with `--preset`.
+  - preset mistakes failing before any call: an unknown plugin, an
+    unknown `KARAKA_PRESET`, `--preset` without presets, and an unknown
+    `--preset`.
+- **Skipped from `persona.spec.ts`:**
+  - "restores the shadowed default when its fiber unloads", and the
+    disposal halves of two other cases: the kernel unloads nothing;
+  - "keeps runtime context by default when apply bypasses schema
+    defaults": a Rust `Persona` has no schema to bypass.
+
+### Where it differs from dsh
+
+- **Presets come from a file of rows the binary knows,** three plugins
+  of them, not from Cordis rows naming any package.
+- **The default is `KARAKA_PRESET`, or the file's first,** where dsh
+  requires `default`.
+- **A tool policy's names are checked at startup** against the global
+  tools. Karaka's original takes application tools out first.

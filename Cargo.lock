@@ -636,11 +636,13 @@ dependencies = [
  "httpdate",
  "karaka-agent",
  "karaka-agent-loop",
+ "karaka-agent-presets",
  "karaka-anthropic",
  "karaka-fs-local",
  "karaka-kernel",
  "karaka-model",
  "karaka-openai",
+ "karaka-persona",
  "karaka-retry",
  "karaka-session",
  "karaka-session-jsonl",
@@ -650,6 +652,7 @@ dependencies = [
  "karaka-skill-filesystem",
  "karaka-system-prompt",
  "karaka-tool-ask-user",
+ "karaka-tool-policy",
  "karaka-tool-skill",
  "karaka-tool-todo",
  "karaka-tool-working-directory",
@@ -659,6 +662,7 @@ dependencies = [
  "karaka-working-directory",
  "serde_json",
  "tokio",
+ "yaml-rust2",
 ]
 
 [[package]]
@@ -777,6 +781,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-persona"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent-presets",
+ "karaka-kernel",
+ "karaka-scope",
+ "karaka-session",
+ "karaka-system-prompt",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-retry"
 version = "0.1.0"
 dependencies = [
@@ -862,6 +878,7 @@ name = "karaka-skill-filesystem"
 version = "0.1.0"
 dependencies = [
  "futures-core",
+ "karaka-agent-presets",
  "karaka-fs",
  "karaka-fs-local",
  "karaka-kernel",
@@ -898,6 +915,23 @@ dependencies = [
  "karaka-system-prompt",
  "karaka-tools",
  "karaka-user-questions",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-tool-policy"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent-loop",
+ "karaka-agent-presets",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-scope",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-system-prompt",
+ "karaka-tools",
  "serde_json",
  "tokio",
 ]

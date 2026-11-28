@@ -44,6 +44,14 @@ karaka-user-approval.workspace = true
 karaka-skill.workspace = true
 karaka-skill-filesystem.workspace = true
 karaka-tool-skill.workspace = true
+# Agent presets from `KARAKA_PRESETS`: the registry, and the plugins a
+# preset row may name.
+karaka-agent-presets.workspace = true
+karaka-persona.workspace = true
+karaka-tool-policy.workspace = true
+# Reads the presets file. The YAML 1.2 parser skill frontmatter is read
+# with, pinned to the same release.
+yaml-rust2 = { version = "=0.13.0", default-features = false }
 # Durable chats: the persistence seam, and its JSONL backend.
 karaka-session-persistence.workspace = true
 karaka-session-jsonl.workspace = true

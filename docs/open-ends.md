@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the preset registry (step 2 of presets).
+Last updated 2026-11-28, after persona, the tool policy and presets in the binary (step 3 of presets).
 
 ## Needs you
 
@@ -88,19 +88,20 @@ Last updated 2026-11-28, after the preset registry (step 2 of presets).
   (Approvals, step B; Presets, step 1)
 - **Per-agent composition.** Every registry files registrations under a
   preset's or a session's scope, and an agent sees them through its
-  chain. Presets exist (`karaka-agent-presets`), and each agent's chain
-  names its session's preset. What is left:
-  - the binary's presets and persona (step 3);
-  - Play This Life's per-preset mounts: `skill-filesystem` and the other
-    plugins it mounts inside a preset, as `PresetPlugin`s, with
-    `includeDefaultRoots: false`, `customSkillDirs: []` and SKILL.md
-    guides. Until then `skill-filesystem` registers globally;
+  chain. Presets exist (`karaka-agent-presets`), each agent's chain
+  names its session's preset, and the binary reads presets from
+  `KARAKA_PRESETS` with `persona`, `tool-policy` and `skill-filesystem`
+  rows. What is left:
+  - Play This Life's other per-preset plugins, as `PresetPlugin`s, and
+    the binary's file accepting them: only those three rows exist;
+  - Play This Life's persona `guides` field: dsh's persona has none, so
+    it is Play This Life's own wrapper, not ported;
   - main-agent's approval gate, to be scoped to main-agent's preset;
   - `composeFrom`: a child agent joining its parent's preset. It waits on
     child agents.
 
   `RequestErrorHooks` and `InboxHooks` are still global only. (Kernel
-  gaps; Skills, steps A, B and C; Presets, steps 1 and 2)
+  gaps; Skills, steps A, B and C; Presets, steps 1, 2 and 3)
 - **The user's default preset.** dsh's registry config has a
   `selectedDefault`, the user's choice of default, edited through
   Settings, which new sessions use over the deployment's `default`. It
@@ -195,6 +196,12 @@ Last updated 2026-11-28, after the preset registry (step 2 of presets).
 
 ## Waiting on a plugin not yet ported
 
+- **The tool policy's `ptc` mode and application tools.** Karaka's
+  `tool-policy` presents tools natively only; its `ptc` mode, and taking
+  the application's MCP tools out of the allow and deny lists
+  (`karakaApplicationTools`, `registerPolicy`), wait on the MCP client.
+  Until then a policy naming a tool no plugin registered breaks its
+  preset. (Presets, step 3)
 - **Sandbox policy.** File-write sandboxing, and the policy line in the
   runtime context. (Filesystem; Working directory)
 - **The filesystem observation policy:** the `fs/write-intent`,
@@ -212,7 +219,6 @@ From Play This Life's plugin list:
 
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.
-- **Personas:** `persona` (presets, step 3).
 - **The rest:** `mcp-client`, `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 

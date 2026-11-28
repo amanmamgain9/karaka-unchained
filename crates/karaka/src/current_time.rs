@@ -3,8 +3,11 @@
 
 use std::time::SystemTime;
 
+use std::sync::Arc;
+
+use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::ToolSchema;
-use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRun};
+use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun};
 use serde_json::Value;
 
 /// Tells the model the current time in UTC, such as
@@ -23,6 +26,25 @@ impl Tool for CurrentTime {
 
     fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
         Box::pin(async { ToolOutput::ok(httpdate::fmt_http_date(SystemTime::now())) })
+    }
+}
+
+/// Registers [`CurrentTime`] globally, as a plugin, so it is there before
+/// the presets are set up and a preset's tool policy can name it.
+pub struct CurrentTimePlugin;
+
+impl Plugin for CurrentTimePlugin {
+    fn name(&self) -> &str {
+        "current-time"
+    }
+
+    fn requires(&self) -> Vec<PortId> {
+        vec![PortId::of::<ToolRegistry>()]
+    }
+
+    async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+        ctx.get::<ToolRegistry>().register(Arc::new(CurrentTime))?;
+        Ok(())
     }
 }
 
