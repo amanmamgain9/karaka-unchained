@@ -215,6 +215,10 @@ impl Agents for Registry {
     fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>> {
         self.live.lock().unwrap().get(id).cloned()
     }
+
+    fn list(&self) -> Vec<Arc<dyn Agent>> {
+        self.live.lock().unwrap().values().cloned().collect()
+    }
 }
 
 /// Provides the stand-in registry, the inbox hooks, and the `inbox`

@@ -1,6 +1,6 @@
 [package]
 name = "karaka-tool-policy"
-description = "Karaka's tool policy preset plugin: a preset's allow and deny lists, as a restriction on its scope"
+description = "Karaka's tool policy preset plugin: a preset's allow and deny lists, as a restriction on its scope and an application tool policy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,9 +14,16 @@ karaka-kernel.workspace = true
 karaka-scope.workspace = true
 # The restriction it files.
 karaka-tools.workspace = true
+# The application catalog it splits the lists by, and the application
+# policy it files.
+karaka-mcp-application.workspace = true
 
 [dev-dependencies]
+karaka-agent.workspace = true
 karaka-agent-loop.workspace = true
+karaka-identity.workspace = true
+karaka-credentials.workspace = true
+karaka-server-auth.workspace = true
 karaka-model.workspace = true
 karaka-session.workspace = true
 karaka-session-projection.workspace = true

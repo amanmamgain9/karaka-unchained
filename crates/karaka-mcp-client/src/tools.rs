@@ -24,7 +24,7 @@ use std::time::Duration;
 use karaka_model::ToolSchema;
 use karaka_scope::ScopeKey;
 use karaka_tools::json_schema::{check_schema, validate};
-use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistration, ToolRegistry, ToolRun};
+use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun};
 use serde_json::{Map, Value};
 
 use crate::client::{Client, RequestOptions};
@@ -90,6 +90,50 @@ pub struct McpTool {
     task_required: bool,
     client: Client,
     timeout: Duration,
+    /// Supplies each call's `_meta`, and may refuse the call.
+    extensions: Option<Arc<dyn BridgeExtensions>>,
+}
+
+/// What a tool's `_meta` resolves to.
+pub type MetadataFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Value>, String>> + Send + 'a>>;
+
+/// Takes a published tool back.
+pub type Disposer = Box<dyn FnOnce() + Send>;
+
+/// How a caller shapes a server's tools: prepared before publication, given
+/// `_meta` per call, and published its own way. (Karaka's fork of dsh's
+/// `syncTools`: its `extensions`' `prepare`, `metadata` and `register`.)
+pub trait BridgeExtensions: Send + Sync {
+    /// The tool to publish for `tool`, from its `tools/list` entry
+    /// `definition`. The default publishes it as it is.
+    ///
+    /// # Errors
+    ///
+    /// The tool can't be published, which fails the whole generation.
+    fn prepare(&self, tool: McpTool, _definition: &Value) -> Result<Arc<dyn Tool>, String> {
+        Ok(Arc::new(tool))
+    }
+
+    /// The `_meta` sent with one call, made by `run`. The default sends
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// The call is refused; its message is the result's.
+    fn metadata<'a>(&'a self, _run: &'a ToolRun) -> MetadataFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Publishes `tool` its own way, or `None` to register it in the
+    /// bridge's scope.
+    ///
+    /// # Errors
+    ///
+    /// The tool's name is taken, which rolls the generation back.
+    fn register(&self, _tool: Arc<dyn Tool>) -> Option<Result<Disposer, String>> {
+        None
+    }
 }
 
 impl McpTool {
@@ -113,7 +157,30 @@ impl McpTool {
             raw_name,
             client,
             timeout,
+            extensions: None,
         }
+    }
+
+    /// The same tool, its calls' `_meta` from `extensions`.
+    pub fn with_extensions(mut self, extensions: Arc<dyn BridgeExtensions>) -> Self {
+        self.extensions = Some(extensions);
+        self
+    }
+
+    /// The server's input schema.
+    pub fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
+    /// The same tool, with `schema` as its parameters.
+    pub fn with_input_schema(mut self, schema: Value) -> Self {
+        self.input_schema = schema;
+        self
+    }
+
+    /// Whether the tool needs the task extension.
+    pub fn task_required(&self) -> bool {
+        self.task_required
     }
 
     pub fn public_name(&self) -> &str {
@@ -124,7 +191,13 @@ impl McpTool {
         &self.raw_name
     }
 
-    async fn run(&self, arguments: Value) -> Result<String, String> {
+    /// Runs one call: the text the model reads, or the error's message.
+    ///
+    /// # Errors
+    ///
+    /// The tool needs tasks, the extensions refused the call, the server
+    /// failed it, or its result doesn't fit.
+    pub async fn call(&self, arguments: Value, run: &ToolRun) -> Result<String, String> {
         if self.task_required {
             return Err(format!(
                 "Tool \"{}\" requires task-based execution, which this bridge does not support",
@@ -138,11 +211,17 @@ impl McpTool {
         } else {
             Value::Object(Map::new())
         };
+        let mut params = serde_json::json!({ "name": self.raw_name, "arguments": arguments });
+        if let Some(extensions) = &self.extensions
+            && let Some(meta) = extensions.metadata(run).await?
+        {
+            params["_meta"] = meta;
+        }
         let result = self
             .client
-            .call_tool(
-                &self.raw_name,
-                arguments,
+            .request(
+                "tools/call",
+                Some(params),
                 RequestOptions {
                     timeout: Some(self.timeout),
                     cancel: None,
@@ -217,9 +296,9 @@ impl Tool for McpTool {
 
     /// Dropping the call cancels it: the client tells the server with
     /// `notifications/cancelled`.
-    fn execute<'a>(&'a self, arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+    fn execute<'a>(&'a self, arguments: Value, run: ToolRun) -> ToolFuture<'a> {
         Box::pin(async move {
-            match self.run(arguments).await {
+            match self.call(arguments, &run).await {
                 Ok(text) => ToolOutput::ok(text),
                 // dsh's tool layer shows a thrown error as `Error: <message>`.
                 Err(message) => ToolOutput::error(format!("Error: {message}")),
@@ -422,8 +501,9 @@ pub struct ToolBridge {
     scope: Option<ScopeKey>,
     tools: Arc<ToolRegistry>,
     timeout: Duration,
-    registrations: Mutex<Vec<ToolRegistration>>,
+    registrations: Mutex<Vec<(String, Disposer)>>,
     log: Log,
+    extensions: Option<Arc<dyn BridgeExtensions>>,
 }
 
 impl ToolBridge {
@@ -441,18 +521,23 @@ impl ToolBridge {
             timeout,
             registrations: Mutex::new(Vec::new()),
             log,
+            extensions: None,
         }
+    }
+
+    /// The same bridge, its tools shaped by `extensions`.
+    #[must_use]
+    pub fn with_extensions(mut self, extensions: Arc<dyn BridgeExtensions>) -> Self {
+        self.extensions = Some(extensions);
+        self
     }
 
     /// The public names this server has registered now.
     pub fn registered(&self) -> Vec<String> {
-        self.lock()
-            .iter()
-            .map(|registration| registration.name().to_owned())
-            .collect()
+        self.lock().iter().map(|(name, _)| name.clone()).collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<ToolRegistration>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, Disposer)>> {
         self.registrations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -468,31 +553,51 @@ impl ToolBridge {
         } else {
             client.list_all_tools(RequestOptions::default()).await?
         };
-        let mut next: Vec<McpTool> = Vec::new();
+        let mut next: Vec<(String, Arc<dyn Tool>)> = Vec::new();
         for definition in &listed {
-            let tool = McpTool::new(&self.server_name, definition, client.clone(), self.timeout);
-            if next
-                .iter()
-                .any(|known| known.public_name == tool.public_name)
-            {
+            let mut tool =
+                McpTool::new(&self.server_name, definition, client.clone(), self.timeout);
+            if next.iter().any(|(known, _)| *known == tool.public_name) {
                 return Err(McpError::other(format!(
                     "{label}: server listed tool \"{}\" more than once — invalid tool list",
                     tool.raw_name
                 )));
             }
-            next.push(tool);
+            let name = tool.public_name.clone();
+            let prepared: Arc<dyn Tool> = match &self.extensions {
+                Some(extensions) => {
+                    tool = tool.with_extensions(Arc::clone(extensions));
+                    extensions
+                        .prepare(tool, definition)
+                        .map_err(McpError::other)?
+                }
+                None => Arc::new(tool),
+            };
+            next.push((name, prepared));
         }
         let mut registrations = self.lock();
-        for previous in registrations.drain(..) {
-            previous.remove();
+        for (_, previous) in registrations.drain(..) {
+            previous();
         }
-        let mut registered = Vec::new();
-        for tool in next {
-            match self.tools.register_in(self.scope.as_ref(), Arc::new(tool)) {
-                Ok(registration) => registered.push(registration),
+        let mut registered: Vec<(String, Disposer)> = Vec::new();
+        for (name, tool) in next {
+            let published = match self
+                .extensions
+                .as_ref()
+                .and_then(|ext| ext.register(Arc::clone(&tool)))
+            {
+                Some(result) => result,
+                None => self
+                    .tools
+                    .register_in(self.scope.as_ref(), tool)
+                    .map(|registration| -> Disposer { Box::new(move || registration.remove()) })
+                    .map_err(|error| error.to_string()),
+            };
+            match published {
+                Ok(disposer) => registered.push((name, disposer)),
                 Err(error) => {
-                    for registration in registered {
-                        registration.remove();
+                    for (_, disposer) in registered {
+                        disposer();
                     }
                     (self.log)(
                         Level::Error,
@@ -501,7 +606,7 @@ impl ToolBridge {
                         ),
                     );
                     if strict {
-                        return Err(McpError::other(error.to_string()));
+                        return Err(McpError::other(error));
                     }
                     return Ok(());
                 }
@@ -518,8 +623,8 @@ impl ConnectionObserver for ToolBridge {
     }
 
     fn clear(&self) {
-        for registration in self.lock().drain(..) {
-            registration.remove();
+        for (_, disposer) in self.lock().drain(..) {
+            disposer();
         }
     }
 

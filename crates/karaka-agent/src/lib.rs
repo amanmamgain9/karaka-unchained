@@ -35,7 +35,9 @@ mod request_error;
 mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
-pub use compose::{AgentComposer, AgentComposition, ComposeError, CompositionTaken};
+pub use compose::{
+    AgentComposer, AgentComposition, AgentOpenHooks, ComposeError, CompositionTaken, OpenListener,
+};
 pub use inbox::{InboxError, SpliceCause};
 pub use inbox_hooks::{InboxHooks, InboxListener};
 pub use pre_step::{
@@ -190,6 +192,10 @@ pub trait Agents: Send + Sync {
     /// The live agent for the session `id`, if one has been opened, without
     /// making one. (dsh: `AgentRegistry.get`.)
     fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>>;
+
+    /// Every live agent, in no particular order. (dsh:
+    /// `AgentRegistry.list`.)
+    fn list(&self) -> Vec<Arc<dyn Agent>>;
 }
 
 /// Why [`Agents::open`] failed.

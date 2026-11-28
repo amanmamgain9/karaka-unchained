@@ -63,6 +63,10 @@ karaka-agent-presets = { path = "crates/karaka-agent-presets" }
 karaka-persona = { path = "crates/karaka-persona" }
 karaka-tool-policy = { path = "crates/karaka-tool-policy" }
 karaka-mcp-client = { path = "crates/karaka-mcp-client" }
+karaka-identity = { path = "crates/karaka-identity" }
+karaka-credentials = { path = "crates/karaka-credentials" }
+karaka-server-auth = { path = "crates/karaka-server-auth" }
+karaka-mcp-application = { path = "crates/karaka-mcp-application" }
 # Implementations. Only the `karaka` binary names these.
 karaka-anthropic = { path = "crates/karaka-anthropic" }
 karaka-openai = { path = "crates/karaka-openai" }

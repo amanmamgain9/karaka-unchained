@@ -650,6 +650,7 @@ dependencies = [
  "karaka-anthropic",
  "karaka-fs-local",
  "karaka-kernel",
+ "karaka-mcp-application",
  "karaka-mcp-client",
  "karaka-model",
  "karaka-openai",
@@ -739,6 +740,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-credentials"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-fs"
 version = "0.1.0"
 dependencies = [
@@ -759,9 +768,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-identity"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-session",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-kernel"
 version = "0.1.0"
 dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "karaka-mcp-application"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent",
+ "karaka-credentials",
+ "karaka-identity",
+ "karaka-kernel",
+ "karaka-mcp-client",
+ "karaka-model",
+ "karaka-scope",
+ "karaka-server-auth",
+ "karaka-session",
+ "karaka-tools",
+ "reqwest",
+ "serde_json",
  "tokio",
 ]
 
@@ -844,6 +881,16 @@ name = "karaka-scope"
 version = "0.1.0"
 dependencies = [
  "karaka-session",
+]
+
+[[package]]
+name = "karaka-server-auth"
+version = "0.1.0"
+dependencies = [
+ "karaka-credentials",
+ "karaka-identity",
+ "karaka-kernel",
+ "tokio",
 ]
 
 [[package]]
@@ -953,11 +1000,16 @@ dependencies = [
 name = "karaka-tool-policy"
 version = "0.1.0"
 dependencies = [
+ "karaka-agent",
  "karaka-agent-loop",
  "karaka-agent-presets",
+ "karaka-credentials",
+ "karaka-identity",
  "karaka-kernel",
+ "karaka-mcp-application",
  "karaka-model",
  "karaka-scope",
+ "karaka-server-auth",
  "karaka-session",
  "karaka-session-projection",
  "karaka-system-prompt",

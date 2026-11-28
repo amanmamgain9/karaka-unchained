@@ -7,7 +7,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use karaka_agent::{
-    Agent, AgentComposition, Agents, InboxHooks, OpenError, PreStepHooks, RequestErrorHooks,
+    Agent, AgentComposition, AgentOpenHooks, Agents, InboxHooks, OpenError, PreStepHooks,
+    RequestErrorHooks,
 };
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
@@ -64,6 +65,8 @@ pub(crate) struct Shared {
     pub(crate) pre_step: Arc<PreStepHooks>,
     /// What composes each agent from its session: its preset.
     pub(crate) composition: Arc<AgentComposition>,
+    /// Told when an agent is made.
+    pub(crate) opened: Arc<AgentOpenHooks>,
     /// Each step's prompt and tool list are assembled from it.
     pub(crate) prompt: Arc<SystemPrompt>,
     /// Where each agent's inbox is folded, as the `inbox` projection.
@@ -94,6 +97,8 @@ pub struct LoopHooks {
     pub pre_step: Arc<PreStepHooks>,
     /// Where an agent composer is set.
     pub composition: Arc<AgentComposition>,
+    /// Told when an agent is made.
+    pub opened: Arc<AgentOpenHooks>,
 }
 
 impl AgentLoop {
@@ -121,6 +126,7 @@ impl AgentLoop {
                 inbox_hooks: hooks.inbox,
                 pre_step: hooks.pre_step,
                 composition: hooks.composition,
+                opened: hooks.opened,
                 prompt,
                 projections,
             }),
@@ -165,6 +171,9 @@ impl Agents for AgentLoop {
         .current()?;
         let agent = Arc::new(LoopAgent::new(session, Arc::clone(&self.shared)));
         agents.insert(id, Arc::clone(&agent));
+        drop(agents);
+        let agent: Arc<dyn Agent> = agent;
+        self.shared.opened.opened(&agent);
         Ok(agent)
     }
 
@@ -173,6 +182,14 @@ impl Agents for AgentLoop {
         agents
             .get(id)
             .map(|agent| Arc::clone(agent) as Arc<dyn Agent>)
+    }
+
+    fn list(&self) -> Vec<Arc<dyn Agent>> {
+        let agents = self.agents.lock().unwrap_or_else(PoisonError::into_inner);
+        agents
+            .values()
+            .map(|agent| Arc::clone(agent) as Arc<dyn Agent>)
+            .collect()
     }
 }
 
@@ -200,8 +217,8 @@ impl fmt::Debug for AgentLoop {
 /// session projections and the system prompt. It registers the `inbox`
 /// projection, which holds each agent's pending input, and the prompt
 /// variables `provider` (its route) and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
-/// [`InboxHooks`], [`PreStepHooks`] and [`AgentComposition`] ports beside
-/// `Agents`, empty: the loop
+/// [`InboxHooks`], [`PreStepHooks`], [`AgentComposition`] and
+/// [`AgentOpenHooks`] ports beside `Agents`, empty: the loop
 /// runs the hooks, so it owns the lists. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
 ///
@@ -230,6 +247,7 @@ impl Plugin for AgentLoopPlugin {
             PortId::of::<InboxHooks>(),
             PortId::of::<PreStepHooks>(),
             PortId::of::<AgentComposition>(),
+            PortId::of::<AgentOpenHooks>(),
         ]
     }
 
@@ -269,6 +287,7 @@ impl Plugin for AgentLoopPlugin {
         ctx.provide(hooks.inbox);
         ctx.provide(hooks.pre_step);
         ctx.provide(hooks.composition);
+        ctx.provide(hooks.opened);
         Ok(())
     }
 }

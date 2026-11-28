@@ -39,7 +39,7 @@ pub use connection::{
     ReconnectPolicy, SyncFuture, TransportConfig, TransportFactory, resolve_reconnect_policy,
     start_connection, transport_factory,
 };
-pub use http::{HttpParams, HttpTransport};
+pub use http::{HeaderFuture, HeaderSource, HttpOptions, HttpParams, HttpTransport};
 pub use plugin::{
     MCP_SERVERS_SECTION_ORDER, McpClients, McpClientsPlugin, McpServer, McpServerConfig,
     McpServerPresetPlugin, McpStartError,
@@ -50,5 +50,8 @@ pub use protocol::{
     SUPPORTED_PROTOCOL_VERSIONS, client_info, code, envelope, meta,
 };
 pub use stdio::{Stderr, StdioParams, StdioTransport, child_env};
-pub use tools::{Log, McpTool, ToolBridge, extract_text, public_tool_name};
+pub use tools::{
+    BridgeExtensions, Disposer, Log, McpTool, MetadataFuture, ToolBridge, extract_text,
+    public_tool_name,
+};
 pub use transport::{Inbound, Transport, TransportFuture, TransportKind};

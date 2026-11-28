@@ -81,6 +81,10 @@ impl Agents for Registry {
     fn get(&self, id: &SessionId) -> Option<Arc<dyn Agent>> {
         self.0.lock().unwrap().get(id).cloned()
     }
+
+    fn list(&self) -> Vec<Arc<dyn Agent>> {
+        self.0.lock().unwrap().values().cloned().collect()
+    }
 }
 
 struct RegistryPlugin;

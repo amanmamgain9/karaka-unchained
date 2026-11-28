@@ -18,6 +18,7 @@ use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
 use karaka_fs_local::LocalFsPlugin;
 use karaka_kernel::{DynPlugin, Runtime};
+use karaka_mcp_application::ApplicationCatalogPlugin;
 use karaka_mcp_client::{Level, McpClientsPlugin};
 use karaka_model::Block;
 use karaka_retry::RetryPlugin;
@@ -168,6 +169,10 @@ pub fn loop_plugins(
         })),
         McpClientsPlugin::server,
     )));
+    // The application catalog a preset's tool policy splits its lists by,
+    // with no application endpoints yet. (Karaka: the
+    // `application-catalog` row.)
+    plugins.push(Box::new(ApplicationCatalogPlugin::default()));
     if let Some(presets) = presets {
         plugins.push(Box::new(presets));
     }

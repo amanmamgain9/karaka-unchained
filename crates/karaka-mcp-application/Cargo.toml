@@ -1,0 +1,32 @@
+[package]
+name = "karaka-mcp-application"
+description = "Karaka's application MCP: an application server's MCP endpoint, its tools published only to the agents of sessions it owns, each call authorized and carrying the owner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The connection supervisor, the HTTP transport and the tool bridge.
+karaka-mcp-client.workspace = true
+# Who owns a session, and what to send the application's endpoint.
+karaka-identity.workspace = true
+karaka-server-auth.workspace = true
+# Tools are registered in each owned agent's scope; agents are found as
+# they open.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+karaka-scope.workspace = true
+karaka-agent.workspace = true
+karaka-kernel.workspace = true
+# `_meta` is JSON, its keys in Karaka's order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# Only to check the endpoint's URL, through the HTTP client the transport
+# already uses.
+reqwest.workspace = true
+
+[dev-dependencies]
+karaka-session.workspace = true
+karaka-credentials.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

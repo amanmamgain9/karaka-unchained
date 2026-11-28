@@ -7,12 +7,19 @@
 //! Redirects are followed, as `fetch` follows them by default and the SDK
 //! sets no redirect option; reqwest follows up to ten, and drops
 //! `Authorization` when one leaves the origin, as `fetch` does.
+//! [`HttpOptions`] can refuse them instead, and add headers resolved for
+//! each request, as Karaka's application transport does. (Karaka:
+//! `mcp-application/src/transport.ts`, a `fetch` that sets the bridge's
+//! headers and `redirect: 'error'`.)
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use karaka_sse::Sse;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::redirect::Policy;
 use reqwest::{Client as HttpClient, Response, StatusCode};
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -40,9 +47,42 @@ pub struct HttpParams {
     pub headers: Vec<(String, String)>,
 }
 
+/// Headers resolved for one request, or why they can't be. (Karaka:
+/// `ApplicationBridge.headers`.)
+pub type HeaderFuture = Pin<Box<dyn Future<Output = Result<Vec<(String, String)>, String>> + Send>>;
+
+/// Resolves the headers for each request.
+pub type HeaderSource = Arc<dyn Fn() -> HeaderFuture + Send + Sync>;
+
+/// What the stock transport doesn't do. (Karaka: `createTransport`'s
+/// `fetch`.)
+#[derive(Clone, Default)]
+pub struct HttpOptions {
+    /// Called before every request; what it gives overrides the configured
+    /// headers of the same name. Its error fails the request.
+    pub headers: Option<HeaderSource>,
+    /// A redirect fails the request, and its target is never contacted.
+    /// (`redirect: 'error'`.)
+    pub refuse_redirects: bool,
+}
+
+impl std::fmt::Debug for HttpOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpOptions")
+            .field("headers", &self.headers.as_ref().map(|_| "<source>"))
+            .field("refuse_redirects", &self.refuse_redirects)
+            .finish()
+    }
+}
+
+/// What a refused redirect fails with. (undici's `fetch` with
+/// `redirect: 'error'`: `fetch failed`, caused by `unexpected redirect`.)
+const REDIRECT_REFUSED: &str = "fetch failed: unexpected redirect";
+
 /// The Streamable HTTP transport. (SDK: `StreamableHTTPClientTransport`.)
 pub struct HttpTransport {
     params: HttpParams,
+    options: HttpOptions,
     client: HttpClient,
     state: Arc<Mutex<State>>,
     /// Becomes `true` on close, which ends every stream.
@@ -59,12 +99,21 @@ struct State {
 
 impl HttpTransport {
     pub fn new(params: HttpParams) -> Self {
-        let client = HttpClient::builder()
-            .connect_timeout(Duration::from_secs(10))
+        Self::with_options(params, HttpOptions::default())
+    }
+
+    /// A transport with per-request headers, or refusing redirects.
+    pub fn with_options(params: HttpParams, options: HttpOptions) -> Self {
+        let mut builder = HttpClient::builder().connect_timeout(Duration::from_secs(10));
+        if options.refuse_redirects {
+            builder = builder.redirect(Policy::none());
+        }
+        let client = builder
             .build()
             .expect("the HTTP client fails to build only if TLS can't start");
         Self {
             params,
+            options,
             client,
             state: Arc::default(),
             stop: watch::channel(false).0,
@@ -117,6 +166,7 @@ impl HttpTransport {
         let is_initialize = method.as_deref() == Some("initialize");
         let is_request = method.is_some() && message.get("id").is_some();
         let mut headers = self.common_headers(!is_initialize);
+        resolve_headers(self.options.headers.as_ref(), &mut headers).await?;
         body_headers(&mut headers, &message);
         insert(&mut headers, CONTENT_TYPE.as_str(), "application/json");
         insert(
@@ -133,6 +183,9 @@ impl HttpTransport {
             .await
             .map_err(|error| McpError::transport(error.to_string()))?;
         let status = response.status();
+        if self.options.refuse_redirects && status.is_redirection() {
+            return Err(McpError::transport(REDIRECT_REFUSED));
+        }
         if is_initialize
             && status.is_success()
             && let Some(session) = header(&response, SESSION_ID)
@@ -208,15 +261,22 @@ impl HttpTransport {
         let client = self.client.clone();
         let url = self.params.url.clone();
         let headers = self.common_headers(true);
+        let source = self.options.headers.clone();
+        let refuse_redirects = self.options.refuse_redirects;
         let mut stop = self.stop.subscribe();
         tokio::spawn(async move {
             let mut last_event_id: Option<String> = None;
             let mut attempt: u32 = 0;
             let mut retry_ms: Option<u64> = None;
             loop {
+                let mut headers = headers.clone();
+                if let Err(error) = resolve_headers(source.as_ref(), &mut headers).await {
+                    let _ = inbound.send(Inbound::Error(error.message));
+                    return;
+                }
                 let mut request = client
                     .get(&url)
-                    .headers(headers.clone())
+                    .headers(headers)
                     .header(ACCEPT, "text/event-stream");
                 if let Some(id) = &last_event_id {
                     request = request.header("last-event-id", id.as_str());
@@ -227,6 +287,10 @@ impl HttpTransport {
                 };
                 match response {
                     Ok(response) if response.status() == StatusCode::METHOD_NOT_ALLOWED => return,
+                    Ok(response) if refuse_redirects && response.status().is_redirection() => {
+                        let _ = inbound.send(Inbound::Error(REDIRECT_REFUSED.to_owned()));
+                        return;
+                    }
                     Ok(response) if !response.status().is_success() => {
                         let text = response.status().canonical_reason().unwrap_or_default();
                         let _ = inbound
@@ -324,6 +388,20 @@ impl Transport for HttpTransport {
             Ok(())
         })
     }
+}
+
+/// Sets what `source` resolves over `headers`, by name.
+async fn resolve_headers(
+    source: Option<&HeaderSource>,
+    headers: &mut HeaderMap,
+) -> Result<(), McpError> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    for (name, value) in source().await.map_err(McpError::transport)? {
+        insert(headers, &name, &value);
+    }
+    Ok(())
 }
 
 fn insert(headers: &mut HeaderMap, name: &str, value: &str) {

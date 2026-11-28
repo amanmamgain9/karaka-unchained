@@ -1,0 +1,17 @@
+[package]
+name = "karaka-identity"
+description = "Karaka's application ownership: application, tenant and user ids, and the port that says which application owns a session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Owners are looked up by session id.
+karaka-session.workspace = true
+# The plugin that puts the owners in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

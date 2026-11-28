@@ -8,6 +8,7 @@ use karaka_agent_presets::{
     AgentPresets, AgentPresetsConfig, AgentPresetsPlugin, PresetDefinition,
 };
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId, Runtime};
+use karaka_mcp_application::ApplicationCatalogPlugin;
 use karaka_model::{ModelsPlugin, ToolSchema};
 use karaka_scope::{PresetId, ScopeChain};
 use karaka_session::SessionsPlugin;
@@ -76,6 +77,7 @@ async fn runtime() -> Runtime {
         Box::new(ModelsPlugin),
         Box::new(AgentLoopPlugin::new(LoopConfig::new("mock", "mock-model"))),
         Box::new(GlobalTools),
+        Box::new(ApplicationCatalogPlugin::default()),
         Box::new(
             AgentPresetsPlugin::new(AgentPresetsConfig::new("open"))
                 .preset(preset("open", policy(None, None)))

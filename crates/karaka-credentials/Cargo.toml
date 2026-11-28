@@ -1,0 +1,15 @@
+[package]
+name = "karaka-credentials"
+description = "dsh's credentials seam: a credential reference, the port that resolves it, and the process-environment resolver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The plugin that puts the resolver in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

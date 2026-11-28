@@ -1,0 +1,19 @@
+[package]
+name = "karaka-server-auth"
+description = "Karaka's server-to-server authentication: the port that verifies an application server and authorizes calls to its tools, and the shared-bearer provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Applications are named by their identity id.
+karaka-identity.workspace = true
+# The bearer values are credential references.
+karaka-credentials.workspace = true
+# The plugin that puts the provider in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -130,3 +130,54 @@ impl fmt::Display for CompositionTaken {
 }
 
 impl std::error::Error for CompositionTaken {}
+
+/// Called with each agent the loop makes, once, when it is first opened.
+pub type OpenListener = Arc<dyn Fn(&Arc<dyn crate::Agent>) + Send + Sync>;
+
+/// The port told when an agent is made. The loop provides it, empty, and
+/// calls each listener, in the order they were added, after the agent is
+/// made and before `Agents::open` returns it. (dsh: the `agent/created`
+/// event.)
+#[derive(Default)]
+pub struct AgentOpenHooks {
+    listeners: RwLock<Vec<OpenListener>>,
+}
+
+impl AgentOpenHooks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `listener`, for the runtime's life.
+    pub fn register(&self, listener: OpenListener) {
+        self.listeners
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// Tells every listener about `agent`.
+    pub fn opened(&self, agent: &Arc<dyn crate::Agent>) {
+        let listeners = self
+            .listeners
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for listener in listeners {
+            listener(agent);
+        }
+    }
+}
+
+impl fmt::Debug for AgentOpenHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let count = self
+            .listeners
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("AgentOpenHooks")
+            .field("listeners", &count)
+            .finish()
+    }
+}

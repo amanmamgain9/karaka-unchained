@@ -4063,3 +4063,320 @@ registry, and MCP servers to the binary.
   module-level map.
 - **A preset's allow list masks its own MCP tools,** as dsh's does
   (open ends).
+
+## MCP application, step A
+
+This step ports Karaka's own `@karaka-ai/mcp-application` (`catalog.ts`,
+`policy.ts`, `tool-policy.ts`, `tools.ts`, `transport.ts`, `index.ts`),
+what it needs of `@karaka-ai/identity` and `@karaka-ai/server-auth`, and
+the one function of `@deepseek-ai/dsh-credentials` they need. It is how
+Play This Life gets its `mcp__play_this_life__*` tools. The binary
+mounts only an empty catalog for now; endpoints in the binary, and a real
+call, are step B.
+
+### New crates
+
+- **`karaka-identity`** (`identity/src/owner.ts`):
+  - `ApplicationId`, `TenantId`, `UserId`, `ApplicationOwner`,
+    `same_owner`, and `IdentityError` with its `forbidden` and
+    `unavailable` codes.
+  - The `SessionOwners` port: `owner_of(session)` (async) and
+    `owner_of_cached(session)`, Karaka's `ownerOf` and `ownerOfCached`.
+    They take a session id, where Karaka's take the `Session`.
+  - `InMemorySessionOwners`, which a host sets and removes owners on, and
+    `SessionOwnersPlugin`, which provides both.
+  - Karaka's whole `KarakaIdentity` (`identity/src/index.ts`: reserve,
+    bind, `markReady`, `withChatLock`, `authorize`, `ownerOfId`, lineage
+    through child sessions, persistence) is an open end. It comes with
+    the app ingress and the webserver.
+- **`karaka-credentials`** (`credentials/credentials/src/index.ts`):
+  - `CredentialRef::new` is `credentialRef`: a POSIX variable name, or
+    dsh's `credential ref "x" must match /^[A-Za-z_][A-Za-z0-9_]*$/`.
+  - The `Credentials` port is `CredentialProvider.resolve` only. A
+    resolved value's `Debug` hides it.
+  - `EnvCredentials` is the process-environment layer of
+    `credentials-local`: read at each resolve, an empty value unset,
+    source `env`. `with_lookup` swaps the environment for a function, so
+    tests never read the real one.
+  - The store, the project and user `.env` layers, and `describe`, `set`,
+    `unset` and change events wait for `credentials-local` (still to
+    port).
+- **`karaka-server-auth`** (`server-auth/src/index.ts`):
+  - The `ServerAuth` port: `authenticate(authorization)` and
+    `authorize_tools(application)`.
+  - `BearerServerAuth`, the stock shared-bearer provider:
+    - Karaka's construction errors, for an empty id, a duplicate id, and
+      a bad credential reference.
+    - The `Bearer` parse, `/^Bearer ([^\s]+)$/iu`: the scheme in any
+      case, one space, and a token without JavaScript's `\s` (Unicode
+      White_Space and the BOM).
+    - A constant-time compare on equal lengths, `timingSafeEqual`. It is
+      written out, as a fold over the bytes behind `black_box`, rather
+      than adding a crate.
+    - Two applications sharing a value verify neither.
+    - Credentials are resolved at every use, so rotation applies to the
+      next request. The tool header is `Bearer <value>`, with Karaka's
+      `unknown application` and `is not configured` errors.
+  - `ServerAuthPlugin::bearer(config)` requires `Credentials`.
+    `ServerAuthPlugin::with(auth)` takes any provider.
+- **`karaka-mcp-application`**: the catalog, the policies, the tool
+  check, the transport, and the endpoint.
+
+### The catalog (`catalog.rs`, from `catalog.ts`)
+
+- `ApplicationCatalog::new(servers)` refuses a repeated server with
+  Karaka's `must be unique`.
+- `endpoint(server)` claims one server, with Karaka's `does not
+  configure` and `already has an owner`. It returns a `CatalogEndpoint`,
+  whose `settle` and `dispose` do nothing once the claim is stale.
+- `register_tool(name)` is counted per name, and returns a contribution
+  to `remove()`. `names()` is a detached set.
+- **Readiness.** Karaka provides the same catalog again as
+  `karakaApplicationTools` once every server has an endpoint and every
+  endpoint has settled. Here `tools()` returns the names from then on,
+  and `None` before. Readiness latches, as Karaka's provide does: it
+  outlasts an endpoint's disposal and replacement. With no servers it is
+  ready at once.
+- `ApplicationCatalogPlugin` provides the catalog and the policies.
+  Every runtime with the tool policy mounts it, with no servers when it
+  has no applications. The binary does.
+
+### The policies (`policy.rs`, from `policy.ts`)
+
+- `ApplicationPolicies` is Karaka's module-level `policies` and
+  `listeners` maps, keyed by root; one per runtime here.
+- `register(scope, policy)` files one policy. With no scope it fails
+  with Karaka's `Karaka tool policy must be mounted inside an Agent
+  preset`. It tells every listener, outside the lock. A listener's error
+  takes the policy back out and is returned. `PolicyRegistration::remove`
+  takes it out and tells them again.
+- `watch(listener)` returns a `PolicyWatch` to remove.
+- `allows(chain, name)` is `policyAllows`, over the chain farthest
+  first:
+  - an allow list without the name refuses;
+  - an allow list with it counts as explicit;
+  - a deny list with it refuses;
+  - otherwise it allows only if some list allowed explicitly.
+
+  So, unlike a global tool's restriction, an application tool needs an
+  allow somewhere.
+
+### The tool policy's split (`karaka-tool-policy`, from `tool-policy.ts`)
+
+- The policy now requires `ApplicationCatalog` and
+  `ApplicationPolicies`.
+- It takes the catalog's names out of both lists for `restrict`, so a
+  global restriction never names an application tool. It files the whole
+  lists as the preset's application policy, in the preset's scope.
+- An omitted list stays omitted in both. With neither list, nothing is
+  filed. An allow list of application names only becomes an empty
+  global allow, which hides every inherited global tool, as Karaka's
+  does.
+- **Departure: an unsettled catalog breaks the preset.** Karaka's policy
+  waits for `karakaApplicationTools`. Here the kernel starts plugins one
+  at a time, so when the presets set up, every endpoint listed before
+  them has settled. A catalog still unsettled then never settles. The
+  preset breaks with `tool-policy: application catalog servers have not
+  settled: "x"`, rather than waiting forever.
+- **What this closes.** A preset can now allow its application tools.
+  They are registered in each owned session's own scope, which the
+  preset's restriction doesn't reach, and the application policy decides
+  them.
+- **A preset-row `mcp-client` server's tools** are still masked by their
+  preset's own allow list, and can't be named in it. Karaka's split
+  covers only the application catalog's names, and dsh's and Karaka's
+  behaviour for a preset's own servers is the same.
+
+### The tool check (`tools.rs`, from `tools.ts`)
+
+- `prepare_application_tool` is `prepareApplicationTool`:
+  - it removes `$schema` from the parameters;
+  - the rest must be an object schema in dsh's enforced subset
+    (`assertObjectJsonSchema`), or the error is the generation's;
+  - the registry then checks each call's arguments before anything else
+    runs, so a bad call is `Error: invalid arguments: …` and is never
+    authorized or sent;
+  - a tool whose `taskSupport` is `required` keeps the bridge's task
+    refusal first, so its arguments aren't checked.
+
+### The transport (`transport.rs`, from `transport.ts`)
+
+- `application_transport(url, headers, source)` checks the URL first:
+  `Invalid URL`, or Karaka's `MCP endpoint must use HTTP or HTTPS`,
+  before any credential is asked for.
+- **New in `karaka-mcp-client`'s `HttpTransport`:** `HttpOptions`, given
+  to `HttpTransport::with_options`:
+  - `headers`: a `HeaderSource` called before every request, POSTs and
+    the GET stream alike. What it returns overrides the configured
+    headers by name. Its error fails the request.
+  - `refuse_redirects`: reqwest follows no redirect, and a 3xx fails the
+    request with `fetch failed: unexpected redirect`. That is undici's
+    `redirect: 'error'` failure, flattened into one message. The target
+    is never contacted.
+- The application's source is `{ authorization: authorize_tools(app) }`.
+  The static headers stay, so a stale configured `authorization` is
+  overridden at every request.
+
+### The endpoint (`application.rs`, from `index.ts`)
+
+- **`ApplicationConfig`** has Karaka's fields and defaults: a 60 s
+  timeout, `fail_on_startup_error` on, empty `allow` and `deny`, and the
+  raw `reconnect`. Reading it from a row (`from_json`) comes with the
+  binary in step B.
+- **`start_application(ports, config)`** is `apply`:
+  1. It checks `serverName` against `^[A-Za-z0-9_-]{1,32}$`, with the
+     message `McpServerConfig::from_json` uses.
+  2. It claims the server in the catalog.
+  3. It resolves `reconnect`, prefixed `karaka-mcp-application`.
+  4. It builds the transport.
+  5. It watches the policies and the agents.
+  6. It starts dsh's supervisor with a `ToolBridge` whose extensions are
+     the endpoint.
+  7. It waits for the first attempt.
+  8. It settles the catalog.
+
+  A fatal start disposes everything and fails with `Application MCP <x>
+  could not start`, its cause appended as `McpStartError` appends one.
+- **It calls the supervisor directly,** as Karaka calls `startConnection`
+  rather than through `mcp-client`'s `apply`. So no `serverName` is
+  reserved in `McpClients`, and the server's instructions are no prompt
+  section, as in Karaka.
+- **The bridge's extensions,** new in `karaka-mcp-client` as
+  `BridgeExtensions`, are the hooks Karaka's fork of dsh's `syncTools`
+  added:
+  - **`prepare(tool, definition)`.** Its error fails the generation.
+  - **`metadata(run)`** gives the `_meta` of the call. `McpTool` now
+    sends `tools/call` through `Client::request` with `{ name,
+    arguments, _meta }`. Its `call(arguments, run)` is public.
+  - **`register(tool)`** publishes the tool its own way, returning a
+    `Disposer`. The bridge now keeps disposers, not registrations, and a
+    refused one rolls the generation back as a conflict does.
+- **`metadata`** is `ApplicationBridge.metadata`, checked at every call:
+  - no agent: `Application tool requires an Agent`;
+  - the session's owner, read with `owner_of` (not the cached one), isn't
+    this application: `Application tool owner does not match endpoint`;
+  - the endpoint's lists or the agent's policies don't admit the name:
+    `Application tool is not allowed`.
+
+  Otherwise the `_meta` is `{ "karaka": { applicationId, tenantId,
+  userId, chatId } }`, in that key order, the chat being the agent's
+  session id. A refusal is the tool's `Error: <message>`.
+- **`register`** is `ApplicationBridge.register`. It files the tool in
+  the endpoint's catalog and contributes its name to the
+  `ApplicationCatalog`. Then it registers the tool in the own scope
+  (`ScopeKey::Session`) of every attached agent the lists and policies
+  admit. A refused registration takes all of that back and fails. The
+  disposer takes the tool from the catalog and from every agent.
+- **Attaching** is `attach`. An agent is attached once, by
+  `Agent::instance()`. Its cached owner must be this application, and
+  every catalog tool it admits is registered for it. A policy change
+  removes and registers every attached agent's tools again (the
+  `watchPolicy` listener), and its error refuses the policy.
+- **`agent/created` and `agents.list()`.** Karaka attaches agents on the
+  `agent/created` event and lists the live ones at start. Karaka has
+  neither, so this step adds both:
+  - **`AgentOpenHooks`**, a port in `karaka-agent`, provided by the
+    loop's plugin. `Agents::open` calls each listener after it makes an
+    agent, outside its lock, before the agent runs a step. The prompt's
+    pre-step and assembly listeners run too late, because the first
+    step's tools are listed at assembly. A hook is also what an agent
+    made later by any path tells.
+  - **`Agents::list()`**, dsh's `AgentRegistry.list`, which the loop
+    answers from its map. With the kernel, no agent is open when the
+    plugin starts, but `start_application` is callable on its own, and
+    the specs open agents before it starts. An agent opened between the
+    hook and the list is attached once.
+- **The owner must be known when the agent opens.** As in Karaka, an
+  agent is offered the catalog by its cached owner at creation. A host
+  using `InMemorySessionOwners` sets the owner before `Agents::open`.
+  Karaka's identity binds the chat before its agent exists; that comes
+  with the identity lifecycle (open ends).
+- **`Application::dispose`** stops the watches, disposes the
+  connection, which clears the bridge and so the catalog and every
+  agent's tools, and frees the server's claim. Agents never close, so an
+  agent's registrations last while the endpoint does. Karaka removes
+  them with the agent's scope.
+- **`McpApplicationPlugin`** starts one endpoint, and is named
+  `karaka-mcp-application(<server>)` so several can mount. It requires
+  the tools, `SessionOwners`, `ServerAuth`, the catalog, the policies,
+  `Agents` and `AgentOpenHooks`. It provides nothing, so the kernel
+  doesn't order it before the presets: list it before them. `on_log`
+  takes the supervisor's lines, which are dropped otherwise.
+
+### How delegated access plugs in later
+
+Play This Life disables `server-auth` and signs short-lived ES256
+service tokens with `delegated-access` (see "Service tokens between the
+app and Karaka"). Nothing of that is built here. The seam it needs:
+
+- It is a `ServerAuth`: `authorize_tools(app)` returns `Bearer <token>`
+  for the `tools` purpose, and `authenticate` verifies the app's
+  `service-api` token.
+- The transport calls `authorize_tools` before every request, so each
+  request can carry a freshly signed 60-second token. Nothing caches
+  one.
+- It mounts with `ServerAuthPlugin::with(Arc::new(delegated))`, or a
+  plugin of its own providing `dyn ServerAuth`, and the endpoint is
+  unchanged.
+- A token carrying a user's delegation needs the call's owner. The owner
+  is already in `_meta.karaka`, from `metadata`. If the header must carry
+  it too, `HeaderSource` would need the request's metadata as an
+  argument. Karaka's `headers(signal)` takes none either, so that would
+  be a change to agree on with the service-token work.
+
+### Tests
+
+- **43 new.** Ported specs:
+  - `server-auth`'s `authentication.spec`: 5 cases.
+  - `mcp-application`'s:
+    - `catalog.spec`: 5 here, and 2 in the tool policy's tests (an
+      endpoint leaving, and a deployment with no applications);
+    - `policy.spec`: 5;
+    - `tool-policy.spec`: 3, in `karaka-tool-policy/tests/application.rs`;
+    - `tools.spec`: 3;
+    - `transport.spec`: 3;
+    - `application.spec`: 9.
+  - Their server is a loopback HTTP MCP server speaking the 2025 era,
+    run in-process, as Karaka's specs run the SDK's handler on
+    `node:http`.
+- **New cases:**
+  - identity (3);
+  - credentials (2);
+  - a bad URL, a bad name and an unclaimed server failing the start;
+  - an unsettled catalog breaking a preset;
+  - an endpoint leaving with the restriction kept;
+  - a real runtime with every plugin, where a preset allowing
+    `mcp__app__read` gives it only to the session its application owns.
+    That session's call reaches the server with `_meta.karaka` and
+    `Bearer` from a credential looked up through a test function.
+- **Skipped:**
+  - server-auth's abort cases: pre-aborted, aborted mid-wait, and the
+    non-`Error` reason. A Rust call is cancelled by dropping it, so
+    `server authentication cancelled` has nowhere to appear.
+  - `transport-fetch.spec`, which checks the SDK's `fetch` callback
+    without a signal. A header source takes none.
+  - application's "drains in-flight discovery during disposal" and
+    catalog's two Cordis activation and cleanup cases. The kernel starts
+    a plugin to the end and unloads none.
+  - application's "removes an Agent catalog when its scope disposes".
+    Agents never close.
+  - The unload halves of tool-policy's cases, for the same reason.
+  - Owners read through Karaka's identity service. The fixture's owners
+    are `InMemorySessionOwners`, as Karaka's spec stubs the service.
+
+### Where it differs from Karaka
+
+- **An unsettled catalog breaks a preset** instead of keeping its policy
+  waiting.
+- **A URL that isn't HTTP or HTTPS fails the start** even with
+  `fail_on_startup_error` off. Karaka builds the transport in each
+  attempt, so a bad URL there is a failed first connection, fatal only
+  with the option on, and retried otherwise. A bad URL never connects,
+  so here it always fails.
+- **Owners are looked up by session id**, not by `Session`.
+- **A start error's text includes its cause,** as `mcp-client`'s does.
+- **A refused registration while attaching an agent** is logged through
+  `on_log` and skipped. Karaka's throws into the `agent/created` emit; an
+  open can't fail on it here.
+- **An endpoint's per-agent registrations are never taken back by the
+  agent,** which lives for the runtime.
