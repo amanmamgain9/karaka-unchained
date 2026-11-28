@@ -17,7 +17,7 @@
 //!         allow: [todo_write]
 //! ```
 //!
-//! A plugin row names one of three plugins, by its short name or its
+//! A plugin row names one of four plugins, by its short name or its
 //! package's, and may give an `id` for diagnostics:
 //!
 //! - `persona` (`@deepseek-ai/dsh-persona`): `prefix` (required), `suffix`,
@@ -26,7 +26,16 @@
 //!   `allow`, `deny`;
 //! - `skill-filesystem` (`@deepseek-ai/dsh-skill-filesystem`):
 //!   `includeDefaultRoots`, `customSkillDirs`, `watch`. A relative
-//!   directory is read from the file's own directory.
+//!   directory is read from the file's own directory;
+//! - `mcp-client` (`@deepseek-ai/dsh-mcp-client`): an MCP server, with
+//!   dsh's config: `transport` (`stdio` or `streamable-http`),
+//!   `serverName`, `command`, `args`, `env`, `cwd` or `url`, `headers`,
+//!   `toolCallTimeoutMs`, `failOnStartupError`, `maxInstructionBytes` and
+//!   `reconnect`. Its tools and instructions are the preset's alone.
+//!
+//! `KARAKA_MCP_SERVERS` names another file: a list of the same `mcp-client`
+//! configs, for servers every session sees, as dsh's global `mcp-client`
+//! rows.
 //!
 //! Anything else, an unknown key included, fails the start with a message
 //! that says where. `KARAKA_PRESET` names the default preset; without it,
@@ -39,6 +48,7 @@ use karaka_agent_presets::{
     PresetPlugin,
 };
 use karaka_kernel::PortId;
+use karaka_mcp_client::{McpServerConfig, McpServerPresetPlugin};
 use karaka_persona::Persona;
 use karaka_skill_filesystem::{SkillFilesystemConfig, SkillFilesystemPresetPlugin};
 use karaka_tool_policy::{ToolMode, ToolPolicy};
@@ -169,10 +179,13 @@ fn plugin_row(
         "skill-filesystem" | "@deepseek-ai/dsh-skill-filesystem" => {
             Box::new(skill_filesystem(config, &at, base, watch_skills)?)
         }
+        "mcp-client" | "@deepseek-ai/dsh-mcp-client" => Box::new(McpServerPresetPlugin::new(
+            McpServerConfig::from_json(config, &at)?,
+        )),
         other => {
             return Err(format!(
-                "{at}: unknown plugin \"{other}\"; a preset may use persona, tool-policy and \
-                 skill-filesystem"
+                "{at}: unknown plugin \"{other}\"; a preset may use persona, tool-policy, \
+                 skill-filesystem and mcp-client"
             ));
         }
     };
@@ -256,6 +269,33 @@ fn skill_filesystem(
         .validate()
         .map_err(|error| format!("{at}: {error}"))?;
     Ok(SkillFilesystemPresetPlugin::new(skills))
+}
+
+/// The global MCP servers in the file at `path`: a list of `mcp-client`
+/// configs.
+///
+/// # Errors
+///
+/// A file that doesn't read or parse, or a config that doesn't fit, said
+/// with where it is.
+pub fn load_mcp_servers(path: &Path) -> Result<Vec<McpServerConfig>, String> {
+    let at = format!("KARAKA_MCP_SERVERS ({})", path.display());
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("{at}: couldn't read it: {error}"))?;
+    parse_mcp_servers(&text, &at)
+}
+
+/// [`load_mcp_servers`] for the file's `text`.
+pub fn parse_mcp_servers(text: &str, at: &str) -> Result<Vec<McpServerConfig>, String> {
+    let documents =
+        YamlLoader::load_from_str(text).map_err(|error| format!("{at}: not YAML: {error}"))?;
+    let Some(Value::Array(rows)) = documents.first().map(json) else {
+        return Err(format!("{at}: must be a list of MCP servers"));
+    };
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| McpServerConfig::from_json(row, &format!("{at}: server {}", index + 1)))
+        .collect()
 }
 
 /// A plugin row with an `id` of its own, which its diagnostics name.
@@ -407,7 +447,7 @@ mod tests {
             ),
             (
                 "- id: a\n  plugins: [{ name: shell }]",
-                "presets.yml: preset 1 (\"a\"), plugin 1 (shell): unknown plugin \"shell\"; a preset may use persona, tool-policy and skill-filesystem",
+                "presets.yml: preset 1 (\"a\"), plugin 1 (shell): unknown plugin \"shell\"; a preset may use persona, tool-policy, skill-filesystem and mcp-client",
             ),
             (
                 "- id: a\n  plugins: [{ name: persona }]",

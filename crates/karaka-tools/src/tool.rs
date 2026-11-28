@@ -35,10 +35,11 @@ pub trait Tool: Send + Sync {
         true
     }
 
-    /// Runs one call. `arguments` is the model's JSON, already parsed: the
-    /// registry has checked it is an object, and, unless the tool opted out
-    /// with [`registry_checks_arguments`](Self::registry_checks_arguments),
-    /// that it fits the parameters.
+    /// Runs one call. `arguments` is the model's JSON, already parsed. The
+    /// registry has checked it is an object that fits the parameters,
+    /// unless the tool opted out with
+    /// [`registry_checks_arguments`](Self::registry_checks_arguments); such
+    /// a tool gets any JSON value, as dsh hands its raw definitions one.
     ///
     /// Dropping the future cancels the call, as dropping a model's stream
     /// does. dsh passes an `AbortSignal` instead and waits for the tool to

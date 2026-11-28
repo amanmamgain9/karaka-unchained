@@ -3865,3 +3865,201 @@ crate for three reasons:
   (open ends).
 - **Generations replace each other's tools,** so step B needs the tool
   registry to remove tools (open ends, "No teardown").
+
+## MCP client, step B: tools, plugin and binary
+
+This step ports the rest of dsh's `packages/mcp/mcp-client`: `tools.ts`,
+`index.ts` and `server-context.ts`. It adds tool removal to the tool
+registry, and MCP servers to the binary.
+
+### Tool removal
+
+- `ToolRegistry::register` and `register_in` now return a
+  `ToolRegistration`, and its `remove()` takes the tool out of its layer,
+  global or scoped. (dsh: the disposer `register` returns.)
+- After a removal:
+  - a scoped shadow's removal shows the inherited tool again;
+  - the name is free again;
+  - a later call is `Error: unknown tool "…"`;
+  - the next request drops the tool, and its header logs a `change`, as
+    any change of tools does.
+- Dropping a registration keeps the tool, and callers that ignore it
+  are unchanged.
+- **Raw tools get any JSON value.** A tool that opts out of the
+  registry's argument check, as dsh's raw `ToolDefinition`s and so MCP's
+  do, now gets whatever the model sent, not just an object. dsh hands a
+  raw definition any value, and its MCP definition turns a non-object
+  into `{}`.
+
+### The tools (`tools.rs`, from `tools.ts`)
+
+- **`public_tool_name(server, raw)`** is dsh's `publicToolName`:
+  - `mcp__<server>__<raw>` when it fits;
+  - otherwise, when replacing characters outside `[A-Za-z0-9_-]` (one
+    `_` per UTF-16 unit, as JavaScript replaces them) or cutting to 64
+    changed the name: the first 51 characters, `_`, then 12 hex digits
+    of SHA-256 over `server\0raw`.
+  - SHA-256 is `ring`'s, already in the tree through rustls.
+- **`McpTool`**, `createMcpToolDefinition`:
+  - The parameters are the server's `inputSchema`, sent as written. The
+    registry doesn't check them (`registry_checks_arguments` is false),
+    as dsh's MCP definitions are raw. A non-object argument becomes `{}`.
+  - The description is the server's, or empty.
+  - A tool whose `execution.taskSupport` is `required` fails with dsh's
+    message.
+  - A result that isn't a `CallToolResult` fails with `Tool "x" returned
+    an invalid MCP result: …`.
+  - `isError` fails with the result's text.
+  - The call is sent with the raw name and `toolCallTimeoutMs`.
+- **The output-schema check deferred from step A.**
+  - With an `outputSchema`, missing `structuredContent` is the SDK's
+    `Tool x has an output schema but did not return structured content`.
+  - A schema in dsh's subset is validated: `tool "<public>" returned
+    invalid output: …`, its paths from `value.structuredContent`.
+  - Any other vocabulary falls back to any JSON, as dsh's
+    `supportedOutputSchema` does.
+  - **Departure:** the SDK's own AJV check of a schema outside the subset
+    isn't ported.
+- **The cancel path.** A Karaka tool call is cancelled by dropping its
+  future. The client now sends `notifications/cancelled` (`AbortError:
+  This operation was aborted`) when a request's future is dropped before
+  it settles, where dsh aborts the call's signal.
+- **The text the model reads** is dsh's projection (`projectContent`):
+  - text runs joined with `\n`;
+  - `Resource link: name (uri)`;
+  - the audio, embedded-resource and unknown-type placeholders;
+  - `(x returned no model-visible content)`.
+
+  Karaka's results are text, so each image is dsh's refusal text.
+  Without an attachment store, dsh refuses an image with `no attachment
+  store is mounted`. A batch with an invalid image gives each image its
+  own decoding reason (a media type outside PNG, JPEG, WebP and GIF, or
+  base64 that isn't canonical), and `another image in the same result was
+  invalid` to the rest. A plain `extractText`, such as an error's text,
+  says `this result was not admitted to durable model context`.
+  `structuredContent` is checked, then not shown, as dsh's text
+  projection doesn't show it.
+- **What is lost** is dsh's canonical value for programmatic callers.
+  The "Tool results carry text only" open end records it.
+- **`ToolBridge`** is `syncTools`, as the supervisor's
+  `ConnectionObserver`:
+  - **Fetch.** Every page of `tools/list`, or none for a server without
+    `tools`. A raw name listed twice is `… more than once — invalid tool
+    list`, and the previous generation stays.
+  - **Swap.** The previous generation's registrations are removed, and
+    the new ones registered in the server's scope.
+  - **A conflict** rolls the whole generation back and logs `tool
+    registration failed, no tools registered: Error: …`. That error goes
+    on up only for the strict startup sync.
+  - **`clear`** removes everything, on giving up and on disposal.
+
+### The plugin (`plugin.rs`, from `index.ts` and `server-context.ts`)
+
+- **`McpServerConfig`** is dsh's `Config`, with its defaults: 60 s calls,
+  32 768 instruction bytes, `failOnStartupError` off.
+  - `from_json` reads dsh's row shape: `transport` `stdio` (`command`,
+    `args`, `env`, `cwd`) or `streamable-http` (`url`, `headers`), plus
+    `serverName` matching `^[A-Za-z0-9_-]{1,32}$`, `toolCallTimeoutMs`,
+    `failOnStartupError`, `maxInstructionBytes` and `reconnect`.
+  - It refuses an unknown key, as the binary's other rows do.
+- **The `McpClients` port**, provided by `McpClientsPlugin`, holds the
+  live `serverName`s per scope (dsh's module-level `activeServerNames`),
+  and the servers' log lines.
+- **`start(scope, config)`** is dsh's `apply`:
+  1. It resolves `reconnect`, with the step A messages.
+  2. It reserves the name in the scope, with dsh's duplicate message.
+  3. It starts the supervisor with a `ToolBridge`.
+  4. It registers the instructions as the section `mcp:<server>`, at
+     `MCP_SERVERS` (3100), uninterpolated, read at each assembly
+     (`registerServerContext`).
+  5. It waits for the first attempt.
+
+  With `failOnStartupError`, a failure stops the server, freeing its name,
+  and fails with `mcp-client(x): initial connection or tool
+  synchronization failed`. Karaka appends the cause, which dsh keeps as
+  the error's `cause`.
+- **`start_with`** takes a `TransportFactory` instead of the config's
+  transport: the seam for `mcp-application`'s own HTTP transport.
+- **`McpServer::dispose`** disconnects, takes the tools and the section
+  back, and frees the name.
+- **Global and per preset.**
+  - `McpClientsPlugin::new().server(config)` starts global servers, each
+    blocking startup until its first sync, as dsh's `apply` blocks
+    activation.
+  - `McpServerPresetPlugin` starts one in its preset's scope, so only the
+    preset's agents see its tools and instructions. Its failure breaks
+    the preset.
+- **Log lines.** The port keeps the most recent 256 (`lines()`), as the
+  skill registry keeps its warnings, and passes each to an optional
+  `on_log`.
+- **mcp-resources isn't ported** (open ends). It is another package, with
+  three tools over every server's resources, and Play This Life's tools
+  don't need it.
+
+### The binary
+
+- **A preset row `mcp-client`** (or `@deepseek-ai/dsh-mcp-client`) takes
+  dsh's config, so a preset can have servers of its own.
+- **`KARAKA_MCP_SERVERS=<file>`** is a YAML list of the same configs, for
+  servers every session sees. This is the equivalent of dsh's global
+  `mcp-client` rows. I chose a file of its own over a key in the presets
+  file, so global servers don't need presets.
+- **Mounting.** `McpClientsPlugin` is always mounted, after the tool
+  plugins and before the presets. Without servers it does nothing.
+- **Failures.** The servers' warnings and errors go to stderr as
+  `karaka: <line>`. A bad config fails the start with where it is.
+- **Usage text** covers the `mcp-client` row, the `mcp__` names, and the
+  variable.
+
+### Tests
+
+- **20 new:**
+  - 16 bridge and plugin cases against scripted servers;
+  - 1 registry removal case;
+  - 1 loop case: a removed tool leaves the next request, and its header
+    logs the change;
+  - 2 CLI cases against `server.sh`:
+    - a preset's server: `mcp__fixture__add` and its instructions in the
+      first request, and a call answered `3`;
+    - a global server: its tool offered, and a bad servers file failing
+      before any call.
+- **Ported:**
+  - `mcp-client.spec`'s `publicToolName`, `syncTools` (registration, two
+    servers, a native namesake, a duplicate raw name, a failed fetch, a
+    squatter's rollback, re-sync), and `tool execution` (raw names, text
+    joins, isError, tasks, the output schema, abort, each block kind,
+    the non-object fallback, descriptions);
+  - `tool-definition.spec`'s invalid results;
+  - `apply.spec`'s:
+    - the config's name rules;
+    - duplicates, per-scope names, and the reservation freed on dispose;
+    - a failed connect that is logged, and a fatal startup;
+    - a strict registration conflict;
+    - `list_changed` re-syncs, and a failed re-sync that keeps the
+      previous tools;
+    - disposal unregistering the tools;
+    - instruction limits.
+- **Skipped:**
+  - the image-admission cases needing an attachment store and an image
+    route;
+  - the post-execute replacement and `projectContent` cases, which
+    belong to dsh's richer results;
+  - `createTransport` (step A's transport tests);
+  - the Schemastery default cases (`from_json` here);
+  - the Cordis lifecycle cases (an owner unloading mid-connect, the
+    effect disposer's identity);
+  - the e2e suite's reference servers and its stdio crash recovery (open
+    ends). `server.sh` covers a real stdio round trip in step A and the
+    CLI here.
+
+### Where it differs from dsh
+
+- **The SDK's AJV check of an output schema outside dsh's subset** isn't
+  ported.
+- **A start error's text includes its cause.**
+- **Images become text,** and an image-bearing result's blocks are
+  joined into one text.
+- **`McpClients` holds the name reservations,** rather than a
+  module-level map.
+- **A preset's allow list masks its own MCP tools,** as dsh's does
+  (open ends).

@@ -18,6 +18,7 @@ use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
 use karaka_fs_local::LocalFsPlugin;
 use karaka_kernel::{DynPlugin, Runtime};
+use karaka_mcp_client::{Level, McpClientsPlugin};
 use karaka_model::Block;
 use karaka_retry::RetryPlugin;
 use karaka_session::{
@@ -65,6 +66,10 @@ const SHORT_RESULT: usize = 80;
 /// watches them by default: a chat's next step sees a skill added
 /// meanwhile. A single question has no next step to see one.
 ///
+/// MCP servers follow: the global ones from `KARAKA_MCP_SERVERS`, each
+/// waiting for its first connection, and the port a preset's `mcp-client`
+/// rows use.
+///
 /// With `KARAKA_PRESETS`, the agent preset registry goes last, so every
 /// tool a preset's policy names is registered before it is set up. The
 /// presets then own skill discovery: the global `skill-filesystem` isn't
@@ -88,6 +93,10 @@ pub fn loop_plugins(
             watch_skills,
         )?),
         None => None,
+    };
+    let mcp_servers = match &config.mcp_servers {
+        Some(path) => crate::presets::load_mcp_servers(path)?,
+        None => Vec::new(),
     };
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
@@ -148,6 +157,17 @@ pub fn loop_plugins(
     if chat {
         plugins.push(Box::new(CurrentTimePlugin));
     }
+    // MCP servers: the global ones every session sees, and the port a
+    // preset's `mcp-client` rows start theirs through. Their failures are
+    // told on stderr, as the loop's warnings would be logged.
+    plugins.push(Box::new(mcp_servers.into_iter().fold(
+        McpClientsPlugin::new().on_log(Arc::new(|level, line| {
+            if level != Level::Info {
+                eprintln!("karaka: {line}");
+            }
+        })),
+        McpClientsPlugin::server,
+    )));
     if let Some(presets) = presets {
         plugins.push(Box::new(presets));
     }

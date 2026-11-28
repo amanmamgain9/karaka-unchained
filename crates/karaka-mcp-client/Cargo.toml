@@ -21,7 +21,20 @@ karaka-sse.workspace = true
 karaka-fs.workspace = true
 # SIGTERM for a stdio server's close; already in the tree through tokio.
 libc = "0.2"
+# A server's tools are registered in the tool registry, under a scope for a
+# preset's server, and its instructions are a prompt section.
+karaka-tools.workspace = true
+karaka-model.workspace = true
+karaka-system-prompt.workspace = true
+karaka-scope.workspace = true
+# The plugin, and the preset plugin a preset mounts a server with.
+karaka-kernel.workspace = true
+karaka-agent-presets.workspace = true
+# SHA-256 for a lossy public tool name's identity hash, as dsh's
+# `createHash('sha256')`; already in the tree through rustls.
+ring = "0.17"
 
 [dev-dependencies]
 karaka-fs.workspace = true
+karaka-scope.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }

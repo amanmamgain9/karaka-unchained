@@ -25,5 +25,7 @@ pub use gate::{
 };
 pub use json_schema::JsonSchemaError;
 pub use plugin::ToolsPlugin;
-pub use registry::{RestrictionRegistration, ToolRegistry, ToolRegistryError, ToolRestriction};
+pub use registry::{
+    RestrictionRegistration, ToolRegistration, ToolRegistry, ToolRegistryError, ToolRestriction,
+};
 pub use tool::{Tool, ToolFuture, ToolOutput, ToolRun};

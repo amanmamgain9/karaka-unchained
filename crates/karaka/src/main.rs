@@ -57,8 +57,16 @@ tools and skills, from a YAML file of presets. A new session runs the
 default preset, KARAKA_PRESET or the file's first; --preset picks another
 before the session's first turn. A preset row's plugins may be persona
 (prefix, suffix, complete, includeRuntimeContext), tool-policy (allow,
-deny) and skill-filesystem (includeDefaultRoots, customSkillDirs, watch).
-With presets, skills come only from their skill-filesystem rows.
+deny), skill-filesystem (includeDefaultRoots, customSkillDirs, watch)
+and mcp-client (an MCP server, with dsh's config: transport stdio or
+streamable-http, serverName, command, args, env, cwd or url, headers,
+toolCallTimeoutMs, failOnStartupError, reconnect). With presets, skills
+come only from their skill-filesystem rows.
+
+MCP servers' tools are named mcp__<serverName>__<tool>. KARAKA_MCP_SERVERS
+names a YAML list of mcp-client configs every session sees; a preset's
+mcp-client rows are that preset's alone. A server is connected before
+the first message, and reconnected if it drops.
 
 Either may ask you a question on stderr. Answer it on stdin with an
 option's number (numbers separated by commas where several may be
@@ -100,6 +108,8 @@ Settings come from the environment:
                       otherwise)
   KARAKA_PRESET       the default preset's id (optional; the file's first
                       otherwise)
+  KARAKA_MCP_SERVERS  a YAML file listing MCP servers for every session
+                      (optional)
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY

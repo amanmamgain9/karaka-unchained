@@ -650,6 +650,7 @@ dependencies = [
  "karaka-anthropic",
  "karaka-fs-local",
  "karaka-kernel",
+ "karaka-mcp-client",
  "karaka-model",
  "karaka-openai",
  "karaka-persona",
@@ -768,10 +769,17 @@ dependencies = [
 name = "karaka-mcp-client"
 version = "0.1.0"
 dependencies = [
+ "karaka-agent-presets",
  "karaka-fs",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-scope",
  "karaka-sse",
+ "karaka-system-prompt",
+ "karaka-tools",
  "libc",
  "reqwest",
+ "ring",
  "serde_json",
  "tokio",
 ]

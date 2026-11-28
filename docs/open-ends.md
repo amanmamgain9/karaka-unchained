@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the MCP client's protocol and connection (step A of mcp-client).
+Last updated 2026-11-28, after the MCP client's tools, plugin and binary (step B of mcp-client).
 
 ## Needs you
 
@@ -65,12 +65,10 @@ Last updated 2026-11-28, after the MCP client's protocol and connection (step A 
 
 - **No teardown.** Plugins never unload, and a failed start doesn't roll
   back the plugins that already started. Because of this:
-  - the tool registry can't remove a tool, scoped ones included, so
-    `todo_write` and `working_directory` stay registered for the
-    runtime's life; a restriction can be lifted. The MCP client's tool
-    sync (step B) needs removal: each connection generation replaces the
-    previous one's tools, giving up after the reconnect budget clears
-    them, and disposal clears them. Step B adds tool unregistration;
+  - `todo_write`, `working_directory` and the other built-in tools stay
+    registered for the runtime's life, since no plugin unloads. The
+    registry itself can remove a tool now, through its
+    `ToolRegistration`, as the MCP bridge does for each generation;
   - `WorkingDirectory::stop()` and `UserQuestions::close()` have to be
     called by hand;
   - session-postgres will need a drain on dispose;
@@ -124,10 +122,11 @@ Last updated 2026-11-28, after the MCP client's protocol and connection (step A 
   `warn`, such as skipped skill files and failed watches) for
   `SkillRegistry::warnings()`, until a logger takes them. dsh also warns
   `agent preset <id>: <reason>` when a preset breaks; Karaka keeps the
-  reason in the roster only. The MCP supervisor's lines (retries, giving
-  up, failed closes) go to its `ConnectionObserver::log`, which step B
-  has to route somewhere. (Durable sessions, parts A and B; Skills,
-  steps A and B; Presets, step 2; MCP client, step A)
+  reason in the roster only. The MCP servers' lines (retries, giving up,
+  failed syncs and closes) are kept by the `McpClients` port
+  (`lines()`), and the binary prints the warnings and errors on stderr.
+  (Durable sessions, parts A and B; Skills, steps A and B; Presets,
+  step 2; MCP client, steps A and B)
 
 ### The agent loop
 
@@ -150,7 +149,12 @@ Last updated 2026-11-28, after the MCP client's protocol and connection (step A 
 - **Tool results carry text only.** dsh's also carry images, a
   structured error `{ name, code, reason }` (a gate denial's `info`
   included), presentation data and extra context for the next step. Play This Life shows its upgrade prompt on
-  the `pro_required` code. (Audit: what Play This Life reads)
+  the `pro_required` code. An MCP tool's result is the text projection
+  dsh's model sees: images refused as text (no attachment store),
+  audio and embedded resources as placeholders, and `structuredContent`
+  checked and then not shown; the canonical value dsh keeps for
+  programmatic callers is gone. (Audit: what Play This Life reads; MCP
+  client, step B)
 - **Developer messages for tool additions and removals.** Only the
   request header records a change of tools. (Agent loop, step one)
 - **Inbox:** the `inserted` signal and the inbox's `replace` and `remove`
@@ -212,10 +216,25 @@ Last updated 2026-11-28, after the MCP client's protocol and connection (step A 
   `terminateSession` (DELETE), and the SDK's OAuth, DPoP and 401 re-auth
   aren't ported. An application that needs per-request headers brings
   its own transport through the `Transport` seam. (MCP client, step A)
-- **The rest of mcp-client** is step B: tool definitions and their
-  public names, the plugin and its `serverName` reservations, the
-  server's prompt section and resources, and the binary. (MCP client,
-  step A)
+- **MCP resources.** dsh's `mcp-resources` package, with its
+  `list_mcp_resources`, `list_mcp_resource_templates` and
+  `read_mcp_resource` tools over every server's resources, isn't ported.
+  (MCP client, step B)
+- **Images from MCP tools** are refused as text, as dsh refuses them
+  without an attachment store; admitting them waits on attachments and
+  image-capable routes. (MCP client, step B)
+- **A preset's allow list hides its own MCP tools.** A preset's tools,
+  its MCP servers' among them, are inherited by its agents, so its
+  `tool-policy` allow list masks them, and can't name them, since from
+  the preset they are its own. Karaka's application-tools split
+  (`karakaApplicationTools`) is what lifts this, with the application
+  catalog. (MCP client, step B)
+- **Not covered by a real-process test:** reconnecting after a stdio
+  server crashes, and the official reference servers
+  (`server-everything`, `server-filesystem`) of dsh's e2e suite. The
+  supervisor's cases run against scripted servers. (MCP client, step B)
+- **The PTC mode SDK schemas** and `presentCall` for MCP tools aren't
+  ported, with the rest of PTC and presentation. (MCP client, step B)
 
 ### Platform
 
@@ -227,9 +246,10 @@ Last updated 2026-11-28, after the MCP client's protocol and connection (step A 
 - **The tool policy's `ptc` mode and application tools.** Karaka's
   `tool-policy` presents tools natively only; its `ptc` mode, and taking
   the application's MCP tools out of the allow and deny lists
-  (`karakaApplicationTools`, `registerPolicy`), wait on the MCP client.
-  Until then a policy naming a tool no plugin registered breaks its
-  preset. (Presets, step 3)
+  (`karakaApplicationTools`, `registerPolicy`), wait on Karaka's
+  `mcp-application`, now that the MCP client is ported. Until then a
+  policy naming a tool no plugin registered breaks its preset. (Presets,
+  step 3; MCP client, step B)
 - **Sandbox policy.** File-write sandboxing, and the policy line in the
   runtime context. (Filesystem; Working directory)
 - **The filesystem observation policy:** the `fs/write-intent`,
@@ -247,9 +267,9 @@ From Play This Life's plugin list:
 
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.
-- **The rest:** `mcp-client` (its protocol and connection are ported;
-  its tools and plugin are step B), `session-reference`, `webserver`,
-  `agent-tool-presentation`, `deepseek-llm-api-extensions`.
+- **The rest:** `mcp-resources`, `session-reference`, `webserver`,
+  `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
+  `mcp-application` (the application catalog over `mcp-client`).
 
 Karaka's own: `token-meter`, `compaction-basic`,
 `compaction-tool-result-pruner`, `session-checkpoint-policy`,

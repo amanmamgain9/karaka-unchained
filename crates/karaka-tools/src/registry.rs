@@ -98,6 +98,8 @@ impl ToolLayer {
 }
 
 struct Registered {
+    /// Which registration this is, for [`ToolRegistration::remove`].
+    id: u64,
     /// Read once, when the tool was registered.
     schema: ToolSchema,
     /// The parameters, parsed, that the arguments are checked against;
@@ -159,6 +161,49 @@ impl fmt::Debug for RestrictionRegistration {
     }
 }
 
+/// A tool in the registry, which [`remove`](Self::remove) takes out.
+/// Dropping it leaves the tool in place, as a dsh registration stays until
+/// its disposer runs. (dsh: the disposer `register` returns.)
+pub struct ToolRegistration {
+    layers: Weak<RwLock<Layers>>,
+    scope: Option<ScopeKey>,
+    id: u64,
+    name: String,
+}
+
+impl ToolRegistration {
+    /// The tool's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Takes the tool out of its layer. A call already running keeps its
+    /// tool; the next lookup no longer finds it. Removing it twice, or
+    /// after another tool took its name, does nothing.
+    pub fn remove(self) {
+        let Some(layers) = self.layers.upgrade() else {
+            return;
+        };
+        let mut layers = layers.write().unwrap_or_else(PoisonError::into_inner);
+        if let Some(layer) = layers.layers.get_mut(self.scope.as_ref()) {
+            layer.tools.retain(|entry| entry.id != self.id);
+        }
+        layers
+            .layers
+            .prune(self.scope.as_ref(), ToolLayer::is_empty);
+    }
+}
+
+impl fmt::Debug for ToolRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolRegistration")
+            .field("name", &self.name)
+            .field("scope", &self.scope)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
 /// One viewer's tools, worked out in one pass over its chain. (dsh:
 /// `ToolView`.)
 struct View {
@@ -189,7 +234,7 @@ impl ToolRegistry {
 
     /// Adds `tool` globally, under the name in its schema. See
     /// [`register_in`](Self::register_in).
-    pub fn register(&self, tool: Arc<dyn Tool>) -> Result<(), ToolRegistryError> {
+    pub fn register(&self, tool: Arc<dyn Tool>) -> Result<ToolRegistration, ToolRegistryError> {
         self.register_in(None, tool)
     }
 
@@ -202,11 +247,15 @@ impl ToolRegistry {
     /// replaced, as in dsh. Fails too when the registry is to check the
     /// tool's arguments and its parameters aren't JSON in dsh's enforced
     /// subset, as dsh's `defineTool` refuses them.
+    ///
+    /// The tool stays until its [`ToolRegistration`] is removed. Each
+    /// assembly lists the tools there are then, so a removal shows in the
+    /// next request, and its header logs the change.
     pub fn register_in(
         &self,
         scope: Option<&ScopeKey>,
         tool: Arc<dyn Tool>,
-    ) -> Result<(), ToolRegistryError> {
+    ) -> Result<ToolRegistration, ToolRegistryError> {
         let schema = tool.schema();
         let parameters = if tool.registry_checks_arguments() {
             let parameters: Value = serde_json::from_str(&schema.parameters).map_err(|error| {
@@ -238,12 +287,25 @@ impl ToolRegistry {
                 Some(_) => ToolRegistryError::DuplicateInScope(name),
             });
         }
-        layer.tools.push(Arc::new(Registered {
-            schema,
-            parameters,
-            tool,
-        }));
-        Ok(())
+        let name = schema.name.clone();
+        layers.next += 1;
+        let id = layers.next;
+        layers
+            .layers
+            .layer_mut(scope)
+            .tools
+            .push(Arc::new(Registered {
+                id,
+                schema,
+                parameters,
+                tool,
+            }));
+        Ok(ToolRegistration {
+            layers: Arc::downgrade(&self.layers),
+            scope: scope.cloned(),
+            id,
+            name,
+        })
     }
 
     /// Masks tools that the nearest scope of `viewer` inherits, for that
@@ -372,9 +434,11 @@ impl ToolRegistry {
     ///    (`gate.rs`). It sees every call, an unknown name's and bad
     ///    arguments' too.
     /// 3. A name the caller doesn't see is an error result.
-    /// 4. Arguments that aren't a JSON object, or that don't fit the tool's
-    ///    parameters, are an error result: `Error: invalid arguments: ` and
-    ///    every violation, joined by `; `, as dsh's `ToolArgsError` shows.
+    /// 4. For a tool whose arguments the registry checks, arguments that
+    ///    aren't a JSON object, or that don't fit its parameters, are an
+    ///    error result: `Error: invalid arguments: ` and every violation,
+    ///    joined by `; `, as dsh's `ToolArgsError` shows. A raw tool gets
+    ///    them as they are.
     /// 5. The tool runs.
     ///
     /// The tool is looked up when the call starts, through the caller's
@@ -419,7 +483,9 @@ impl ToolRegistry {
                 arguments,
                 agent,
             } = execution;
-            if !arguments.is_object() {
+            // A tool that checks its own arguments gets them as they are,
+            // as dsh hands a raw definition any JSON value.
+            if parameters.is_some() && !arguments.is_object() {
                 return invalid_arguments();
             }
             if let Some(parameters) = parameters {
@@ -536,8 +602,8 @@ impl fmt::Debug for ToolRegistry {
 /// dsh hands such a string, or any JSON that isn't an object, to the tool,
 /// and every typed tool then rejects it, because its arguments must be an
 /// object (`tools/src/schema.ts`, `validateArgs`). The registry makes that
-/// check after the gate for every tool, a raw one too, which dsh would hand
-/// the value to.
+/// check after the gate for every tool it checks the arguments of; a raw
+/// one, such as an MCP server's, gets the value, as in dsh.
 fn parse_arguments(raw: &str) -> Value {
     if raw.is_empty() {
         return Value::Object(Map::new());

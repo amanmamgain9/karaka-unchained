@@ -427,6 +427,10 @@ impl Client {
         let timeout = options
             .timeout
             .unwrap_or(Duration::from_millis(crate::DEFAULT_REQUEST_TIMEOUT_MS));
+        let mut dropped = CancelOnDrop {
+            client: (method != "initialize").then(|| self.clone()),
+            id: id.clone(),
+        };
         let outcome = self
             .peer
             .exchange(
@@ -436,6 +440,7 @@ impl Client {
                 options.cancel.as_ref(),
             )
             .await;
+        dropped.client = None;
         match outcome {
             Outcome::Response(response) => match response.get("error") {
                 Some(error) => Err(McpError::protocol(error)),
@@ -635,6 +640,42 @@ fn aborted() -> McpError {
     )
 }
 
+/// Takes a request's entry out of the pending map when its wait ends,
+/// however it ends.
+struct Forget<'a> {
+    peer: &'a Peer,
+    key: &'a str,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        self.peer.pending().remove(self.key);
+    }
+}
+
+/// Tells the server a request was given up when its caller drops it
+/// before it settles: a Karaka tool call is cancelled by dropping its
+/// future, where dsh's aborts its signal.
+struct CancelOnDrop {
+    client: Option<Client>,
+    id: Value,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let id = self.id.clone();
+        runtime.spawn(async move {
+            client.cancelled(&id, &aborted().message).await;
+        });
+    }
+}
+
 /// What one request came to.
 enum Outcome {
     Response(Value),
@@ -686,8 +727,12 @@ impl Peer {
             return Outcome::Closed;
         }
         self.pending().insert(key.clone(), sender);
+        // Dropped, the wait forgets its entry, so a late answer is unknown.
+        let _forget = Forget {
+            peer: self,
+            key: &key,
+        };
         if let Err(error) = self.transport.send(message).await {
-            self.pending().remove(&key);
             return Outcome::Send(error);
         }
         let never = AbortSignal::never();
@@ -700,7 +745,6 @@ impl Peer {
             () = tokio::time::sleep(timeout) => Outcome::Timeout,
             () = cancel.wait() => Outcome::Cancelled,
         };
-        self.pending().remove(&key);
         outcome
     }
 

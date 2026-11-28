@@ -43,6 +43,8 @@ pub struct Config {
     pub presets: Option<PathBuf>,
     /// The default preset; the file's first when unset.
     pub preset: Option<String>,
+    /// A YAML file of global MCP servers (`presets.rs`).
+    pub mcp_servers: Option<PathBuf>,
 }
 
 /// The model provider, with its plugin's config. Kept apart from the plugin
@@ -261,6 +263,7 @@ impl Config {
             session: var("KARAKA_SESSION"),
             presets: var("KARAKA_PRESETS").map(PathBuf::from),
             preset: var("KARAKA_PRESET"),
+            mcp_servers: var("KARAKA_MCP_SERVERS").map(PathBuf::from),
         })
     }
 }

@@ -3619,3 +3619,45 @@ async fn a_request_lists_and_runs_the_tools_its_agent_sees() {
         .collect();
     assert_eq!(results, ["ran mine", "Error: unknown tool \"broken\""]);
 }
+
+// A tool removed between turns leaves the next request, whose header logs
+// the change.
+#[tokio::test]
+async fn a_removed_tool_leaves_the_next_request() {
+    struct Gone;
+
+    impl Tool for Gone {
+        fn schema(&self) -> ToolSchema {
+            schema("gone")
+        }
+
+        fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+            Box::pin(async { ToolOutput::ok("gone") })
+        }
+    }
+
+    let harness = Harness::new(vec![text("one"), text("two")]).await;
+    let registration = harness.tools.register(Arc::new(Gone)).unwrap();
+    harness.say("first").await;
+    registration.remove();
+    harness.say("second").await;
+
+    assert_eq!(
+        reasons(&harness),
+        [RequestHeaderReason::Initial, RequestHeaderReason::Change]
+    );
+    let names = |index: usize| -> Vec<String> {
+        harness.headers()[index]
+            .header
+            .tools
+            .clone()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    };
+    assert!(names(0).contains(&"gone".to_owned()));
+    assert!(!names(1).contains(&"gone".to_owned()));
+    let requests = harness.model.requests();
+    assert!(!requests[1].tools.iter().any(|tool| tool.name == "gone"));
+}

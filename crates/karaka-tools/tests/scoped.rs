@@ -543,3 +543,39 @@ async fn a_scoped_listener_gates_only_the_agents_whose_chain_holds_it() {
     assert_eq!(run(&registry, "t", Some(&other)).await, "ran:t");
     assert_eq!(*coach.0.lock().unwrap(), [Some("s1".to_owned())]);
 }
+
+// A registration's `remove` takes the tool out, global or scoped: a scoped
+// shadow's removal shows the global tool again, the name is free again,
+// and a call made after it is an unknown tool. (dsh: the disposer
+// `register` returns.)
+#[tokio::test]
+async fn a_removed_tool_is_gone_from_every_view() {
+    let registry = ToolRegistry::new();
+    let a = agent("a");
+    let global = registry.register(replying("bash", "global-bash")).unwrap();
+    let shadow = registry
+        .register_in(Some(&session("a")), replying("bash", "scoped-bash"))
+        .unwrap();
+    assert_eq!(shadow.name(), "bash");
+    assert_eq!(run(&registry, "bash", Some(&a)).await, "scoped-bash");
+    shadow.remove();
+    assert_eq!(run(&registry, "bash", Some(&a)).await, "global-bash");
+    global.remove();
+    assert!(registry.schemas().is_empty());
+    assert!(names(&registry, &chain_of(&a)).is_empty());
+    assert_eq!(
+        run(&registry, "bash", Some(&a)).await,
+        "Error: unknown tool \"bash\""
+    );
+    // The name is free again, in both layers.
+    let again = registry.register(tool("bash")).unwrap();
+    registry
+        .register_in(Some(&session("a")), tool("bash"))
+        .unwrap();
+    again.remove();
+    assert_eq!(
+        names(&registry, &ScopeChain::global()),
+        Vec::<String>::new()
+    );
+    assert_eq!(names(&registry, &chain_of(&a)), ["bash"]);
+}

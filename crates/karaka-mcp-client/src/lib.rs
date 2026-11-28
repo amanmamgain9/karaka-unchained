@@ -10,17 +10,23 @@
 //!   requests, and what the server sends unasked ([`Client`]).
 //! - `connection.rs`: the supervisor: generations, reconnecting with
 //!   backoff, and the server's instructions ([`start_connection`]).
+//! - `tools.rs`: a server's tools as Karaka tools, under
+//!   `mcp__<server>__<tool>` names, synced per generation ([`ToolBridge`]).
+//! - `plugin.rs`: the plugin, global or in a preset, with each server's
+//!   instructions as a prompt section ([`McpClientsPlugin`],
+//!   [`McpServerPresetPlugin`]).
 //!
-//! The tools a server offers, the plugin that registers them, and the
-//! server's prompt section and resources come with the next step. A caller
-//! drives a connection through a [`ConnectionObserver`], and may bring its
-//! own transport through a [`TransportFactory`].
+//! A caller with its own tools, such as an application's catalog, drives a
+//! connection through a [`ConnectionObserver`], and may bring its own
+//! transport through a [`TransportFactory`].
 
 mod client;
 mod connection;
 mod http;
+mod plugin;
 mod protocol;
 mod stdio;
+mod tools;
 mod transport;
 
 pub use client::{
@@ -34,10 +40,15 @@ pub use connection::{
     start_connection, transport_factory,
 };
 pub use http::{HttpParams, HttpTransport};
+pub use plugin::{
+    MCP_SERVERS_SECTION_ORDER, McpClients, McpClientsPlugin, McpServer, McpServerConfig,
+    McpServerPresetPlugin, McpStartError,
+};
 pub use protocol::{
     CLIENT_NAME, CLIENT_VERSION, DEFAULT_REQUEST_TIMEOUT_MS, ErrorKind, LATEST_PROTOCOL_VERSION,
     MODERN_METHODS, MODERN_PROTOCOL_VERSION, McpError, STDIO_MAX_BUFFER_BYTES,
     SUPPORTED_PROTOCOL_VERSIONS, client_info, code, envelope, meta,
 };
 pub use stdio::{Stderr, StdioParams, StdioTransport, child_env};
+pub use tools::{Log, McpTool, ToolBridge, extract_text, public_tool_name};
 pub use transport::{Inbound, Transport, TransportFuture, TransportKind};

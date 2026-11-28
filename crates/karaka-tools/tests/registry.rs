@@ -411,9 +411,10 @@ async fn a_tool_that_opts_out_gets_its_arguments_unchecked() {
         .execute(&call("reader", r#"{"path":2}"#), None)
         .await;
     assert_eq!(output, ToolOutput::ok(r#"read {"path":2}"#));
-    // Arguments that aren't an object are still refused.
+    // Arguments that aren't an object reach it too, as dsh hands a raw
+    // definition any JSON value.
     let output = registry.execute(&call("reader", "[1]"), None).await;
-    assert!(output.is_error);
+    assert_eq!(output, ToolOutput::ok("read [1]"));
 }
 
 // dsh's `defineTool` refuses parameters outside the subset when the tool is

@@ -32,6 +32,7 @@ const VARIABLES: &[&str] = &[
     "KARAKA_SESSION",
     "KARAKA_PRESETS",
     "KARAKA_PRESET",
+    "KARAKA_MCP_SERVERS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
@@ -762,7 +763,7 @@ fn preset_mistakes_fail_before_any_call() {
     assert_eq!(
         text(&output.stderr),
         format!(
-            "karaka: KARAKA_PRESETS ({}): preset 1 (\"a\"), plugin 1 (shell): unknown plugin \"shell\"; a preset may use persona, tool-policy and skill-filesystem\n",
+            "karaka: KARAKA_PRESETS ({}): preset 1 (\"a\"), plugin 1 (shell): unknown plugin \"shell\"; a preset may use persona, tool-policy, skill-filesystem and mcp-client\n",
             presets.display()
         )
     );
@@ -953,6 +954,166 @@ fn chat_runs_the_clock_tool_and_keeps_the_conversation() {
     ] {
         assert!(third.contains(said), "{said}: {third}");
     }
+}
+
+/// The MCP fixture server: a 2025-era server needing only `sh` and `sed`,
+/// with one tool, `add`.
+fn mcp_fixture() -> String {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../karaka-mcp-client/tests/fixtures/server.sh"
+    )
+    .to_owned()
+}
+
+/// Anthropic's events for a call to `mcp__fixture__add` with 1 and 2.
+const ANTHROPIC_MCP_ADD: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__fixture__add","input":{}}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1,\"b\":2}"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+// A preset's MCP server: its tool, under the server's namespace, and its
+// instructions reach the request, and the model's call goes through to
+// the server.
+#[test]
+fn a_presets_mcp_server_offers_its_tool_and_answers_the_call() {
+    let dir = scratch("mcp-preset");
+    let events = dir.join("events");
+    std::fs::write(&events, "").unwrap();
+    std::fs::write(
+        dir.join("presets.yml"),
+        format!(
+            "- id: calculator\n  plugins:\n    - name: mcp-client\n      config:\n        transport: stdio\n        serverName: fixture\n        command: sh\n        args: [{:?}, {:?}]\n        reconnect: {{ enabled: false }}\n",
+            mcp_fixture(),
+            events.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (address, server) = serve(vec![
+        streamed(ANTHROPIC_MCP_ADD),
+        streamed(&anthropic_text("It is 3.")),
+    ]);
+
+    let output = karaka(
+        &["chat"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            (
+                "KARAKA_PRESETS",
+                dir.join("presets.yml").display().to_string(),
+            ),
+        ],
+        "what is 1 + 2?\n",
+    );
+
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        text(&output.stdout),
+        "[mcp__fixture__add gave: 3]\nIt is 3.\n"
+    );
+    let sent = server.join().expect("the server ran");
+    let first: Value = serde_json::from_str(body(&sent[0])).unwrap();
+    assert!(
+        tool_names(&first).contains(&"mcp__fixture__add".to_owned()),
+        "{first}"
+    );
+    // The server's instructions are a section of the system prompt.
+    assert!(
+        body(&sent[0]).contains(r#"### MCP server: fixture\n\nUse add."#),
+        "{first}"
+    );
+    let second = body(&sent[1]);
+    assert!(second.contains(r#""tool_use_id":"toolu_1""#), "{second}");
+    // The fixture saw the call with the model's arguments.
+    let log = std::fs::read_to_string(&events).unwrap();
+    assert!(log.contains("tools/call"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A global server, from `KARAKA_MCP_SERVERS`, is offered to every session.
+#[test]
+fn a_global_mcp_server_is_offered_to_every_session() {
+    let dir = scratch("mcp-global");
+    let events = dir.join("events");
+    std::fs::write(&events, "").unwrap();
+    std::fs::write(
+        dir.join("servers.yml"),
+        format!(
+            "- transport: stdio\n  serverName: fixture\n  command: sh\n  args: [{:?}, {:?}]\n",
+            mcp_fixture(),
+            events.display().to_string()
+        ),
+    )
+    .unwrap();
+    let (address, server) = serve_once(streamed(DEEPSEEK_HELLO));
+    let output = karaka(
+        &["ask", "hi"],
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
+            (
+                "KARAKA_MCP_SERVERS",
+                dir.join("servers.yml").display().to_string(),
+            ),
+        ],
+        "",
+    );
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let sent = server.join().expect("the server ran");
+    let body: Value = serde_json::from_str(body(&sent)).unwrap();
+    assert!(
+        tool_names(&body).contains(&"mcp__fixture__add".to_owned()),
+        "{body}"
+    );
+
+    // A bad config fails before any call.
+    std::fs::write(
+        dir.join("servers.yml"),
+        "- transport: stdio\n  serverName: fixture\n",
+    )
+    .unwrap();
+    let output = karaka(
+        &["ask", "hi"],
+        &[
+            ("KARAKA_PROVIDER", "deepseek".into()),
+            ("DEEPSEEK_API_KEY", "test-key".into()),
+            ("DEEPSEEK_BASE_URL", "http://127.0.0.1:1".into()),
+            (
+                "KARAKA_MCP_SERVERS",
+                dir.join("servers.yml").display().to_string(),
+            ),
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "karaka: KARAKA_MCP_SERVERS ({}): server 1 needs a \"command\"\n",
+            dir.join("servers.yml").display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
