@@ -25,6 +25,7 @@ use karaka_model::{
     ModelError, ModelRegistry, ModelsPlugin, Origin, Replay, Request, RetryPolicy, Role, ToolCall,
     ToolResult, ToolSchema, Usage, stream_of,
 };
+use karaka_scope::{ScopeChain, ScopeKey};
 use karaka_session::{
     CallConfig, CancelCause, ContentBlock, Entry, Extra, Failure, IN_HISTORY, InboxSplice,
     InboxTarget, RequestContext, RequestHeader, RequestHeaderData, RequestHeaderReason, Seq,
@@ -34,8 +35,8 @@ use karaka_session::{
 };
 use karaka_session_projection::{SessionProjections, SessionProjectionsPlugin};
 use karaka_system_prompt::{
-    HARNESS_IDENTITY, PromptContext, Scope, Section, SystemPrompt, SystemPromptConfig,
-    SystemPromptPlugin, TOOL_ORDER_REST, Text,
+    HARNESS_IDENTITY, PromptContext, Section, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
+    TOOL_ORDER_REST, Text,
 };
 use karaka_tools::{Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin};
 use serde_json::{Value, json};
@@ -906,7 +907,7 @@ async fn a_section_scoped_to_one_session_reaches_its_agent_only() {
     let _ = harness
         .prompt
         .section(
-            Some(&Scope::new(id().as_str())),
+            Some(&ScopeKey::from(id())),
             Section::new("child:extra", 50.0, "Only a1."),
         )
         .unwrap();
@@ -3554,4 +3555,67 @@ async fn a_rejected_step_blocks_the_turn() {
     assert_eq!(harness.endings(), [TurnEndReason::Blocked]);
     assert!(!harness.types().iter().any(|kind| kind == "step/start"));
     assert!(harness.model.requests().is_empty());
+}
+
+// Each request lists the tools its agent sees, and a call resolves through
+// the same view: a tool scoped to the agent's session is listed and runs,
+// and a restricted global tool is neither listed nor run. (dsh: the
+// loop's tools are `tools.schemas(agent)` and `execute({ agent })`.)
+#[tokio::test]
+async fn a_request_lists_and_runs_the_tools_its_agent_sees() {
+    struct Mine;
+
+    impl Tool for Mine {
+        fn schema(&self) -> ToolSchema {
+            schema("mine")
+        }
+
+        fn execute<'a>(&'a self, _arguments: Value, _run: ToolRun) -> ToolFuture<'a> {
+            Box::pin(async { ToolOutput::ok("ran mine") })
+        }
+    }
+
+    let harness = Harness::new(vec![
+        calls(&[call("c1", "mine", "{}"), call("c2", "broken", "{}")]),
+        text("done"),
+    ])
+    .await;
+    harness
+        .tools
+        .register_in(Some(&ScopeKey::from(id())), Arc::new(Mine))
+        .unwrap();
+    let _restriction = harness
+        .tools
+        .restrict(
+            &ScopeChain::session(id()),
+            karaka_tools::ToolRestriction {
+                allow: None,
+                deny: Some(vec!["broken".into()]),
+            },
+        )
+        .unwrap();
+    harness.say("go").await;
+
+    let requests = harness.model.requests();
+    let names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, ["echo", "mine", "stuck"]);
+    // The global view is unchanged.
+    let global: Vec<String> = harness
+        .tools
+        .schemas()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect();
+    assert_eq!(global, ["echo", "broken", "stuck"]);
+    let results: Vec<String> = harness
+        .events()
+        .iter()
+        .filter(|entry| matches!(entry.event, SessionEvent::ToolResult { .. }))
+        .map(|entry| tool_result(entry).0.content)
+        .collect();
+    assert_eq!(results, ["ran mine", "Error: unknown tool \"broken\""]);
 }

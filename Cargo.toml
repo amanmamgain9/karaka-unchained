@@ -43,6 +43,7 @@ karaka-kernel = { path = "crates/karaka-kernel" }
 karaka-model = { path = "crates/karaka-model" }
 karaka-sse = { path = "crates/karaka-sse" }
 karaka-session = { path = "crates/karaka-session" }
+karaka-scope = { path = "crates/karaka-scope" }
 karaka-tools = { path = "crates/karaka-tools" }
 karaka-agent = { path = "crates/karaka-agent" }
 karaka-session-persistence = { path = "crates/karaka-session-persistence" }

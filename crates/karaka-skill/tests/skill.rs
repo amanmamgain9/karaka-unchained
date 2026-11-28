@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use karaka_fs::{AbortController, AbortSignal};
 use karaka_kernel::Runtime;
+use karaka_scope::{PresetId, ScopeChain, ScopeKey};
 use karaka_session::{SessionId, UserSource};
 use karaka_skill::{
     BUNDLED_SKILL_RANK, GetFuture, Invocable, ListFuture, SkillCandidate, SkillConfig,
@@ -46,7 +47,7 @@ fn lookup() -> SkillLookupOptions {
 
 fn in_scope(id: &str) -> SkillLookupOptions {
     SkillLookupOptions {
-        scope: Some(SessionId::new(id)),
+        scope: ScopeChain::session(SessionId::new(id)),
         ..SkillLookupOptions::default()
     }
 }
@@ -859,7 +860,7 @@ async fn an_incomplete_observation_is_loadable_but_not_cached() {
 /// Registers `provider`, keeping its control.
 fn add_with_control(
     registry: &SkillRegistry,
-    scope: Option<&SessionId>,
+    scope: Option<&ScopeKey>,
     provider: Arc<dyn SkillProvider>,
 ) -> (karaka_skill::ProviderRegistration, SkillProviderControl) {
     let control: Arc<OnceLock<SkillProviderControl>> = Arc::default();
@@ -1415,7 +1416,7 @@ async fn a_scoped_provider_shows_only_in_its_scopes_view() {
         &registry,
         Memory::new(vec![memory("global-skill", "Global", 100.0)]),
     );
-    let scope = SessionId::new("a");
+    let scope = ScopeKey::from(SessionId::new("a"));
     let _ = registry
         .register_provider(Some(&scope), |_| {
             one("preset-local", "preset-skill", "Preset", 300.0)
@@ -1447,7 +1448,7 @@ async fn the_scopes_entry_wins_whatever_its_rank() {
         &registry,
         Memory::new(vec![memory("shared-name", "Global wins ranks", 10.0)]),
     );
-    let scope = SessionId::new("shadow");
+    let scope = ScopeKey::from(SessionId::new("shadow"));
     let _ = registry
         .register_provider(Some(&scope), |_| {
             one("preset-local", "shared-name", "Preset shadow", 900.0)
@@ -1474,7 +1475,10 @@ async fn the_scopes_entry_wins_whatever_its_rank() {
 async fn provider_names_are_unique_per_layer() {
     let registry = registry();
     add(&registry, Memory::new(Vec::new()));
-    let (a, b) = (SessionId::new("a"), SessionId::new("b"));
+    let (a, b) = (
+        ScopeKey::from(SessionId::new("a")),
+        ScopeKey::from(SessionId::new("b")),
+    );
     let _ = registry
         .register_provider(Some(&a), |_| {
             Memory::new(vec![memory("a-only", "A", 100.0)]) as Arc<dyn SkillProvider>
@@ -1510,7 +1514,7 @@ async fn runtime_duplicates_are_per_layer_and_a_scope_shadows() {
             SkillRegistration::new("told-twice", "Global runtime", "runtime", "Global body."),
         )
         .unwrap();
-    let scope = SessionId::new("runtime");
+    let scope = ScopeKey::from(SessionId::new("runtime"));
     let shadow = registry
         .register(
             Some(&scope),
@@ -1557,7 +1561,7 @@ async fn a_removed_scoped_registration_leaves_its_view() {
     let _ = registry.on_change(Arc::new(move || {
         counted.fetch_add(1, Ordering::SeqCst);
     }));
-    let scope = SessionId::new("hmr");
+    let scope = ScopeKey::from(SessionId::new("hmr"));
     let registration = registry
         .register_provider(Some(&scope), |_| {
             Memory::new(vec![memory("scoped-skill", "Scoped", 100.0)]) as Arc<dyn SkillProvider>
@@ -1578,7 +1582,7 @@ async fn a_removed_scoped_registration_leaves_its_view() {
 #[tokio::test]
 async fn a_scoped_control_invalidates_only_while_live() {
     let registry = registry();
-    let scope = SessionId::new("invalidate");
+    let scope = ScopeKey::from(SessionId::new("invalidate"));
     let memory = Memory::new(vec![memory("watched", "Watched", 100.0)]);
     let (registration, control) = add_with_control(
         &registry,
@@ -1616,4 +1620,74 @@ async fn the_plugin_provides_the_registry() {
                 .is_some_and(|cause| cause.to_string().contains("collectCacheMaxEntries")),
         "{error}"
     );
+}
+
+// A preset's layer is seen through every chain naming the preset, between
+// the global layer and the session's; the nearest layer wins a name
+// whatever the ranks. (dsh: a preset's standing mount, with an agent scope
+// bound under it.)
+#[tokio::test]
+async fn a_presets_layer_sits_between_global_and_the_session() {
+    let registry = registry();
+    add(
+        &registry,
+        Memory::new(vec![memory("shared-name", "Global", 10.0)]),
+    );
+    let coach = ScopeKey::from(PresetId::new("coach"));
+    let _ = registry
+        .register_provider(Some(&coach), |_| {
+            one("coach-local", "shared-name", "Coach", 300.0)
+        })
+        .unwrap();
+    let _ = registry
+        .register_provider(Some(&coach), |_| {
+            one("coach-only", "coach-skill", "Coach only", 300.0)
+        })
+        .unwrap();
+    let coached = |session: &str| SkillLookupOptions {
+        scope: ScopeChain::new(Some(PresetId::new("coach")), Some(SessionId::new(session))),
+        ..SkillLookupOptions::default()
+    };
+    assert_eq!(
+        names(&registry, &coached("s1")).await,
+        ["coach-skill", "shared-name"]
+    );
+    assert_eq!(
+        content(&registry, "shared-name", &coached("s1"))
+            .await
+            .as_deref(),
+        Some("Coach body.")
+    );
+
+    // The session's own layer is nearer still.
+    let s1 = ScopeKey::from(SessionId::new("s1"));
+    let _ = registry
+        .register_provider(Some(&s1), |_| one("s1-local", "shared-name", "Mine", 900.0))
+        .unwrap();
+    assert_eq!(
+        content(&registry, "shared-name", &coached("s1"))
+            .await
+            .as_deref(),
+        Some("Mine body.")
+    );
+    assert_eq!(
+        content(&registry, "shared-name", &coached("s2"))
+            .await
+            .as_deref(),
+        Some("Coach body.")
+    );
+
+    // No other chain sees the preset: not another preset, not a session
+    // alone, and not a session named like the preset.
+    let other = SkillLookupOptions {
+        scope: ScopeChain::new(Some(PresetId::new("other")), Some(SessionId::new("s3"))),
+        ..SkillLookupOptions::default()
+    };
+    for view in [other, in_scope("s3"), in_scope("coach"), lookup()] {
+        assert_eq!(names(&registry, &view).await, ["shared-name"]);
+        assert_eq!(
+            content(&registry, "shared-name", &view).await.as_deref(),
+            Some("shared-name body.")
+        );
+    }
 }

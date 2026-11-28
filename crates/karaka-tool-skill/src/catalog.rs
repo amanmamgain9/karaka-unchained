@@ -34,9 +34,10 @@ use std::sync::Arc;
 use karaka_agent::{PreStep, PreStepDecision, PreStepFuture, PreStepListener, PreStepNext};
 use karaka_session::{ContentBlock, Session, SessionEvent, SessionStore, UserMessage, UserSource};
 use karaka_skill::{
-    Invocable, SkillLookupOptions, SkillRegistry, escape_text, is_skill_name, render_skill_content,
-    skill_invocation_source,
+    Invocable, SkillCatalogSnapshot, SkillLookupOptions, SkillRegistry, escape_text, is_skill_name,
+    render_skill_content, skill_invocation_source,
 };
+use karaka_tools::{Tool, ToolRegistry};
 use karaka_working_directory::WorkingDirectory;
 use serde_json::{Value, json};
 
@@ -49,6 +50,10 @@ pub type Entry = (String, String);
 /// What both listeners need.
 pub(crate) struct Shared {
     pub(crate) skills: Arc<SkillRegistry>,
+    /// The registry the tool is in, and the tool this plugin registered:
+    /// the catalog is published only while the agent sees that very tool.
+    pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) tool: Arc<dyn Tool>,
     pub(crate) directories: Arc<WorkingDirectory>,
     pub(crate) sessions: Arc<SessionStore>,
     pub(crate) description_max_length: usize,
@@ -64,7 +69,7 @@ impl Shared {
         Ok(SkillLookupOptions {
             cwd: Some(cwd),
             signal: None,
-            scope: Some(step.agent.id().clone()),
+            scope: step.agent.scope(),
         })
     }
 }
@@ -79,8 +84,24 @@ impl PreStepListener for CatalogListener {
                 return Ok(PreStepDecision::Reject);
             };
             let shared = &self.0;
-            let lookup = shared.lookup(step).await?;
-            let snapshot = shared.skills.snapshot(&lookup).await?;
+            // dsh's `toolVisible`: a restricted agent, or one with a scoped
+            // tool of the same name, gets no catalog, and one that had a
+            // catalog gets the empty replacement.
+            let visible = shared
+                .tools
+                .get(crate::NAME, &step.agent.scope())
+                .is_some_and(|seen| {
+                    std::ptr::addr_eq(Arc::as_ptr(&seen), Arc::as_ptr(&shared.tool))
+                });
+            let snapshot = if visible {
+                let lookup = shared.lookup(step).await?;
+                shared.skills.snapshot(&lookup).await?
+            } else {
+                SkillCatalogSnapshot {
+                    skills: Vec::new(),
+                    complete: true,
+                }
+            };
             if !snapshot.complete {
                 return Ok(PreStepDecision::Enter { messages });
             }

@@ -35,6 +35,7 @@ use karaka_model::{
     Block, ErrorKind, Event, EventStream, FinishReason, Model, ModelError, ModelRegistry,
     ModelsPlugin, Request, ToolCall, ToolSchema, Usage, stream_of,
 };
+use karaka_scope::{PresetId, ScopeChain, ScopeKey};
 use karaka_session::{
     CancelCause, Entry, Extra, InboxSplice, InboxTarget, SessionEvent, SessionHeader, SessionId,
     SessionStore, SessionsPlugin, SpliceOutcome, TOOL_OUTCOME_UNKNOWN, UserMessage, UserSource,
@@ -61,6 +62,9 @@ use tokio::time::advance;
 /// inbox, as dsh's `liveAgent` does in its arrays. It never runs a turn.
 struct Stub {
     id: SessionId,
+    /// The agent's preset, if any: its chain is the preset, then its
+    /// session.
+    preset: Mutex<Option<PresetId>>,
     sessions: Arc<SessionStore>,
     frames: FrameListeners,
     /// What the inbox holds, to splice at the right place.
@@ -77,6 +81,7 @@ impl Stub {
     fn new(id: &str, sessions: &Arc<SessionStore>) -> Arc<Self> {
         Arc::new(Self {
             id: SessionId::new(id),
+            preset: Mutex::new(None),
             sessions: Arc::clone(sessions),
             frames: FrameListeners::new(),
             next_turn: Mutex::new(Vec::new()),
@@ -148,6 +153,10 @@ impl Stub {
 impl Agent for Stub {
     fn id(&self) -> &SessionId {
         &self.id
+    }
+
+    fn scope(&self) -> ScopeChain {
+        ScopeChain::new(self.preset.lock().unwrap().clone(), Some(self.id.clone()))
     }
 
     fn followup(&self, message: UserMessage) -> Result<(), InboxError> {
@@ -510,8 +519,12 @@ async fn an_agents_answerers_hear_only_its_requests() {
         }))
     };
     let _ = bench.service.answerer(None, note("global"));
-    let _ = bench.service.answerer(Some(&agent.id), note("mine"));
-    let _ = bench.service.answerer(Some(&other.id), note("other's"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(agent.id.clone())), note("mine"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(other.id.clone())), note("other's"));
     let _ = bench.service.answerer(None, note("global again"));
     let ask = |agent: Option<Arc<Stub>>| {
         let service = Arc::clone(&bench.service);
@@ -1764,4 +1777,50 @@ async fn a_late_answer_reaches_the_model_through_the_loop() {
             .answer(agent.as_ref(), "call-ask", &tool_only())
             .unwrap()
     );
+}
+
+// A preset's answerers hear the requests of every agent in the preset, in
+// the order they were added among the global ones, and no other agent's.
+// (dsh: a listener of an enclosing scope hears its descendants' events.)
+#[tokio::test]
+async fn a_presets_answerers_hear_its_agents_requests() {
+    let bench = bench().await;
+    let coached = bench.live("coached");
+    *coached.preset.lock().unwrap() = Some(PresetId::new("coach"));
+    let alone = bench.live("alone");
+    // A session named like the preset isn't in it.
+    let lookalike = bench.live("coach");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let note = |name: &'static str| {
+        let heard = Arc::clone(&heard);
+        Arc::new(with(move |_, next| {
+            heard.lock().unwrap().push(name);
+            next.run()
+        }))
+    };
+    let _ = bench.service.answerer(None, note("global"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(PresetId::new("coach"))), note("coach"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(coached.id.clone())), note("mine"));
+    let ask = |agent: Arc<Stub>| {
+        let service = Arc::clone(&bench.service);
+        async move {
+            service
+                .ask(QuestionRequest {
+                    agent: Some(agent as Arc<dyn Agent>),
+                    ..request(confirm())
+                })
+                .await
+        }
+    };
+    ask(Arc::clone(&coached)).await.unwrap_err();
+    assert_eq!(*heard.lock().unwrap(), ["global", "coach", "mine"]);
+    for agent in [alone, lookalike] {
+        heard.lock().unwrap().clear();
+        ask(agent).await.unwrap_err();
+        assert_eq!(*heard.lock().unwrap(), ["global"]);
+    }
 }

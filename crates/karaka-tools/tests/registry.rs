@@ -113,7 +113,7 @@ fn schemas_come_in_the_order_the_tools_were_registered() {
     assert_eq!(registry.schemas(), [schema("broken"), schema("echo")]);
     assert_eq!(
         format!("{registry:?}"),
-        r#"ToolRegistry { tools: ["broken", "echo"] }"#
+        r#"ToolRegistry { tools: ["broken", "echo"], scopes: 0 }"#
     );
 }
 
@@ -126,7 +126,11 @@ fn a_second_tool_with_the_same_name_is_rejected() {
         .register(Arc::new(Echo))
         .expect_err("the name is taken");
     assert_eq!(error, ToolRegistryError::DuplicateName("echo".into()));
-    assert_eq!(error.to_string(), "tool \"echo\" is already registered");
+    assert_eq!(
+        error.to_string(),
+        "tool \"echo\" is already registered (for a per-agent variant, register it in that \
+         agent's scope instead)"
+    );
     assert_eq!(registry.schemas().len(), 1);
 }
 

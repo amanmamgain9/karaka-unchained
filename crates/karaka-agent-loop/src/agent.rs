@@ -51,6 +51,7 @@ use karaka_agent::{
     Agent, CancelSwitch, Cancellation, FrameListener, FrameListeners, FrameSubscription,
     InboxError, WhenIdle, cancellation,
 };
+use karaka_scope::ScopeChain;
 use karaka_session::{CancelCause, InboxTarget, Session, SessionEvent, SessionId, UserMessage};
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -162,6 +163,10 @@ impl Agent for LoopAgent {
         self.inner.session.id()
     }
 
+    fn scope(&self) -> ScopeChain {
+        self.inner.scope()
+    }
+
     fn followup(&self, message: UserMessage) -> Result<(), InboxError> {
         self.send(message, InboxTarget::NextTurn, true)
     }
@@ -258,6 +263,12 @@ impl LoopAgent {
 }
 
 impl Inner {
+    /// The scopes this agent sees registrations through: its session's,
+    /// with no preset, until presets exist.
+    pub(crate) fn scope(&self) -> ScopeChain {
+        ScopeChain::session(self.session.id().clone())
+    }
+
     /// Runs turns while anything is pending, until a turn fails. (dsh:
     /// `kick`, and the end of `turn`.)
     async fn drive(self: Arc<Self>, mut cancel: Cancel) {

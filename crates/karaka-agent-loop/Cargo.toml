@@ -16,6 +16,8 @@ karaka-model.workspace = true
 karaka-tools.workspace = true
 karaka-session.workspace = true
 karaka-agent.workspace = true
+# The scopes an agent sees prompt contributions, tools and listeners through.
+karaka-scope.workspace = true
 # Each step's system prompt and tool list are assembled from the registry.
 karaka-system-prompt.workspace = true
 # The agent's pending input is the session's `inbox` projection, folded

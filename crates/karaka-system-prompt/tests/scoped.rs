@@ -1,17 +1,19 @@
 //! Contributions scoped to one agent. Ported from dsh's
 //! `core/system-prompt/tests/scoped.spec.ts`.
 //!
-//! dsh scopes nest, and a scope disposes all its contributions at once;
-//! Karaka's scope is one agent's, and each contribution is removed by its
-//! own registration.
+//! dsh scopes nest to any depth, and a scope disposes all its contributions
+//! at once. Karaka's chain is fixed at global, preset, then session, and
+//! each contribution is removed by its own registration.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use karaka_model::ToolSchema;
+use karaka_scope::{PresetId, ScopeChain, ScopeKey};
+use karaka_session::SessionId;
 use karaka_system_prompt::{
     AssembleContext, AssembleFuture, AssembleListener, AssembleNext, AssembledContext,
-    AssembledSection, PromptAssembly, PromptContext, Registration, Scope, Section, SystemPrompt,
+    AssembledSection, PromptAssembly, PromptContext, Registration, Section, SystemPrompt,
     SystemPromptConfig, TOOL_ORDER_REST, Text, ToolProviderResult, render_context_snapshot,
     render_prompt,
 };
@@ -27,12 +29,24 @@ fn persona(prefix: &str) -> SystemPromptConfig {
     }
 }
 
-fn child() -> Scope {
-    Scope::new("child")
+fn child() -> ScopeKey {
+    ScopeKey::Session(SessionId::new("child"))
 }
 
 fn scoped() -> AssembleContext {
-    AssembleContext::scoped(child())
+    AssembleContext::scoped(ScopeChain::session(SessionId::new("child")))
+}
+
+fn coach() -> ScopeKey {
+    ScopeKey::Preset(PresetId::new("coach"))
+}
+
+/// The child agent, in the preset `coach`.
+fn coached() -> AssembleContext {
+    AssembleContext::scoped(ScopeChain::new(
+        Some(PresetId::new("coach")),
+        Some(SessionId::new("child")),
+    ))
 }
 
 fn global() -> AssembleContext {
@@ -432,4 +446,59 @@ async fn a_scoped_listener_shapes_its_scopes_assemblies_only() {
     assert!(has(&prompt.assemble(&scoped()).await.unwrap()));
     assert!(!has(&prompt.assemble(&global()).await.unwrap()));
     assert_eq!(listener.0.load(Ordering::SeqCst), 1);
+}
+
+// A preset's contributions reach every agent whose chain names the preset,
+// under the session's own, and no other agent. (dsh: a section a preset's
+// scope registers, seen through an agent scope bound under it.)
+#[tokio::test]
+async fn a_presets_contributions_are_seen_through_chains_naming_it() {
+    let prompt = mount(SystemPromptConfig::default());
+    let _global = prompt
+        .section(None, Section::new("tone", 1.0, "Global tone."))
+        .unwrap();
+    let _preset = prompt
+        .section(Some(&coach()), Section::new("tone", 1.0, "Coach tone."))
+        .unwrap();
+    let _rules = prompt
+        .section(Some(&coach()), Section::new("rules", 2.0, "Coach rules."))
+        .unwrap();
+    let _variable = prompt
+        .variable(Some(&coach()), "mode", |_| Some("coach".into()))
+        .unwrap();
+    let _session = prompt
+        .variable(Some(&child()), "mode", |_| Some("child".into()))
+        .unwrap();
+    let _uses = prompt
+        .section(None, Section::new("uses", 3.0, "Mode: {{mode}}."))
+        .unwrap();
+
+    let seen = rendered(&prompt, &coached()).await;
+    assert!(seen.contains("Coach tone."), "{seen}");
+    assert!(!seen.contains("Global tone."), "{seen}");
+    assert!(seen.contains("Coach rules."), "{seen}");
+    // The session's variable is nearer than the preset's.
+    assert!(seen.contains("Mode: child."), "{seen}");
+
+    let preset_only = AssembleContext::scoped(ScopeChain::new(Some(PresetId::new("coach")), None));
+    assert!(
+        rendered(&prompt, &preset_only)
+            .await
+            .contains("Mode: coach.")
+    );
+
+    let _fallback = prompt
+        .variable(None, "mode", |_| Some("global".into()))
+        .unwrap();
+    for other in [
+        scoped(),
+        global(),
+        AssembleContext::scoped(ScopeChain::new(Some(PresetId::new("other")), None)),
+    ] {
+        let seen = rendered(&prompt, &other).await;
+        assert!(!seen.contains("Coach"), "{seen}");
+    }
+    // A session id that happens to equal the preset's name isn't the preset.
+    let lookalike = AssembleContext::scoped(ScopeChain::session(SessionId::new("coach")));
+    assert!(!rendered(&prompt, &lookalike).await.contains("Coach"));
 }

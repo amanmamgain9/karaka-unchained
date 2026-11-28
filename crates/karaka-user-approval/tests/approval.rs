@@ -22,14 +22,13 @@ use karaka_agent::{Agent, FrameListener, FrameListeners, FrameSubscription, Inbo
 use karaka_fs::{AbortController, AbortSignal};
 use karaka_kernel::Runtime;
 use karaka_model::{ToolCall, ToolSchema};
+use karaka_scope::{ScopeChain, ScopeKey};
 use karaka_session::{
     CancelCause, Entry, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEnd,
     TurnEndReason, TurnStart, UserMessage, UserSource,
 };
 use karaka_session_projection::SessionProjectionsPlugin;
-use karaka_system_prompt::{
-    AssembleContext, Scope, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
-};
+use karaka_system_prompt::{AssembleContext, SystemPrompt, SystemPromptConfig, SystemPromptPlugin};
 use karaka_tools::{
     PreExecuteFuture, PreExecuteListener, PreExecuteNext, PreToolDecision, Tool, ToolExecution,
     ToolFuture, ToolOutput, ToolRegistry, ToolRun, ToolsPlugin,
@@ -163,7 +162,9 @@ impl Bench {
     async fn context_for(&self, scope: Option<&str>) -> Option<String> {
         self.prompt
             .assemble(&AssembleContext {
-                scope: scope.map(Scope::new),
+                chain: scope.map_or_else(ScopeChain::global, |id| {
+                    ScopeChain::session(SessionId::new(id))
+                }),
             })
             .await
             .unwrap()
@@ -298,7 +299,7 @@ async fn a_scoped_answerer_gets_the_very_request() {
     let received = Arc::new(Mutex::new(None));
     let seen = Arc::clone(&received);
     let _ = bench.service.answerer(
-        Some(&agent.id),
+        Some(&ScopeKey::from(agent.id.clone())),
         Arc::new(with(move |request, _| {
             *seen.lock().unwrap() = Some((
                 std::ptr::from_ref(request) as usize,
@@ -378,8 +379,12 @@ async fn an_agents_answerers_hear_only_its_requests() {
         }))
     };
     let _ = bench.service.answerer(None, note("global"));
-    let _ = bench.service.answerer(Some(&a.id), note("scoped"));
-    let _ = bench.service.answerer(Some(&b.id), note("scoped"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(a.id.clone())), note("scoped"));
+    let _ = bench
+        .service
+        .answerer(Some(&ScopeKey::from(b.id.clone())), note("scoped"));
     for agent in [&a, &b] {
         assert_eq!(
             bench.service.request(&request_of(agent)).await,
@@ -605,9 +610,10 @@ async fn never_rejects_without_asking_anyone() {
     let calls = Arc::new(AtomicUsize::new(0));
     bench.register(counting(&calls));
     let agent = bench.agent("never");
-    let _ = bench
-        .service
-        .answerer(Some(&agent.id), Arc::new(counting(&calls)));
+    let _ = bench.service.answerer(
+        Some(&ScopeKey::from(agent.id.clone())),
+        Arc::new(counting(&calls)),
+    );
     let request = ApprovalRequest::new(Arc::clone(&agent) as Arc<dyn Agent>, "bash");
     assert_eq!(
         bench.service.request(&request).await,

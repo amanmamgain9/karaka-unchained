@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-27, after tool-skill (step C of skills).
+Last updated 2026-11-28, after the scope chain (step 1 of presets).
 
 ## Needs you
 
@@ -65,8 +65,9 @@ Last updated 2026-11-27, after tool-skill (step C of skills).
 
 - **No teardown.** Plugins never unload, and a failed start doesn't roll
   back the plugins that already started. Because of this:
-  - the tool registry can't remove a tool, so `todo_write` and
-    `working_directory` stay registered for the runtime's life;
+  - the tool registry can't remove a tool, scoped ones included, so
+    `todo_write` and `working_directory` stay registered for the
+    runtime's life; a restriction can be lifted;
   - `WorkingDirectory::stop()` and `UserQuestions::close()` have to be
     called by hand;
   - session-postgres will need a drain on dispose.
@@ -78,23 +79,25 @@ Last updated 2026-11-27, after tool-skill (step C of skills).
   no `startsRequestSeries`, which waits on compaction. (Kernel gaps;
   Skills, step C)
 - **Tool guards.** dsh's registry runs monotonic guards (`ToolGuard`)
-  after `tools/pre-execute`, which can only deny. They aren't ported.
-  (Approvals, step B)
-- **Per-agent composition.** Each agent preset needs its own tools,
-  prompt and skills, and main-agent's approval gate must fire only for
-  main-agent. Prompt contributions, answerers, `tools/pre-execute`
-  listeners, skill providers and runtime skills can be scoped to one
-  session, but tools can't yet. A skill scope has no parent, so an agent
-  can't inherit its preset's skill layer, and dsh's re-parenting on
-  recompose has nothing to follow; both wait on presets. Play This
-  Life mounts `skill-filesystem` inside each preset, with
-  `includeDefaultRoots: false` and `customSkillDirs: []`, plus guides that
-  are SKILL.md files; that mount waits on presets too, and the plugin
-  registers globally until then. dsh publishes the skill catalog only
-  while the agent resolves `tool-skill`'s own `skill` tool, so a
-  restricted agent, or one with a scoped tool of that name, gets none;
-  with no per-agent tools, Karaka always publishes it. (Kernel gaps;
-  Skills, steps A, B and C)
+  after `tools/pre-execute`, which can only deny, globally or per scope.
+  They aren't ported, and nor are `presentAs` or `tools/result`.
+  (Approvals, step B; Presets, step 1)
+- **Per-agent composition.** Every registry now files registrations
+  under a preset's or a session's scope, and an agent sees them through
+  its chain, global, then preset, then session. Tools can be scoped and
+  restricted too. What is left:
+  - the presets themselves, the preset registry (step 2);
+  - filling each agent's chain from its session's `agentPreset`
+    (step 2). Until then `Agent::scope()` is the session alone;
+  - mounting a preset's plugins into its scope, Play This Life's
+    per-preset `skill-filesystem` among them, with
+    `includeDefaultRoots: false`, `customSkillDirs: []` and SKILL.md
+    guides. Until then that plugin registers globally;
+  - main-agent's approval gate, to be scoped to main-agent's preset.
+
+  The chain is fixed at three levels, so dsh's re-parenting on recompose
+  has nothing to follow. `RequestErrorHooks` and `InboxHooks` are still
+  global only. (Kernel gaps; Skills, steps A, B and C; Presets, step 1)
 - **A logger.** dsh warns on a torn log tail and a failed background
   batch. Karaka writes nothing, or prints to stderr. The skill registry
   keeps its warnings (ignored duplicates, skipped providers, panicking

@@ -1,0 +1,12 @@
+[package]
+name = "karaka-scope"
+description = "Scopes: whose a registration is, and the chain of scopes a lookup sees, global, then preset, then session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# A session scope is named by its session's id.
+karaka-session.workspace = true

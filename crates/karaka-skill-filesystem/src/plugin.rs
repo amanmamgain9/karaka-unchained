@@ -17,7 +17,9 @@ use crate::provider::{FileSystemSkillProvider, SkillFilesystemConfig};
 /// or edit; Karaka has no such event yet, so that is
 /// [`FileSystemSkillProvider::observe_host_mutation`], for a caller to
 /// call. An agent preset mounts dsh's plugin in the preset's own layer;
-/// Karaka has no presets, so this plugin registers globally.
+/// until Karaka's presets mount plugins, this plugin registers globally.
+/// [`FileSystemSkillProvider`] can be registered in a preset's scope by
+/// hand.
 #[derive(Clone, Debug, Default)]
 pub struct SkillFilesystemPlugin {
     config: SkillFilesystemConfig,

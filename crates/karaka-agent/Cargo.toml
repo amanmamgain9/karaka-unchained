@@ -13,6 +13,9 @@ publish.workspace = true
 # session's user messages, and ends a cancelled turn with the session's
 # cancel causes. A failed request is described by the session's `Failure`.
 karaka-session.workspace = true
+# The scopes an agent sees registrations through, and the pre-step hook's
+# listeners are filed under.
+karaka-scope.workspace = true
 # The retry policy a failed request's provider asks for.
 karaka-model.workspace = true
 # Only `sync`, for the watch channel behind a turn's cancel switch. It needs

@@ -13,8 +13,8 @@ use crate::ToolRegistry;
 /// any of them. (dsh: the `tools` service.)
 ///
 /// It requires the [`SystemPrompt`] port, and registers the registry there
-/// as a source of tool schemas, so each assembly lists the tools registered
-/// by then, as dsh's tool runtime does (`core/tools/src/index.ts:857`).
+/// as a source of tool schemas, so each assembly lists the tools its agent
+/// sees by then, as dsh's tool runtime does (`core/tools/src/index.ts:857`).
 ///
 /// The port is the concrete registry, not a trait, for the same reason as
 /// the model registry: there is one way to keep a list of tools, and the
@@ -39,12 +39,15 @@ impl Plugin for ToolsPlugin {
         let registry = Arc::new(ToolRegistry::new());
         let source = Arc::clone(&registry);
         // For the life of the runtime.
-        let _ = ctx
-            .get::<SystemPrompt>()
-            .tools(None, move |_| ToolProviderResult {
-                schemas: source.schemas(),
-                known_names: None,
-            });
+        let _ = ctx.get::<SystemPrompt>().tools(None, move |context| {
+            // The tools the assembly's agent sees, and every name it
+            // knows, as dsh's provider gives `wireSchemas(scope)`.
+            let (schemas, known) = source.wire(&context.chain);
+            ToolProviderResult {
+                schemas,
+                known_names: Some(known),
+            }
+        });
         ctx.provide(registry);
         Ok(())
     }

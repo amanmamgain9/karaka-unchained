@@ -21,11 +21,10 @@
 //! answer is what it extends, and an invoked skill comes last, closest to
 //! the model's answer.
 //!
-//! dsh publishes the catalog only while the calling agent resolves this
-//! plugin's own `skill` tool, so an agent whose tools are restricted, or
-//! that has a scoped tool of the same name, gets no catalog. Karaka's tool
-//! registry has no per-agent tools yet, and never replaces a tool, so the
-//! tool is always this one and the catalog is always published.
+//! The catalog is published only while the calling agent sees this
+//! plugin's own `skill` tool, as in dsh: an agent whose tools are
+//! restricted away from it, or whose scope has a tool of the same name,
+//! gets no catalog, and one that had a catalog gets the empty replacement.
 
 mod catalog;
 mod tool;
@@ -37,7 +36,7 @@ use karaka_agent::PreStepHooks;
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_session::SessionStore;
 use karaka_skill::SkillRegistry;
-use karaka_tools::ToolRegistry;
+use karaka_tools::{Tool, ToolRegistry};
 use karaka_working_directory::WorkingDirectory;
 
 pub use catalog::{
@@ -128,12 +127,16 @@ impl Plugin for ToolSkillPlugin {
         }
         let skills = ctx.get::<SkillRegistry>();
         let directories = ctx.get::<WorkingDirectory>();
-        ctx.get::<ToolRegistry>().register(Arc::new(SkillTool::new(
+        let tools = ctx.get::<ToolRegistry>();
+        let tool: Arc<dyn Tool> = Arc::new(SkillTool::new(
             Arc::clone(&skills),
             Arc::clone(&directories),
-        )))?;
+        ));
+        tools.register(Arc::clone(&tool))?;
         let shared = Arc::new(Shared {
             skills,
+            tools,
+            tool,
             directories,
             sessions: ctx.get::<SessionStore>(),
             description_max_length: max_length,

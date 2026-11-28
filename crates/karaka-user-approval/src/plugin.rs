@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_session::{SessionId, SessionStore};
+use karaka_session::SessionStore;
 use karaka_session_projection::SessionProjections;
 use karaka_system_prompt::{ContextOrder, PromptContext, SystemPrompt, Text};
 use karaka_tools::{ToolApproval, ToolRegistry};
@@ -82,13 +82,7 @@ impl Plugin for ApprovalPlugin {
             PromptContext::new(
                 CONTEXT_NAME,
                 ContextOrder::ApprovalPolicy.order(),
-                Text::dynamic(move |context| {
-                    let id = context
-                        .scope
-                        .as_ref()
-                        .map(|scope| SessionId::new(scope.as_str()));
-                    shown.context_text(id.as_ref())
-                }),
+                Text::dynamic(move |context| shown.context_text(context.chain.session.as_ref())),
             ),
         )?;
         ctx.get::<ToolRegistry>()

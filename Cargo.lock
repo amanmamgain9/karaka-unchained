@@ -666,6 +666,7 @@ name = "karaka-agent"
 version = "0.1.0"
 dependencies = [
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "tokio",
 ]
@@ -678,6 +679,7 @@ dependencies = [
  "karaka-agent",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-session-projection",
  "karaka-system-prompt",
@@ -772,6 +774,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-scope"
+version = "0.1.0"
+dependencies = [
+ "karaka-session",
+]
+
+[[package]]
 name = "karaka-session"
 version = "0.1.0"
 dependencies = [
@@ -821,6 +830,7 @@ version = "0.1.0"
 dependencies = [
  "karaka-fs",
  "karaka-kernel",
+ "karaka-scope",
  "karaka-session",
  "serde",
  "serde_json",
@@ -851,6 +861,8 @@ version = "0.1.0"
 dependencies = [
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
+ "karaka-session",
  "tokio",
 ]
 
@@ -880,6 +892,7 @@ dependencies = [
  "karaka-fs-local",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-session-projection",
  "karaka-skill",
@@ -935,6 +948,7 @@ dependencies = [
  "karaka-agent",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-system-prompt",
  "serde_json",
@@ -949,6 +963,7 @@ dependencies = [
  "karaka-fs",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-session-projection",
  "karaka-system-prompt",
@@ -968,6 +983,7 @@ dependencies = [
  "karaka-fs",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-session-projection",
  "karaka-system-prompt",
@@ -988,6 +1004,7 @@ dependencies = [
  "karaka-fs-local",
  "karaka-kernel",
  "karaka-model",
+ "karaka-scope",
  "karaka-session",
  "karaka-session-projection",
  "karaka-system-prompt",

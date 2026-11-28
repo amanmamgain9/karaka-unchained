@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use karaka_model::ToolSchema;
+use karaka_scope::ScopeChain;
+use karaka_session::SessionId;
 use karaka_system_prompt::{
     AssembleContext, AssembleFuture, AssembleListener, AssembleNext, AssembledContext,
-    AssembledSection, ContextSection, HARNESS_IDENTITY, PromptAssembly, PromptContext, Scope,
-    Section, SectionOrder, SystemPrompt, SystemPromptConfig, Text, ToolProviderResult,
+    AssembledSection, ContextSection, HARNESS_IDENTITY, PromptAssembly, PromptContext, Section,
+    SectionOrder, SystemPrompt, SystemPromptConfig, Text, ToolProviderResult,
     render_context_sections, render_context_snapshot, render_prompt,
 };
 
@@ -554,14 +556,20 @@ async fn section_text_is_worked_out_for_each_assembly_and_its_context() {
                 0.0,
                 Text::dynamic(move |context| {
                     let call = counted.fetch_add(1, Ordering::SeqCst) + 1;
-                    let who = context.scope.as_ref().map_or("nobody", Scope::as_str);
+                    let who = context
+                        .chain
+                        .session
+                        .as_ref()
+                        .map_or("nobody", SessionId::as_str);
                     format!("call {call} for {who}")
                 }),
             ),
         )
         .unwrap();
     let alice = prompt
-        .assemble(&AssembleContext::scoped(Scope::new("alice")))
+        .assemble(&AssembleContext::scoped(ScopeChain::session(
+            SessionId::new("alice"),
+        )))
         .await
         .unwrap();
     assert_eq!(contributed(&alice)[0].text, "call 1 for alice");
@@ -894,13 +902,16 @@ async fn a_variable_is_worked_out_for_each_assembly() {
     let registration = prompt
         .variable(None, "who", |context| {
             context
-                .scope
+                .chain
+                .session
                 .as_ref()
-                .map(|scope| scope.as_str().to_owned())
+                .map(|id| id.as_str().to_owned())
         })
         .unwrap();
     let alice = prompt
-        .assemble(&AssembleContext::scoped(Scope::new("alice")))
+        .assemble(&AssembleContext::scoped(ScopeChain::session(
+            SessionId::new("alice"),
+        )))
         .await
         .unwrap();
     assert_eq!(alice.variables.get("who"), Some(Some("alice")));

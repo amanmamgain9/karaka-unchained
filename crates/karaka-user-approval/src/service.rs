@@ -22,8 +22,8 @@
 //! dsh's `approval/request` waterfall, dispatched to the global listeners
 //! and those scoped to the request's agent. Here it is the service's own
 //! list, as `karaka-user-questions` keeps its answerers: an answerer is
-//! global, or belongs to one agent by its session's id, and they run in
-//! the order they were added.
+//! global, or filed under a scope, and a request runs those its agent's
+//! chain admits, in the order they were added.
 //!
 //! # The policy
 //!
@@ -40,6 +40,7 @@ use std::task::{Context, Poll};
 
 use karaka_agent::Agent;
 use karaka_fs::AbortSignal;
+use karaka_scope::{ScopeChain, ScopeKey};
 use karaka_session::{
     Entry, LogError, Passthrough, Session, SessionEvent, SessionHeader, SessionId, SessionStore,
     UserMessage, UserSource,
@@ -133,7 +134,7 @@ impl std::fmt::Debug for AnswererRegistration {
 #[derive(Default)]
 struct Answerers {
     next: u64,
-    list: Vec<(u64, Option<SessionId>, Arc<dyn ApprovalAnswerer>)>,
+    list: Vec<(u64, Option<ScopeKey>, Arc<dyn ApprovalAnswerer>)>,
 }
 
 /// What the service reads of a session: whether a turn is open, and its
@@ -246,11 +247,11 @@ impl ApprovalService {
     }
 
     /// Adds `answerer` at the end of the chain: for every request when
-    /// `scope` is `None`, or for the requests of the agent whose session is
-    /// `scope`.
+    /// `scope` is `None`, or for the requests of the agents whose chain
+    /// holds `scope`.
     pub fn answerer(
         &self,
-        scope: Option<&SessionId>,
+        scope: Option<&ScopeKey>,
         answerer: Arc<dyn ApprovalAnswerer>,
     ) -> AnswererRegistration {
         let mut answerers = lock(&self.answerers);
@@ -376,7 +377,7 @@ impl ApprovalService {
         if self.effective_policy(session) == ApprovalPolicy::Never {
             return ApprovalOutcome::Rejected;
         }
-        let chain = self.chain(request.agent.id());
+        let chain = self.chain(&request.agent.scope());
         let answer = async {
             // An answerer that panics, even before its future, fails the
             // question closed, not the caller's call open.
@@ -405,12 +406,12 @@ impl ApprovalService {
         }
     }
 
-    /// The global answerers and those of the agent of session `scope`.
-    fn chain(&self, scope: &SessionId) -> Vec<Arc<dyn ApprovalAnswerer>> {
+    /// The global answerers and those of the scopes on `viewer`.
+    fn chain(&self, viewer: &ScopeChain) -> Vec<Arc<dyn ApprovalAnswerer>> {
         lock(&self.answerers)
             .list
             .iter()
-            .filter(|(_, owner, _)| owner.as_ref().is_none_or(|owner| owner == scope))
+            .filter(|(_, owner, _)| viewer.admits(owner.as_ref()))
             .map(|(_, _, answerer)| Arc::clone(answerer))
             .collect()
     }

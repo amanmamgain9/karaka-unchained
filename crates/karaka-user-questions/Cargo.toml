@@ -16,6 +16,9 @@ karaka-agent.workspace = true
 # The events the projection folds, the reply message, and the listener
 # that sees a reply admitted.
 karaka-session.workspace = true
+# An answerer is filed under a scope, and a request sees the answerers its
+# agent's chain admits.
+karaka-scope.workspace = true
 # The `userQuestions` projection, and the `inbox` one a reply is looked
 # for in.
 karaka-session-projection.workspace = true

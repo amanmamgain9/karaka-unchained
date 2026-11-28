@@ -7,7 +7,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use karaka_fs::AbortSignal;
-use karaka_session::{SessionId, UserSource};
+use karaka_scope::ScopeChain;
+use karaka_session::UserSource;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -281,9 +282,9 @@ pub struct SkillLookupOptions {
     pub cwd: Option<String>,
     /// Cancels discovery or loading.
     pub signal: Option<AbortSignal>,
-    /// The viewing agent, by its session's id; `None` reads the global
-    /// layer alone.
-    pub scope: Option<SessionId>,
+    /// The viewing agent's chain; the empty chain reads the global layer
+    /// alone. (dsh: `scope`, the agent as its scope key.)
+    pub scope: ScopeChain,
 }
 
 /// One observation of the catalog. (dsh: `SkillCatalogSnapshot`.)

@@ -8,8 +8,10 @@
 //! and a [`PreStepNext`], and decides, usually by asking the rest of the
 //! chain first and then changing what it answered. The end of the chain
 //! enters the step with the claimed messages. A listener is global, or
-//! scoped to one agent by its session's id, as the other registry ports
-//! scope theirs, and they run in the order they were added.
+//! filed under a scope, and hears the agents whose chain holds that scope
+//! (`karaka-scope`), as the other registry ports scope theirs. The
+//! listeners an agent hears run in the order they were added, whatever
+//! their scopes, as dsh's scope-filtered waterfall runs them.
 //!
 //! dsh's end of the chain also adds the runtime-context snapshot to the
 //! step's messages. Karaka's loop logs that snapshot with each attempt of
@@ -25,7 +27,8 @@ use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use karaka_session::{SessionId, UserMessage};
+use karaka_scope::{ScopeChain, ScopeKey};
+use karaka_session::UserMessage;
 
 use crate::{Agent, Cancellation, HandlerError};
 
@@ -101,7 +104,7 @@ impl<'a> PreStepNext<'a> {
 }
 
 /// A listener, with the session it is scoped to, if any.
-type Scoped = (Option<SessionId>, Arc<dyn PreStepListener>);
+type Scoped = (Option<ScopeKey>, Arc<dyn PreStepListener>);
 
 /// The port the pre-step listeners are registered in. The loop provides it
 /// and runs it.
@@ -116,32 +119,32 @@ impl PreStepHooks {
     }
 
     /// Adds `listener` at the end of the chain, for every agent when
-    /// `scope` is `None`, or for the agent whose session is `scope`, for
+    /// `scope` is `None`, or for the agents whose chain holds `scope`, for
     /// the life of the hooks.
-    pub fn register(&self, scope: Option<&SessionId>, listener: Arc<dyn PreStepListener>) {
+    pub fn register(&self, scope: Option<&ScopeKey>, listener: Arc<dyn PreStepListener>) {
         self.listeners
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .push((scope.cloned(), listener));
     }
 
-    /// Whether any listener would run for the agent of session `scope`.
-    pub fn is_empty_for(&self, scope: &SessionId) -> bool {
-        self.chain(scope).is_empty()
+    /// Whether any listener would run for an agent seeing `chain`.
+    pub fn is_empty_for(&self, chain: &ScopeChain) -> bool {
+        self.chain(chain).is_empty()
     }
 
     /// Runs the chain for `step`, first listener first.
     pub fn run<'a>(&self, step: &'a PreStep) -> PreStepFuture<'a> {
-        let chain = self.chain(step.agent.id());
+        let chain = self.chain(&step.agent.scope());
         Box::pin(async move { PreStepNext { rest: &chain, step }.run().await })
     }
 
-    fn chain(&self, scope: &SessionId) -> Vec<Arc<dyn PreStepListener>> {
+    fn chain(&self, viewer: &ScopeChain) -> Vec<Arc<dyn PreStepListener>> {
         self.listeners
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|(owner, _)| owner.as_ref().is_none_or(|owner| owner == scope))
+            .filter(|(owner, _)| viewer.admits(owner.as_ref()))
             .map(|(_, listener)| Arc::clone(listener))
             .collect()
     }

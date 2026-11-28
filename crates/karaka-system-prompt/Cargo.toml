@@ -12,7 +12,11 @@ publish.workspace = true
 karaka-kernel.workspace = true
 # Tool schemas are the model seam's type.
 karaka-model.workspace = true
+# A contribution's scope, and the chain an assembly sees.
+karaka-scope.workspace = true
 
 # Only for running the async tests.
 [dev-dependencies]
+# A session scope is named by its session's id.
+karaka-session.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

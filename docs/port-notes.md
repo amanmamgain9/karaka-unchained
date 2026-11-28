@@ -3090,7 +3090,8 @@ and `tool-skill` (`bundle/base/cordis.patch.yml`).
   with a scoped tool named `skill`, gets no catalog. Karaka's tools have
   no per-agent restriction or scoping yet, and a tool is never replaced,
   so the tool is always visible and the catalog always published. The
-  two spec cases wait on per-agent tools.
+  two spec cases wait on per-agent tools. (Closed in "Presets, step 1":
+  the catalog is now gated, and both cases are ported.)
 - **The abort signal.** dsh passes the step's signal to `ensure` and to
   every registry lookup, and throws once it fires. A pre-step has a
   cancel switch, and the loop drops the chain on a cancel, so the lookups
@@ -3126,3 +3127,190 @@ and `tool-skill` (`bundle/base/cordis.patch.yml`).
 - **Cutting a description.** dsh's `slice` counts UTF-16 units and can
   split a surrogate pair. Here lengths are counted in UTF-16 units too,
   but a character that would be split is dropped whole.
+
+## Presets, step 1: the scope chain
+
+This step gives every per-agent registry one shared notion of scope, so a
+registration can belong to an agent preset as well as to one session.
+It also ports scoped tools and restrictions to the tool registry. The
+preset registry itself is step 2. (dsh: `packages/core/scope`,
+`src/index.ts` and `store.ts`; the scoped half of `core/tools`.)
+
+### The chain
+
+A new crate, `karaka-scope`, holds the shared types. It depends on
+`karaka-session` alone, for `SessionId`, so every registry crate can use
+it. `karaka-system-prompt` now reaches `karaka-session` through it.
+
+- **`ScopeKey`** is `Preset(PresetId)` or `Session(SessionId)`. A
+  registration takes `Option<&ScopeKey>`, where `None` means global.
+  `PresetId` is new.
+- **`ScopeChain { preset, session }`** is what a lookup sees.
+  - `farthest_first()` gives preset, then session; `nearest_first()` gives
+    the reverse; `nearest()` is the viewer's own scope.
+  - `admits(scope)` says whether a registration filed under `scope` is
+    seen: a global one always, a scoped one when its key is on the chain.
+  - A preset's id and a session's never match each other.
+- **`ScopedLayers<L>`** is dsh's `ScopedLayers`:
+  - the global layer always exists;
+  - a scoped layer is made by its first registration, never by a read;
+  - `chain_layers(chain)` gives the layers that exist, farthest first;
+  - `peek(key)` reads one scope's own layer and nothing else;
+  - `prune` forgets an empty layer.
+
+  The system prompt and the tool registry keep their layers in it. The
+  skill registry kept its own map, keyed by `ScopeKey` now.
+- **`Agent::scope()`** gives the agent's chain. The default is the
+  session alone. The loop's agent answers from `Inner::scope()`, which
+  the loop's prompt assembly and pre-step hook use too, so there is one
+  source when step 2 fills in the preset.
+
+dsh's chain can be any length, and a parent can be moved while a session
+is still blank. Karaka's is fixed at three levels: global, then preset,
+then session. A child agent will join its parent's preset, as dsh's
+`composeFrom` does, so three levels still cover it.
+
+### The registries
+
+Each one keeps its rules, now across the chain:
+
+- **The system prompt.** Its own `Scope(String)` type is gone, and
+  `AssembleContext` holds `chain: ScopeChain`.
+  - Sections, contexts and variables merge from the global layer, then
+    the chain's layers, farthest first, so the nearest scope has the last
+    word on a name. dsh's `Map.set` keeps a name's first place, and the
+    merge does too.
+  - Suppression holds if any layer on the chain suppresses.
+  - Tool sources come from every layer on the chain.
+  - Listeners run if the chain admits them.
+  - The working-directory and approval contexts read the session from
+    `context.chain.session`.
+- **The user-questions and approval answerers.** A request runs the
+  answerers its agent's chain admits. A request with no agent runs only
+  the global ones.
+- **The `tools/pre-execute` listeners and the pre-step hooks** work the
+  same way. `PreStepHooks::is_empty_for` takes a chain.
+- **The skill registry.** `SkillLookupOptions::scope` is a `ScopeChain`.
+  - A read merges the global layer, then the preset's, then the
+    session's, and the nearest layer's entry of a name wins outright,
+    whatever the ranks, as dsh's does.
+  - The cache is keyed by `(cwd, chain, revision)`.
+
+**Listener order.** In dsh, scoped listeners run through Cordis's
+filtered dispatch (`scopeTarget`): every listener the dispatch key
+admits, global or on an ancestor scope, in registration order. Here the
+admitted listeners keep the order they were added, whatever their
+scopes. `on_assemble_first` still puts a listener at the front.
+
+### Scoped tools
+
+`ToolRegistry` keeps a `ScopedLayers` of tool layers. Each layer has its
+tools in registration order, names unique within the layer, and its
+restrictions. (dsh: `ToolLayer` and `view`.)
+
+- **Registering.** `register_in(scope, tool)` files a tool in a scope;
+  `register(tool)` is global.
+  - A second tool of a name in one layer is refused. The scoped error is
+    dsh's `tool "x" is already registered in this scope`.
+  - The global error now gives dsh's advice in Karaka's terms: `(for a
+    per-agent variant, register it in that agent's scope instead)`. dsh's
+    says to register through `agent.ctx`.
+- **The view** (`view`), worked out per lookup in one pass over the
+  chain:
+  1. What the viewer inherits: the global tools, then each scope on the
+     chain except its own, farthest first, a nearer tool shadowing a
+     farther one of its name.
+  2. Every scope's restrictions on the chain, its own included, mask
+     inherited names, each intersecting the others.
+  3. The viewer's own scope's tools come last. They shadow an inherited
+     name and sit outside every restriction.
+- **`restrict(viewer, ToolRestriction { allow, deny })`** files a
+  restriction in the viewer's nearest scope. It returns a
+  `RestrictionRegistration` whose `remove` lifts it.
+  - It checks the names against what that scope inherits through the
+    chain.
+  - The errors are dsh's texts: a chain with no scope, a restriction with
+    neither list, and unknown names, with "known global tools" sorted by
+    UTF-16 units, or `(none)`.
+  - A restriction applies to tools registered after it.
+  - A preset's restriction reaches every session in the preset.
+- **Lookups.** `schemas_for(chain)` gives the schemas a viewer sees, and
+  `schemas()` is the global view. `get(name, chain)` gives the tool a
+  viewer would call.
+- **The system prompt's tool source** gives each assembly its agent's
+  schemas, and every name the agent knows, restricted ones included. A
+  configured tool order may still name a masked tool, as dsh's
+  `wireSchemas` gives `knownNames`.
+- **`execute`** resolves the tool and the gate's listeners through the
+  caller's chain. A tool the caller doesn't see is `Error: unknown tool
+  "x"`, as in dsh.
+
+### The skill tool's visibility gating
+
+`tool-skill` now publishes the catalog only while the agent's view
+resolves to the very `skill` tool the plugin registered, compared by
+pointer, as dsh's `ctx.tools.get(name, agent) === skillTool`.
+
+- A restricted agent gets no catalog.
+- An agent with a scoped tool named `skill` gets no catalog.
+- An agent that had a catalog gets the empty replacement.
+
+Its lookups, the tool's and the listeners', use the agent's chain.
+
+### Tests
+
+- **New tests:**
+  - 4 in `karaka-scope`;
+  - 12 scoped-tool cases in `karaka-tools/tests/scoped.rs`;
+  - 1 each for a preset's prompt sections and variables, skill layer,
+    question answerers and pre-step listeners;
+  - 2 for the skill tool's visibility gating;
+  - 1 loop case, where a request lists and runs the tools its agent sees.
+- **Preset coverage.** Each preset case also checks that a chain naming
+  another preset, a session alone, and a session named like the preset
+  see none of it.
+- **Call sites** in the existing tests now pass `ScopeKey`s and chains.
+- **Ported dsh cases:**
+  - `scope.spec.ts`: listener routing by key, and an ancestor-tagged
+    listener admitted for a descendant but never the reverse;
+  - `store.spec.ts`: eager global state, reads that make no layer, and
+    merged shadows;
+  - `scoped.spec.ts`: registration, shadowing, duplicates, the five
+    `restrict()` cases, the three inherited-layer cases, and the scoped
+    pre-execute listener;
+  - `tool-skill.spec.ts`: its two visibility cases.
+- **Skipped dsh cases:**
+  - `scope.spec.ts`: Cordis contexts, fibers and disposal; carriers and
+    base filters; `{ global: true }`; cycle checks and rebinding. A
+    fixed chain has no parent links.
+  - `store.spec.ts`: `NamedEntries` and `AnonymousEntries` live iteration
+    and idempotent undo; effect labels; notification rollback. There are
+    no Cordis effects.
+  - `scoped.spec.ts`: the synchronous `tools/result` observer type,
+    guards, argument snapshots and final-outcome notification, none of
+    them ported. Also skipped: disposing a scope, since tools are never
+    removed, and compiling a readonly filter, since a Rust restriction is
+    moved into the registry.
+
+### Left out
+
+- **Presets themselves:** the registry, binding an agent's chain to its
+  session's `agentPreset`, and mounting a preset's plugins into its scope.
+  That is step 2.
+- **`RequestErrorHooks` and `InboxHooks`** stay global only, as they
+  were.
+- **Tool guards, `presentAs` and `tools/result`,** with the rest of dsh's
+  tool runtime that isn't ported.
+- **Removing a tool,** which waits on teardown, as before.
+
+### Where it differs from dsh
+
+- **`restrict` takes the viewer's chain,** where dsh takes the calling
+  scope. A Karaka scope doesn't know its parent, so what a session
+  inherits depends on its preset, which only its chain names.
+- **The restrict errors keep dsh's words verbatim,** `tools.restrict()`
+  and `(agent.ctx)` included, though Karaka has no such method or
+  context.
+- **The tool view is worked out on every lookup.** dsh's is too, from its
+  live maps. Here it clones the `Arc`s of every tool along the chain under
+  the read lock.

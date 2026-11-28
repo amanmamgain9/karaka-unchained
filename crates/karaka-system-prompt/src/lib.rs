@@ -14,8 +14,10 @@
 //!   snapshot, and can be suppressed.
 //! - **Listeners**, which shape each assembly before it is returned.
 //!
-//! A contribution is global, or belongs to one agent's [`Scope`], where it
-//! shadows a global one of the same name for that agent alone.
+//! A contribution is global, or filed under a scope (`karaka-scope`): an
+//! agent preset's, or one session's. An assembly is made for a chain of
+//! scopes, and a nearer scope's contribution shadows a farther one, or a
+//! global one, of the same name.
 //!
 //! The plugin's own sections are the identity line, [`HARNESS_IDENTITY`],
 //! and the deployment persona's prefix and suffix, from
@@ -40,6 +42,6 @@ pub use plugin::SystemPromptPlugin;
 pub use registry::{
     AssembleContext, AssembleFuture, AssembleListener, AssembleNext, ContextOrder,
     HARNESS_IDENTITY, HARNESS_IDENTITY_SECTION, PERSONA_PREFIX_SECTION, PERSONA_SUFFIX_SECTION,
-    PromptContext, Registration, Scope, Section, SectionOrder, SystemPrompt, SystemPromptConfig,
+    PromptContext, Registration, Section, SectionOrder, SystemPrompt, SystemPromptConfig,
     TOOL_ORDER_REST, Text, ToolProviderResult,
 };

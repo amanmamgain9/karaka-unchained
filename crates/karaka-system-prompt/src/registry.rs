@@ -2,13 +2,13 @@
 //! its assembly. (dsh: `SystemPrompt` in `core/system-prompt/src/index.ts`.)
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::fmt;
 use std::future::{Future, ready};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use karaka_model::ToolSchema;
+use karaka_scope::{ScopeChain, ScopeKey, ScopedLayers};
 
 use crate::assembly::{
     AssembledContext, AssembledSection, PromptAssembly, PromptError, Variables, valid_variable_name,
@@ -75,34 +75,20 @@ impl ContextOrder {
     }
 }
 
-/// Whose contributions an assembly takes, besides the global ones: one
-/// agent's, by the id of its session. (dsh: `ScopeKey`.)
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Scope(String);
-
-impl Scope {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// What one assembly is for. (dsh: `AssembleContext`, without its signal
 /// and its merge-extensible fields.)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AssembleContext {
-    /// The agent whose contributions join the global ones; `None` for the
-    /// global ones alone.
-    pub scope: Option<Scope>,
+    /// The scopes whose contributions join the global ones: the viewing
+    /// agent's chain. The empty chain takes the global ones alone. (dsh:
+    /// `scope`, the agent as its scope key.)
+    pub chain: ScopeChain,
 }
 
 impl AssembleContext {
-    /// An assembly for the agent `scope`.
-    pub fn scoped(scope: Scope) -> Self {
-        Self { scope: Some(scope) }
+    /// An assembly for an agent seeing `chain`.
+    pub fn scoped(chain: ScopeChain) -> Self {
+        Self { chain }
     }
 }
 
@@ -317,7 +303,7 @@ impl Default for SystemPromptConfig {
     }
 }
 
-/// One registry layer: the global one, or one agent's.
+/// One registry layer: the global one, or one scope's.
 #[derive(Default)]
 struct Layer {
     sections: Vec<(u64, Section)>,
@@ -348,9 +334,8 @@ impl Layer {
 #[derive(Default)]
 struct State {
     next: u64,
-    global: Layer,
-    scoped: HashMap<Scope, Layer>,
-    listeners: Vec<(u64, Option<Scope>, Arc<dyn AssembleListener>)>,
+    layers: ScopedLayers<Layer>,
+    listeners: Vec<(u64, Option<ScopeKey>, Arc<dyn AssembleListener>)>,
 }
 
 impl State {
@@ -359,40 +344,44 @@ impl State {
         self.next
     }
 
-    fn layer(&mut self, scope: Option<&Scope>) -> &mut Layer {
-        match scope {
-            None => &mut self.global,
-            Some(scope) => self.scoped.entry(scope.clone()).or_default(),
-        }
+    fn layer(&mut self, scope: Option<&ScopeKey>) -> &mut Layer {
+        self.layers.layer_mut(scope)
     }
 
-    fn scope_layer(&self, scope: Option<&Scope>) -> Option<&Layer> {
-        scope.and_then(|scope| self.scoped.get(scope))
+    /// The global layer, then the chain's, the farthest first. (dsh:
+    /// `layers.global` and `chainLayers`.)
+    fn seen(&self, chain: &ScopeChain) -> Vec<&Layer> {
+        std::iter::once(self.layers.global())
+            .chain(
+                self.layers
+                    .chain_layers(chain)
+                    .into_iter()
+                    .map(|(_, layer)| layer),
+            )
+            .collect()
     }
 
-    fn suppressed(&self, scope: Option<&Scope>) -> bool {
-        !self.global.suppressors.is_empty()
-            || self
-                .scope_layer(scope)
-                .is_some_and(|layer| !layer.suppressors.is_empty())
+    /// Whether any layer the chain sees suppresses optional context.
+    fn suppressed(&self, chain: &ScopeChain) -> bool {
+        self.seen(chain)
+            .iter()
+            .any(|layer| !layer.suppressors.is_empty())
     }
 
-    /// The effective sections: the global ones, each replaced by the
-    /// scope's of the same name, then the scope's own.
-    fn sections(&self, scope: Option<&Scope>) -> Vec<Section> {
+    /// The effective sections: the global ones, each replaced by a nearer
+    /// scope's of the same name, then each scope's new ones.
+    fn sections(&self, chain: &ScopeChain) -> Vec<Section> {
         merge(
-            self.global.sections.iter().map(|(_, section)| section),
-            self.scope_layer(scope)
+            self.seen(chain)
                 .into_iter()
                 .flat_map(|layer| layer.sections.iter().map(|(_, section)| section)),
             |section| &section.name,
         )
     }
 
-    fn contexts(&self, scope: Option<&Scope>) -> Vec<PromptContext> {
+    fn contexts(&self, chain: &ScopeChain) -> Vec<PromptContext> {
         merge(
-            self.global.contexts.iter().map(|(_, context)| context),
-            self.scope_layer(scope)
+            self.seen(chain)
                 .into_iter()
                 .flat_map(|layer| layer.contexts.iter().map(|(_, context)| context)),
             |context| &context.name,
@@ -400,15 +389,15 @@ impl State {
     }
 }
 
-/// `scoped` over `global`, by name: a scoped entry takes its global twin's
-/// place, a new one goes last.
+/// `entries`, farthest layer first, by name: a nearer entry takes its
+/// farther twin's place, a new one goes last. (dsh: `ScopedLayers.merge`,
+/// a `Map` whose `set` keeps a name's first place.)
 fn merge<'a, T: Clone + 'a>(
-    global: impl Iterator<Item = &'a T>,
-    scoped: impl Iterator<Item = &'a T>,
+    entries: impl Iterator<Item = &'a T>,
     name: impl Fn(&T) -> &String,
 ) -> Vec<T> {
-    let mut merged: Vec<T> = global.cloned().collect();
-    for entry in scoped {
+    let mut merged: Vec<T> = Vec::new();
+    for entry in entries {
         match merged.iter().position(|known| name(known) == name(entry)) {
             Some(at) => merged[at] = entry.clone(),
             None => merged.push(entry.clone()),
@@ -423,7 +412,7 @@ fn merge<'a, T: Clone + 'a>(
 #[must_use = "dropping a registration keeps the contribution; call `remove` to take it back"]
 pub struct Registration {
     state: Weak<Mutex<State>>,
-    scope: Option<Scope>,
+    scope: Option<ScopeKey>,
     id: u64,
 }
 
@@ -435,17 +424,11 @@ impl Registration {
         };
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         state.listeners.retain(|(id, _, _)| *id != self.id);
-        match &self.scope {
-            None => state.global.remove(self.id),
-            Some(scope) => {
-                if let Some(layer) = state.scoped.get_mut(scope) {
-                    layer.remove(self.id);
-                    if layer.is_empty() {
-                        state.scoped.remove(scope);
-                    }
-                }
-            }
+        let scope = self.scope.as_ref();
+        if let Some(layer) = state.layers.get_mut(scope) {
+            layer.remove(self.id);
         }
+        state.layers.prune(scope, Layer::is_empty);
     }
 }
 
@@ -462,8 +445,8 @@ impl fmt::Debug for Registration {
 /// variables, which the loop assembles before each model step. (dsh:
 /// `SystemPrompt`, `ctx.systemPrompt`.)
 ///
-/// Each contribution is global, or belongs to one agent's [`Scope`], where
-/// it shadows a global one of the same name for that agent alone.
+/// Each contribution is global, or filed under a scope, where it shadows a
+/// farther one of the same name for the agents whose chain holds it.
 pub struct SystemPrompt {
     state: Arc<Mutex<State>>,
     tool_order: Option<Vec<String>>,
@@ -604,7 +587,7 @@ impl SystemPrompt {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn registration(&self, scope: Option<&Scope>, id: u64) -> Registration {
+    fn registration(&self, scope: Option<&ScopeKey>, id: u64) -> Registration {
         Registration {
             state: Arc::downgrade(&self.state),
             scope: scope.cloned(),
@@ -612,7 +595,7 @@ impl SystemPrompt {
         }
     }
 
-    fn duplicate(kind: &str, name: &str, scope: Option<&Scope>, what: &str) -> PromptError {
+    fn duplicate(kind: &str, name: &str, scope: Option<&ScopeKey>, what: &str) -> PromptError {
         PromptError::new(match scope {
             None => format!(
                 "prompt {kind} \"{name}\" is already registered (for a per-agent {what}, register \
@@ -622,14 +605,14 @@ impl SystemPrompt {
         })
     }
 
-    /// Adds a section, globally or for one agent. (dsh: `section`.)
+    /// Adds a section, globally or in a scope. (dsh: `section`.)
     ///
     /// # Errors
     ///
     /// A name already in that layer, or an order that isn't finite.
     pub fn section(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         section: Section,
     ) -> Result<Registration, PromptError> {
         if !section.order.is_finite() {
@@ -652,14 +635,14 @@ impl SystemPrompt {
         Ok(self.registration(scope, id))
     }
 
-    /// Adds runtime context, globally or for one agent. (dsh: `context`.)
+    /// Adds runtime context, globally or in a scope. (dsh: `context`.)
     ///
     /// # Errors
     ///
     /// As [`section`](Self::section).
     pub fn context(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         context: PromptContext,
     ) -> Result<Registration, PromptError> {
         if !context.order.is_finite() {
@@ -682,10 +665,10 @@ impl SystemPrompt {
         Ok(self.registration(scope, id))
     }
 
-    /// Leaves optional runtime context out, globally or for one agent,
+    /// Leaves optional runtime context out, globally or in a scope,
     /// until removed. Several suppressors compose. (dsh:
     /// `suppressRuntimeContext`.)
-    pub fn suppress_runtime_context(&self, scope: Option<&Scope>) -> Registration {
+    pub fn suppress_runtime_context(&self, scope: Option<&ScopeKey>) -> Registration {
         let mut state = self.lock();
         let id = state.id();
         state.layer(scope).suppressors.push(id);
@@ -696,7 +679,7 @@ impl SystemPrompt {
     /// `tools`.)
     pub fn tools(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         provider: impl Fn(&AssembleContext) -> ToolProviderResult + Send + Sync + 'static,
     ) -> Registration {
         let mut state = self.lock();
@@ -714,7 +697,7 @@ impl SystemPrompt {
     /// A name that isn't `[a-z][a-z0-9_]*`, or one already in that layer.
     pub fn variable(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         name: &str,
         provider: impl Fn(&AssembleContext) -> Option<String> + Send + Sync + 'static,
     ) -> Result<Registration, PromptError> {
@@ -740,12 +723,13 @@ impl SystemPrompt {
         Ok(self.registration(scope, id))
     }
 
-    /// Adds a listener that shapes assemblies: every one when global, one
-    /// agent's when scoped. Listeners run in the order they were added.
+    /// Adds a listener that shapes assemblies: every one when global, those
+    /// whose chain holds `scope` when scoped. Listeners run in the order
+    /// they were added, whatever their scopes.
     /// (dsh: a `system-prompt/assemble` listener.)
     pub fn on_assemble(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         listener: Arc<dyn AssembleListener>,
     ) -> Registration {
         let mut state = self.lock();
@@ -758,7 +742,7 @@ impl SystemPrompt {
     /// `system-prompt/assemble` with `{ prepend: true }`.)
     pub fn on_assemble_first(
         &self,
-        scope: Option<&Scope>,
+        scope: Option<&ScopeKey>,
         listener: Arc<dyn AssembleListener>,
     ) -> Registration {
         let mut state = self.lock();
@@ -770,22 +754,20 @@ impl SystemPrompt {
     /// The variables, each provider called with no lock held. Providers
     /// added meanwhile are called too; one removed before its turn isn't.
     fn variables(&self, context: &AssembleContext) -> Variables {
-        let scope = context.scope.as_ref();
         let mut variables = Variables::new();
-        for scoped in [false, true] {
-            if scoped && scope.is_none() {
-                break;
-            }
+        // The global layer, then the chain's, the farthest first, so the
+        // nearest scope's value wins a name.
+        let layers =
+            std::iter::once(None).chain(context.chain.farthest_first().into_iter().map(Some));
+        for key in layers {
             let mut index = 0;
             loop {
                 let entry = {
                     let state = self.lock();
-                    let layer = if scoped {
-                        state.scope_layer(scope)
-                    } else {
-                        Some(&state.global)
-                    };
-                    layer.and_then(|layer| layer.variables.get(index).cloned())
+                    state
+                        .layers
+                        .get(key.as_ref())
+                        .and_then(|layer| layer.variables.get(index).cloned())
                 };
                 let Some((_, name, provider)) = entry else {
                     break;
@@ -797,8 +779,9 @@ impl SystemPrompt {
         variables
     }
 
-    /// Assembles the prompt for `context`: the global and the scope's
-    /// contributions, scoped ones shadowing global twins; sections by
+    /// Assembles the prompt for `context`: the global contributions and
+    /// those of the scopes on its chain, a nearer one shadowing a farther
+    /// twin; sections by
     /// order, then name; tools in their canonical order; then the
     /// listeners. A complete section is restored after them, and
     /// suppressed context stays out. (dsh: `assemble`.)
@@ -808,33 +791,29 @@ impl SystemPrompt {
     /// Two complete sections, a tool named like the rest entry, a
     /// configured tool no source knows, or a listener's failure.
     pub async fn assemble(&self, context: &AssembleContext) -> Result<PromptAssembly, PromptError> {
-        let scope = context.scope.as_ref();
+        let chain = &context.chain;
         let variables = self.variables(context);
         let (mut sections, contexts, providers, suppressed, listeners) = {
             let state = self.lock();
             let providers: Vec<ToolProvider> = state
-                .global
-                .tools
-                .iter()
-                .chain(
-                    state
-                        .scope_layer(scope)
-                        .into_iter()
-                        .flat_map(|layer| layer.tools.iter()),
-                )
+                .seen(chain)
+                .into_iter()
+                .flat_map(|layer| layer.tools.iter())
                 .map(|(_, provider)| Arc::clone(provider))
                 .collect();
+            // Every listener the chain admits, in the order they were
+            // added, as dsh's scope-filtered waterfall runs them.
             let listeners: Vec<Arc<dyn AssembleListener>> = state
                 .listeners
                 .iter()
-                .filter(|(_, owner, _)| owner.is_none() || owner.as_ref() == scope)
+                .filter(|(_, owner, _)| chain.admits(owner.as_ref()))
                 .map(|(_, _, listener)| Arc::clone(listener))
                 .collect();
             (
-                state.sections(scope),
-                state.contexts(scope),
+                state.sections(chain),
+                state.contexts(chain),
                 providers,
-                state.suppressed(scope),
+                state.suppressed(chain),
                 listeners,
             )
         };
@@ -931,10 +910,12 @@ impl SystemPrompt {
         assembly: &PromptAssembly,
         context: &AssembleContext,
     ) -> PromptAssembly {
-        let scope = context.scope.as_ref();
         let (providers, suppressed) = {
             let state = self.lock();
-            (state.contexts(scope), state.suppressed(scope))
+            (
+                state.contexts(&context.chain),
+                state.suppressed(&context.chain),
+            )
         };
         let provider = |name: &str| providers.iter().find(|entry| entry.name == name);
         let mut required: Vec<&PromptContext> =

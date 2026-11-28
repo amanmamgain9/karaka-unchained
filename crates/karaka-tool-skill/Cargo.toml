@@ -22,6 +22,8 @@ karaka-agent.workspace = true
 karaka-session.workspace = true
 # A lookup is for the calling agent's working directory.
 karaka-working-directory.workspace = true
+# A lookup is made for the calling agent's scope chain.
+karaka-scope.workspace = true
 # The model's arguments, and the catalog's message source.
 serde_json = { workspace = true, features = ["preserve_order"] }
 

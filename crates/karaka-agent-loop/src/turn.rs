@@ -81,8 +81,7 @@ use karaka_session::{
     UserMessage,
 };
 use karaka_system_prompt::{
-    AssembleContext, PromptAssembly, Scope, join_context_sections, render_context_sections,
-    render_prompt,
+    AssembleContext, PromptAssembly, join_context_sections, render_context_sections, render_prompt,
 };
 
 use crate::agent::{Cancel, Inner};
@@ -255,7 +254,7 @@ impl Inner {
         caller: &Arc<dyn Agent>,
     ) -> Result<PreStepDecision, Stop> {
         let hooks = &self.shared.pre_step;
-        if hooks.is_empty_for(self.session.id()) {
+        if hooks.is_empty_for(&self.scope()) {
             return Ok(PreStepDecision::Enter { messages: input });
         }
         let proposed = PreStep {
@@ -651,9 +650,9 @@ impl Inner {
         Ok(())
     }
 
-    /// What this agent's assemblies are for: its session's scope.
+    /// What this agent's assemblies are for: its scope chain.
     fn assemble_context(&self) -> AssembleContext {
-        AssembleContext::scoped(Scope::new(self.session.id().as_str()))
+        AssembleContext::scoped(self.scope())
     }
 
     /// An id for the message the next appended event will hold.

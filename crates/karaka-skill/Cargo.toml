@@ -10,9 +10,10 @@ publish.workspace = true
 [dependencies]
 # For the plugin that provides the registry.
 karaka-kernel.workspace = true
-# A view is scoped to one agent by its session's id, and an invocation's
-# message source is a session `UserSource`.
+# An invocation's message source is a session `UserSource`.
 karaka-session.workspace = true
+# Registrations are filed under scopes, and a view reads the viewer's chain.
+karaka-scope.workspace = true
 # The cancel a lookup carries: a cause-less signal, as dsh's `AbortSignal`,
 # the one the question and approval services use.
 karaka-fs.workspace = true

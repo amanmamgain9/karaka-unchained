@@ -4,18 +4,17 @@
 //!
 //! # Layers
 //!
-//! A registration goes in the global layer, or in one agent's, by its
-//! session's id: dsh files it in the layer of its calling context's scope,
-//! where an agent preset's standing mount is a scope of its own. Karaka has
-//! no presets, so a scope is a session and has no parent; a read merges the
-//! global layer with the viewing scope's. Within a layer, the lowest rank
-//! wins a duplicate name, then the earliest registration, then the
-//! provider's own order. Across layers, the scope's entry replaces the
-//! global one outright, whatever their ranks.
+//! A registration goes in the global layer, or in a scope's (`karaka-scope`):
+//! dsh files it in the layer of its calling context's scope, where an agent
+//! preset's standing mount is a scope of its own. A read merges the global
+//! layer with the layers of the viewer's chain, preset then session. Within
+//! a layer, the lowest rank wins a duplicate name, then the earliest
+//! registration, then the provider's own order. Across layers, the nearest
+//! layer's entry replaces a farther one outright, whatever their ranks.
 //!
 //! # The cache
 //!
-//! A complete catalog is kept per `(cwd, scope, revision)`, at most
+//! A complete catalog is kept per `(cwd, chain, revision)`, at most
 //! `collect_cache_max_entries` of them, oldest out first. Every change to
 //! a layer, and a provider's own invalidation, bumps the revision. A read
 //! whose revision changed while it ran tries once more, and if it changed
@@ -35,7 +34,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use karaka_fs::{AbortController, AbortSignal};
-use karaka_session::SessionId;
+use karaka_scope::{ScopeChain, ScopeKey};
 
 use crate::error::SkillError;
 use crate::types::{
@@ -90,7 +89,7 @@ pub struct SkillProviderControl {
     /// Fires when the registration is refused or removed.
     pub signal: AbortSignal,
     shared: Weak<Shared>,
-    scope: Option<SessionId>,
+    scope: Option<ScopeKey>,
     id: u64,
 }
 
@@ -144,7 +143,7 @@ impl Default for SkillConfig {
 #[must_use = "dropping a registration keeps the provider; call `remove` to take it out"]
 pub struct ProviderRegistration {
     shared: Weak<Shared>,
-    scope: Option<SessionId>,
+    scope: Option<ScopeKey>,
     id: u64,
 }
 
@@ -163,7 +162,7 @@ impl ProviderRegistration {
 #[must_use = "dropping a registration keeps the skill; call `remove` to take it out"]
 pub struct SkillHandle {
     shared: Weak<Shared>,
-    scope: Option<SessionId>,
+    scope: Option<ScopeKey>,
     /// `None` for an ignored duplicate.
     entry: Option<(String, u64)>,
 }
@@ -209,7 +208,7 @@ struct Shared {
 #[derive(Default)]
 struct State {
     global: Layer,
-    scoped: HashMap<SessionId, Layer>,
+    scoped: HashMap<ScopeKey, Layer>,
     revision: u64,
     next_id: u64,
     next_order: u64,
@@ -244,7 +243,7 @@ struct RegisteredProvider {
 #[derive(Clone, PartialEq, Eq)]
 struct CacheKey {
     cwd: Option<String>,
-    scope: Option<SessionId>,
+    chain: ScopeChain,
     revision: u64,
 }
 
@@ -256,7 +255,7 @@ struct Indexed {
     candidate: SkillCandidate,
     /// `None` for a runtime skill, whose body is its locator.
     provider: Option<(u64, Arc<dyn SkillProvider>)>,
-    layer: Option<SessionId>,
+    layer: Option<ScopeKey>,
     provider_order: i128,
     local_order: u64,
 }
@@ -276,7 +275,7 @@ impl Shared {
         state.warnings.push_back(message);
     }
 
-    fn is_live(&self, scope: Option<&SessionId>, id: u64) -> bool {
+    fn is_live(&self, scope: Option<&ScopeKey>, id: u64) -> bool {
         let state = self.lock();
         layer(&state, scope).is_some_and(|layer| layer.providers.iter().any(|entry| entry.id == id))
     }
@@ -306,7 +305,7 @@ impl Shared {
         }
     }
 
-    fn remove_provider(&self, scope: Option<&SessionId>, id: u64) {
+    fn remove_provider(&self, scope: Option<&ScopeKey>, id: u64) {
         let removed = {
             let mut state = self.lock();
             let Some(layer) = layer_mut(&mut state, scope) else {
@@ -323,7 +322,7 @@ impl Shared {
         self.invalidate();
     }
 
-    fn remove_runtime(&self, scope: Option<&SessionId>, name: &str, id: u64) {
+    fn remove_runtime(&self, scope: Option<&ScopeKey>, name: &str, id: u64) {
         {
             let mut state = self.lock();
             let Some(layer) = layer_mut(&mut state, scope) else {
@@ -339,14 +338,14 @@ impl Shared {
     }
 }
 
-fn layer<'a>(state: &'a State, scope: Option<&SessionId>) -> Option<&'a Layer> {
+fn layer<'a>(state: &'a State, scope: Option<&ScopeKey>) -> Option<&'a Layer> {
     match scope {
         None => Some(&state.global),
         Some(scope) => state.scoped.get(scope),
     }
 }
 
-fn layer_mut<'a>(state: &'a mut State, scope: Option<&SessionId>) -> Option<&'a mut Layer> {
+fn layer_mut<'a>(state: &'a mut State, scope: Option<&ScopeKey>) -> Option<&'a mut Layer> {
     match scope {
         None => Some(&mut state.global),
         Some(scope) => state.scoped.get_mut(scope),
@@ -354,7 +353,7 @@ fn layer_mut<'a>(state: &'a mut State, scope: Option<&SessionId>) -> Option<&'a 
 }
 
 /// Forgets an empty scoped layer. (dsh: `ScopedLayers` drops one.)
-fn prune(state: &mut State, scope: Option<&SessionId>) {
+fn prune(state: &mut State, scope: Option<&ScopeKey>) {
     if let Some(scope) = scope
         && state.scoped.get(scope).is_some_and(Layer::is_empty)
     {
@@ -417,8 +416,8 @@ impl SkillRegistry {
     }
 
     /// Registers the provider `create` makes, given its control, in the
-    /// global layer, or in the layer of the agent whose session is `scope`.
-    /// (dsh: `registerProvider`, filed by the calling context's scope.)
+    /// global layer, or in `scope`'s, which the agents whose chain holds it
+    /// see. (dsh: `registerProvider`, filed by the calling context's scope.)
     ///
     /// # Errors
     ///
@@ -426,7 +425,7 @@ impl SkillRegistry {
     /// layer; the control's signal fires either way.
     pub fn register_provider(
         &self,
-        scope: Option<&SessionId>,
+        scope: Option<&ScopeKey>,
         create: impl FnOnce(SkillProviderControl) -> Arc<dyn SkillProvider>,
     ) -> Result<ProviderRegistration, SkillError> {
         let lifecycle = Arc::new(AbortController::new());
@@ -487,8 +486,8 @@ impl SkillRegistry {
         })
     }
 
-    /// Registers a runtime skill, globally or for the agent whose session
-    /// is `scope`. Within a layer, the first of a name wins: a duplicate is
+    /// Registers a runtime skill, globally or in `scope`'s layer, which the
+    /// agents whose chain holds it see. Within a layer, the first of a name wins: a duplicate is
     /// warned of, ignored, and gets a registration that removes nothing.
     /// (dsh: `register`.)
     ///
@@ -497,7 +496,7 @@ impl SkillRegistry {
     /// An invalid name, or an empty description.
     pub fn register(
         &self,
-        scope: Option<&SessionId>,
+        scope: Option<&ScopeKey>,
         skill: SkillRegistration,
     ) -> Result<SkillHandle, SkillError> {
         if !is_skill_name(&skill.name) {
@@ -677,19 +676,19 @@ impl SkillRegistry {
                 let state = self.shared.lock();
                 let key = CacheKey {
                     cwd: options.cwd.clone(),
-                    scope: options.scope.clone(),
+                    chain: options.scope.clone(),
                     revision: state.revision,
                 };
                 if let Some((_, cached)) = state.cache.iter().find(|(held, _)| *held == key) {
                     return Ok((Arc::clone(cached), true));
                 }
-                // Global first, then the scope's, so its same-name entry
-                // replaces the global one.
+                // Global first, then the chain's, the farthest first, so the
+                // nearest same-name entry replaces the others.
                 let mut layers = vec![(None, state.global.clone())];
-                if let Some(scope) = &options.scope
-                    && let Some(layer) = state.scoped.get(scope)
-                {
-                    layers.push((Some(scope.clone()), layer.clone()));
+                for key in options.scope.farthest_first() {
+                    if let Some(layer) = state.scoped.get(&key) {
+                        layers.push((Some(key), layer.clone()));
+                    }
                 }
                 (state.revision, key, layers)
             };
@@ -726,7 +725,7 @@ impl SkillRegistry {
     /// `collectLayer` and `listLayerCandidates`.)
     async fn collect_layer(
         &self,
-        scope: Option<SessionId>,
+        scope: Option<ScopeKey>,
         layer: Layer,
         options: &SkillLookupOptions,
     ) -> Result<(Vec<Indexed>, bool), SkillError> {

@@ -19,10 +19,6 @@
 //!   cancel instead of signalling it.
 //! - "rejects a missing event below the current Session length": a Karaka
 //!   session's events are a list with no holes.
-//! - "omits catalog guidance when the calling agent restricts away the
-//!   shipped skill tool" and "does not attach shipped catalog guidance to a
-//!   scoped same-name tool shadow": Karaka's tool registry has no per-agent
-//!   restriction or scoped tools yet.
 //! - "rejects an unknown resource-base kind at the canonical output
 //!   boundary": a resource base is a Rust enum, so no unknown kind reaches
 //!   the tool.
@@ -46,6 +42,7 @@ use karaka_model::{
     Block, ErrorKind, Event, EventStream, FinishReason, Message, Model, ModelError, ModelRegistry,
     ModelsPlugin, Request, Role, ToolCall, Usage, stream_of,
 };
+use karaka_scope::ScopeKey;
 use karaka_session::{
     ContentBlock, Extra, ReasoningBlock, Seq, Session, SessionEvent, SessionHeader, SessionId,
     SessionStore, SessionsPlugin, SurfaceIntent, SurfaceOp, UserMessage, UserSource,
@@ -61,7 +58,9 @@ use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tool_skill::{
     CATALOG_KIND, DESCRIPTION, NAME, PARAMETERS, ToolSkillConfig, ToolSkillPlugin,
 };
-use karaka_tools::{ToolOutput, ToolRegistry, ToolsPlugin};
+use karaka_tools::{
+    Tool, ToolFuture, ToolOutput, ToolRegistry, ToolRestriction, ToolRun, ToolsPlugin,
+};
 use karaka_working_directory::WorkingDirectoryPlugin;
 use serde_json::{Value, json};
 
@@ -917,7 +916,7 @@ async fn lookups_are_the_calling_agents() {
     let _kept = f
         .skills
         .register(
-            Some(scoped.id()),
+            Some(&ScopeKey::from(scoped.id().clone())),
             SkillRegistration::new(
                 "preset-only-skill",
                 "Visible to the scoped agent alone",
@@ -1571,5 +1570,91 @@ async fn a_person_invokes_a_skill_by_name() {
             "skill-invocation".into()
         ]),
         "{logged:?}"
+    );
+}
+
+// "omits catalog guidance when the calling agent restricts away the
+// shipped skill tool"; and a catalog published before the restriction is
+// withdrawn with the empty replacement, as dsh's README says.
+#[tokio::test]
+async fn an_agent_restricted_from_the_tool_gets_no_catalog() {
+    let f = fixture().await;
+    let _kept = f.register("listed-skill", "Listed", "body");
+    let agent = f.agent("restricted-catalog");
+    open_message_turn(&f.session(&agent));
+    let _restriction = f
+        .tools
+        .restrict(
+            &agent.scope(),
+            ToolRestriction {
+                allow: None,
+                deny: Some(vec![NAME.into()]),
+            },
+        )
+        .unwrap();
+
+    assert!(f.tools.get(NAME, &agent.scope()).is_none());
+    f.fire_step(&agent).await;
+    f.fire_step(&agent).await;
+    assert!(f.catalogs(&agent).is_empty());
+    // Another agent still gets one.
+    assert_eq!(f.fire_step(&f.agent("free")).await.len(), 1);
+
+    let published = f.agent("published");
+    open_message_turn(&f.session(&published));
+    f.fire_step(&published).await;
+    assert_eq!(f.catalogs(&published).len(), 1);
+    let _later = f
+        .tools
+        .restrict(
+            &published.scope(),
+            ToolRestriction {
+                allow: None,
+                deny: Some(vec![NAME.into()]),
+            },
+        )
+        .unwrap();
+    f.fire_step(&published).await;
+    let catalogs = f.catalogs(&published);
+    assert_eq!(catalogs.len(), 2);
+    assert_eq!(
+        source(&catalogs[1].1),
+        json!({ "kind": "skill-catalog", "form": "catalog", "update": true, "entries": [] })
+    );
+}
+
+/// A tool named `skill` with other semantics.
+struct Shadow;
+
+impl Tool for Shadow {
+    fn schema(&self) -> karaka_model::ToolSchema {
+        karaka_model::ToolSchema {
+            name: NAME.into(),
+            description: "A scoped tool with unrelated semantics.".into(),
+            parameters: r#"{"type":"object","properties":{}}"#.into(),
+        }
+    }
+
+    fn execute<'a>(&'a self, _: Value, _: ToolRun) -> ToolFuture<'a> {
+        Box::pin(async { ToolOutput::ok("shadow") })
+    }
+}
+
+// "does not attach shipped catalog guidance to a scoped same-name tool
+// shadow"
+#[tokio::test]
+async fn a_scoped_tool_named_skill_gets_no_catalog() {
+    let f = fixture().await;
+    let _kept = f.register("listed-skill", "Listed", "body");
+    let agent = f.agent("shadowed");
+    f.tools
+        .register_in(Some(&ScopeKey::from(agent.id().clone())), Arc::new(Shadow))
+        .unwrap();
+
+    assert!(f.fire_step(&agent).await.is_empty());
+    assert_eq!(f.fire_step(&f.agent("unshadowed")).await.len(), 1);
+    assert_eq!(
+        f.call("listed-skill", Some(agent)).await,
+        ToolOutput::ok("shadow")
     );
 }

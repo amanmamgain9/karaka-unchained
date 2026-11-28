@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use karaka_model::ToolSchema;
+use karaka_scope::ScopeChain;
 use karaka_skill::{
     Invocable, SkillLookupOptions, SkillRegistry, is_skill_name, render_skill_content,
 };
@@ -59,7 +60,10 @@ impl SkillTool {
         let lookup = SkillLookupOptions {
             cwd,
             signal: None,
-            scope: run.agent.as_ref().map(|agent| agent.id().clone()),
+            scope: run
+                .agent
+                .as_ref()
+                .map_or_else(ScopeChain::global, |agent| agent.scope()),
         };
         let unknown = || format!("skill \"{name}\" is unknown or no longer available");
         let not_for_models = || format!("skill \"{name}\" is not available for model invocation");

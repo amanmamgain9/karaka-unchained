@@ -30,6 +30,7 @@ use karaka_model::{
     Block, ErrorKind, Event, EventStream, FinishReason, Model, ModelError, ModelRegistry,
     ModelsPlugin, Request, Usage, stream_of,
 };
+use karaka_scope::ScopeChain;
 use karaka_session::{
     CancelCause, ContentBlock, Session, SessionEvent, SessionHeader, SessionId, SessionStore,
     SessionsPlugin, TurnEndReason, UserMessage, UserSource,
@@ -37,8 +38,8 @@ use karaka_session::{
 use karaka_session_projection::{SessionProjections, SessionProjectionsPlugin};
 use karaka_system_prompt::{
     AssembleContext, AssembleFuture, AssembleListener, AssembleNext, AssembledContext,
-    PromptAssembly, Scope, SystemPrompt, SystemPromptConfig, SystemPromptPlugin,
-    render_context_snapshot, render_prompt,
+    PromptAssembly, SystemPrompt, SystemPromptConfig, SystemPromptPlugin, render_context_snapshot,
+    render_prompt,
 };
 use karaka_tools::ToolsPlugin;
 use karaka_user_approval::{
@@ -440,7 +441,7 @@ impl Fixture {
 
     async fn assemble(&self, agent: &dyn Agent) -> PromptAssembly {
         self.prompt
-            .assemble(&AssembleContext::scoped(Scope::new(agent.id().as_str())))
+            .assemble(&AssembleContext::scoped(agent.scope()))
             .await
             .unwrap()
     }
@@ -958,7 +959,9 @@ async fn a_notice_that_cant_be_queued_is_warned_and_the_change_stands() {
         .unwrap();
     let assembly = f
         .prompt
-        .assemble(&AssembleContext::scoped(Scope::new(restored.id().as_str())))
+        .assemble(&AssembleContext::scoped(ScopeChain::session(
+            restored.id().clone(),
+        )))
         .await
         .unwrap();
     assert!(snapshot(&assembly).contains(&current(&child)));

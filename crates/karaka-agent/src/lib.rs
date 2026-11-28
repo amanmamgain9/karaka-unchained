@@ -52,6 +52,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use karaka_scope::ScopeChain;
 use karaka_session::{CancelCause, SessionError, SessionId, UserMessage};
 
 /// One session's agent: the loop that turns what the user says into turns
@@ -138,6 +139,16 @@ pub trait Agent: Send + Sync {
     /// address.
     fn instance(&self) -> usize {
         std::ptr::from_ref(self).cast::<()>() as usize
+    }
+
+    /// The scopes this agent sees registrations through: its preset's,
+    /// then its session's. (dsh: the agent as its own scope key, bound
+    /// under its preset's scope.)
+    ///
+    /// The default is the session alone, with no preset, as every agent is
+    /// until presets exist.
+    fn scope(&self) -> ScopeChain {
+        ScopeChain::session(self.id().clone())
     }
 }
 

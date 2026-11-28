@@ -6,9 +6,9 @@
 //! dsh asks through the Cordis waterfall `user-questions/request`: each
 //! listener answers, or hands the request to the next, and the end of the
 //! chain fails with `NO_PROVIDER`. Here the chain is the service's own
-//! list. An answerer is global, or belongs to one agent, by its session's
-//! id, as dsh scopes a listener to an agent. A request from an agent runs
-//! the global answerers and that agent's, in the order they were
+//! list. An answerer is global, or filed under a scope (`karaka-scope`),
+//! as dsh scopes a listener. A request from an agent runs the global
+//! answerers and those of the scopes on its chain, in the order they were
 //! registered; one with no agent runs only the global ones.
 //!
 //! # The calling agent
@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use karaka_agent::{Agent, Agents, InboxHooks, InboxListener};
 use karaka_fs::AbortSignal;
+use karaka_scope::{ScopeChain, ScopeKey};
 use karaka_session::{
     Appended, Entry, FlushFuture, Session, SessionEvent, SessionId, SessionListener, SessionStore,
     UserMessage,
@@ -134,7 +135,7 @@ impl std::fmt::Debug for AnswererRegistration {
 #[derive(Default)]
 struct Answerers {
     next: u64,
-    list: Vec<(u64, Option<SessionId>, Arc<dyn QuestionAnswerer>)>,
+    list: Vec<(u64, Option<ScopeKey>, Arc<dyn QuestionAnswerer>)>,
 }
 
 /// A queued late reply. (dsh: `QueuedReply`.)
@@ -296,11 +297,11 @@ impl UserQuestions {
     }
 
     /// Adds `answerer` at the end of the chain: for every request when
-    /// `scope` is `None`, or for the requests of the agent whose session
-    /// is `scope`.
+    /// `scope` is `None`, or for the requests of the agents whose chain
+    /// holds `scope`.
     pub fn answerer(
         &self,
-        scope: Option<&SessionId>,
+        scope: Option<&ScopeKey>,
         answerer: Arc<dyn QuestionAnswerer>,
     ) -> AnswererRegistration {
         let mut answerers = lock(&self.answerers);
@@ -383,7 +384,11 @@ impl UserQuestions {
                 .into());
             }
         }
-        let chain = self.chain(request.agent.as_ref().map(|agent| agent.id()));
+        let viewer = request
+            .agent
+            .as_ref()
+            .map_or_else(ScopeChain::global, |agent| agent.scope());
+        let chain = self.chain(&viewer);
         let result = AnswerNext {
             rest: &chain,
             request: &request,
@@ -623,12 +628,12 @@ impl UserQuestions {
         }
     }
 
-    /// The answerers a request from the agent of session `scope` runs.
-    fn chain(&self, scope: Option<&SessionId>) -> Vec<Arc<dyn QuestionAnswerer>> {
+    /// The answerers a request from an agent seeing `viewer` runs.
+    fn chain(&self, viewer: &ScopeChain) -> Vec<Arc<dyn QuestionAnswerer>> {
         lock(&self.answerers)
             .list
             .iter()
-            .filter(|(_, owner, _)| owner.is_none() || owner.as_ref() == scope)
+            .filter(|(_, owner, _)| viewer.admits(owner.as_ref()))
             .map(|(_, _, answerer)| Arc::clone(answerer))
             .collect()
     }

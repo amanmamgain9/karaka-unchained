@@ -14,6 +14,9 @@ karaka-kernel.workspace = true
 karaka-agent.workspace = true
 # The audit and policy events, and the notice's message.
 karaka-session.workspace = true
+# An answerer is filed under a scope, and a request sees the answerers its
+# agent's chain admits.
+karaka-scope.workspace = true
 # The session's policy and whether a turn is open, folded from its log.
 karaka-session-projection.workspace = true
 # The policy line in the runtime context.

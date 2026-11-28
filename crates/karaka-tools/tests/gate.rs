@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use karaka_agent::{Agent, FrameListener, FrameListeners, FrameSubscription, InboxError, WhenIdle};
 use karaka_model::{ToolCall, ToolSchema};
+use karaka_scope::ScopeKey;
 use karaka_session::{CancelCause, SessionId, UserMessage};
 use karaka_tools::{
     DisplayReason, PreExecuteFuture, PreExecuteListener, PreExecuteNext, PreToolDecision, Tool,
@@ -438,8 +439,8 @@ async fn an_agents_listeners_hear_only_its_calls() {
     let a = agent("a");
     let b = agent("b");
     let _ = registry.on_pre_execute(None, note("global"));
-    let _ = registry.on_pre_execute(Some(a.id()), note("scoped"));
-    let _ = registry.on_pre_execute(Some(b.id()), note("scoped"));
+    let _ = registry.on_pre_execute(Some(&ScopeKey::from(a.id().clone())), note("scoped"));
+    let _ = registry.on_pre_execute(Some(&ScopeKey::from(b.id().clone())), note("scoped"));
     for caller in [Some(a), Some(b), None] {
         registry.execute(&call("echo", json!({})), caller).await;
     }

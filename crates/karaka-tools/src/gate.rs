@@ -7,9 +7,11 @@
 //!
 //! Each listener gets the pending call and a [`PreExecuteNext`], and
 //! decides, or hands the call on. The end of the chain allows. A listener
-//! is global, or scoped to one agent by its session's id, as the other
-//! registry ports scope theirs, and they run in the order they were added.
-//! A call made outside any agent runs only the global ones. A listener
+//! is global, or filed under a scope, and gates the calls of the agents
+//! whose chain holds that scope (`karaka-scope`), as the other registry
+//! ports scope theirs. A call's listeners run in the order they were added,
+//! whatever their scopes. A call made outside any agent runs only the
+//! global ones. A listener
 //! that fails fails the call, `Error: <message>`, and the tool doesn't run.
 //!
 //! # Ask
@@ -35,7 +37,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use karaka_agent::Agent;
-use karaka_session::SessionId;
+use karaka_scope::{ScopeChain, ScopeKey};
 use serde_json::Value;
 
 /// What a listener decides about a call. (dsh: `PreToolDecision`.)
@@ -167,7 +169,7 @@ impl fmt::Debug for PreExecuteRegistration {
 #[derive(Default)]
 pub(crate) struct Listeners {
     next: u64,
-    list: Vec<(u64, Option<SessionId>, Arc<dyn PreExecuteListener>)>,
+    list: Vec<(u64, Option<ScopeKey>, Arc<dyn PreExecuteListener>)>,
 }
 
 /// One approval question about a call. (dsh: the `ApprovalRequest`
@@ -223,7 +225,7 @@ pub(crate) struct Gate {
 impl Gate {
     pub(crate) fn listen(
         &self,
-        scope: Option<&SessionId>,
+        scope: Option<&ScopeKey>,
         listener: Arc<dyn PreExecuteListener>,
     ) -> PreExecuteRegistration {
         let mut listeners = lock(&self.listeners);
@@ -236,12 +238,12 @@ impl Gate {
         }
     }
 
-    /// The listeners a call from the agent of session `scope` runs.
-    pub(crate) fn chain(&self, scope: Option<&SessionId>) -> Vec<Arc<dyn PreExecuteListener>> {
+    /// The listeners a call from an agent seeing `viewer` runs.
+    pub(crate) fn chain(&self, viewer: &ScopeChain) -> Vec<Arc<dyn PreExecuteListener>> {
         lock(&self.listeners)
             .list
             .iter()
-            .filter(|(_, owner, _)| owner.is_none() || owner.as_ref() == scope)
+            .filter(|(_, owner, _)| viewer.admits(owner.as_ref()))
             .map(|(_, _, listener)| Arc::clone(listener))
             .collect()
     }

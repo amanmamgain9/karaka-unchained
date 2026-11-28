@@ -7,7 +7,7 @@ use std::sync::Arc;
 use karaka_agent::Agents;
 use karaka_fs::FileSystem;
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_session::{SessionId, SessionStore};
+use karaka_session::SessionStore;
 use karaka_session_projection::SessionProjections;
 use karaka_system_prompt::{
     AssembleContext, AssembleFuture, AssembleListener, AssembleNext, AssembledContext,
@@ -101,8 +101,7 @@ fn session_of(
     sessions: &SessionStore,
     context: &AssembleContext,
 ) -> Option<karaka_session::Session> {
-    let scope = context.scope.as_ref()?;
-    sessions.get(&SessionId::new(scope.as_str()))
+    sessions.get(context.chain.session.as_ref()?)
 }
 
 /// Checks the directory before the assembly, and keeps its context after.
@@ -121,12 +120,12 @@ impl AssembleListener for EnsureFirst {
         next: AssembleNext<'a>,
     ) -> AssembleFuture<'a> {
         Box::pin(async move {
-            let Some(scope) = &context.scope else {
+            let Some(id) = &context.chain.session else {
                 return next.run(assembly).await;
             };
             let agent = self
                 .agents
-                .open(SessionId::new(scope.as_str()))
+                .open(id.clone())
                 .map_err(|error| PromptError::new(error.to_string()))?;
             self.service
                 .ensure(agent.as_ref(), None)
