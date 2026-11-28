@@ -51,8 +51,13 @@ karaka-persona.workspace = true
 karaka-tool-policy.workspace = true
 # MCP servers, global from `KARAKA_MCP_SERVERS` or in a preset's row.
 karaka-mcp-client.workspace = true
-# The application catalog a preset's tool policy reads.
+# Global plugin rows from `KARAKA_PLUGINS`: the application catalog and
+# endpoints, the server auth their requests carry, the credentials it reads
+# from the environment, and the sessions' owners.
 karaka-mcp-application.workspace = true
+karaka-server-auth.workspace = true
+karaka-credentials.workspace = true
+karaka-identity.workspace = true
 # Reads the presets file. The YAML 1.2 parser skill frontmatter is read
 # with, pinned to the same release.
 yaml-rust2 = { version = "=0.13.0", default-features = false }

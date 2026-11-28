@@ -19,6 +19,7 @@ use std::sync::Arc;
 use karaka_credentials::{CredentialRef, Credentials};
 use karaka_identity::ApplicationId;
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
+use serde_json::Value;
 
 /// A verified application server. (Karaka: `AuthenticatedApplication`.)
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +70,50 @@ pub struct ApplicationCredentialConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BearerConfig {
     pub applications: Vec<ApplicationCredentialConfig>,
+}
+
+impl BearerConfig {
+    /// Reads Karaka's row config: `applications`, a list of mappings each
+    /// with `id`, `chatCredential` and `toolCredential`, all required, as
+    /// its schema has them. A key it doesn't know is refused. The values
+    /// are checked when the provider is made.
+    ///
+    /// # Errors
+    ///
+    /// A missing or misshapen field, said with `at`.
+    pub fn from_json(value: &Value, at: &str) -> Result<Self, String> {
+        let Value::Object(map) = value else {
+            return Err(format!("{at} must be a mapping"));
+        };
+        if let Some(key) = map.keys().find(|key| *key != "applications") {
+            return Err(format!("{at}: unknown key \"{key}\""));
+        }
+        let Some(Value::Array(rows)) = map.get("applications") else {
+            return Err(format!("{at} needs \"applications\", a list"));
+        };
+        let mut applications = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let at = format!("{at}: application {}", index + 1);
+            let Value::Object(row) = row else {
+                return Err(format!("{at} must be a mapping"));
+            };
+            const KEYS: [&str; 3] = ["id", "chatCredential", "toolCredential"];
+            if let Some(key) = row.keys().find(|key| !KEYS.contains(&key.as_str())) {
+                return Err(format!("{at}: unknown key \"{key}\""));
+            }
+            let field = |key: &str| match row.get(key) {
+                Some(Value::String(text)) => Ok(text.clone()),
+                None | Some(Value::Null) => Err(format!("{at} needs \"{key}\"")),
+                Some(_) => Err(format!("{at}: \"{key}\" must be a string")),
+            };
+            applications.push(ApplicationCredentialConfig {
+                id: field("id")?,
+                chat_credential: field("chatCredential")?,
+                tool_credential: field("toolCredential")?,
+            });
+        }
+        Ok(Self { applications })
+    }
 }
 
 struct Application {

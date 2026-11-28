@@ -33,8 +33,8 @@
 //!   `toolCallTimeoutMs`, `failOnStartupError`, `maxInstructionBytes` and
 //!   `reconnect`. Its tools and instructions are the preset's alone.
 //!
-//! `KARAKA_MCP_SERVERS` names another file: a list of the same `mcp-client`
-//! configs, for servers every session sees, as dsh's global `mcp-client`
+//! Servers every session sees are `mcp-client` rows of the global plugins
+//! file, `KARAKA_PLUGINS` (`plugins.rs`), as dsh's global `mcp-client`
 //! rows.
 //!
 //! Anything else, an unknown key included, fails the start with a message
@@ -221,7 +221,7 @@ fn tool_policy(config: &Value, at: &str) -> Result<ToolPolicy, String> {
         None | Some("native") => {}
         Some("ptc") => {
             return Err(format!(
-                "{at}: mode \"ptc\" isn't supported yet; it waits on the MCP client"
+                "{at}: mode \"ptc\" isn't supported yet; it waits on dsh's tool presentation"
             ));
         }
         Some(other) => {
@@ -271,33 +271,6 @@ fn skill_filesystem(
     Ok(SkillFilesystemPresetPlugin::new(skills))
 }
 
-/// The global MCP servers in the file at `path`: a list of `mcp-client`
-/// configs.
-///
-/// # Errors
-///
-/// A file that doesn't read or parse, or a config that doesn't fit, said
-/// with where it is.
-pub fn load_mcp_servers(path: &Path) -> Result<Vec<McpServerConfig>, String> {
-    let at = format!("KARAKA_MCP_SERVERS ({})", path.display());
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("{at}: couldn't read it: {error}"))?;
-    parse_mcp_servers(&text, &at)
-}
-
-/// [`load_mcp_servers`] for the file's `text`.
-pub fn parse_mcp_servers(text: &str, at: &str) -> Result<Vec<McpServerConfig>, String> {
-    let documents =
-        YamlLoader::load_from_str(text).map_err(|error| format!("{at}: not YAML: {error}"))?;
-    let Some(Value::Array(rows)) = documents.first().map(json) else {
-        return Err(format!("{at}: must be a list of MCP servers"));
-    };
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| McpServerConfig::from_json(row, &format!("{at}: server {}", index + 1)))
-        .collect()
-}
-
 /// A plugin row with an `id` of its own, which its diagnostics name.
 struct Labelled {
     id: String,
@@ -323,7 +296,11 @@ impl PresetPlugin for Labelled {
 }
 
 /// `value` as a mapping holding only `keys`.
-fn object<'a>(value: &'a Value, at: &str, keys: &[&str]) -> Result<&'a Map<String, Value>, String> {
+pub(crate) fn object<'a>(
+    value: &'a Value,
+    at: &str,
+    keys: &[&str],
+) -> Result<&'a Map<String, Value>, String> {
     let Value::Object(map) = value else {
         return Err(format!("{at} must be a mapping"));
     };
@@ -336,7 +313,11 @@ fn object<'a>(value: &'a Value, at: &str, keys: &[&str]) -> Result<&'a Map<Strin
     Ok(map)
 }
 
-fn string(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<String>, String> {
+pub(crate) fn string(
+    map: &Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<String>, String> {
     match map.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
@@ -344,7 +325,11 @@ fn string(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<String
     }
 }
 
-fn boolean(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<bool>, String> {
+pub(crate) fn boolean(
+    map: &Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<bool>, String> {
     match map.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -352,7 +337,11 @@ fn boolean(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<bool>
     }
 }
 
-fn strings(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<Vec<String>>, String> {
+pub(crate) fn strings(
+    map: &Map<String, Value>,
+    key: &str,
+    at: &str,
+) -> Result<Option<Vec<String>>, String> {
     let wrong = || format!("{at}: \"{key}\" must be a list of strings");
     match map.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -366,7 +355,7 @@ fn strings(map: &Map<String, Value>, key: &str, at: &str) -> Result<Option<Vec<S
 }
 
 /// A YAML value as JSON, a mapping's keys as strings.
-fn json(yaml: &Yaml) -> Value {
+pub(crate) fn json(yaml: &Yaml) -> Value {
     match yaml {
         Yaml::Real(text) => text
             .parse::<f64>()
@@ -463,7 +452,7 @@ mod tests {
             ),
             (
                 "- id: a\n  plugins: [{ name: tool-policy, config: { mode: ptc } }]",
-                "presets.yml: preset 1 (\"a\"), plugin 1 (tool-policy): mode \"ptc\" isn't supported yet; it waits on the MCP client",
+                "presets.yml: preset 1 (\"a\"), plugin 1 (tool-policy): mode \"ptc\" isn't supported yet; it waits on dsh's tool presentation",
             ),
         ] {
             assert_eq!(refused(text), message, "{text}");

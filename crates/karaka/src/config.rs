@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use karaka_anthropic::{
     AnthropicConfig, AnthropicPlugin, CacheMode, DeepSeekThinking, Profile, ThinkingDisplay,
 };
+use karaka_identity::{ApplicationId, ApplicationOwner, TenantId, UserId};
 use karaka_kernel::DynPlugin;
 use karaka_model::{Effort, ModelsPlugin, RetryPolicyConfig};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
@@ -43,8 +44,11 @@ pub struct Config {
     pub presets: Option<PathBuf>,
     /// The default preset; the file's first when unset.
     pub preset: Option<String>,
-    /// A YAML file of global MCP servers (`presets.rs`).
-    pub mcp_servers: Option<PathBuf>,
+    /// A YAML file of global plugin rows (`plugins.rs`).
+    pub plugins: Option<PathBuf>,
+    /// Who owns the sessions this process opens: the application an
+    /// application endpoint's tools are offered to.
+    pub owner: Option<ApplicationOwner>,
 }
 
 /// The model provider, with its plugin's config. Kept apart from the plugin
@@ -253,6 +257,39 @@ impl Config {
             )?),
         };
 
+        // The global servers moved into the plugins file.
+        if var("KARAKA_MCP_SERVERS").is_some() {
+            return Err("KARAKA_MCP_SERVERS is no longer read: list its servers as mcp-client rows in the file KARAKA_PLUGINS names".into());
+        }
+        // The owner's three ids go together, as Play This Life's names for
+        // the first two.
+        const OWNER: [&str; 3] = [
+            "KARAKA_APPLICATION_ID",
+            "KARAKA_TENANT_ID",
+            "KARAKA_USER_ID",
+        ];
+        let owner = match OWNER.map(|name| var(name).map(|value| value.trim().to_owned())) {
+            [Some(application), Some(tenant), Some(user)] => Some(ApplicationOwner {
+                application_id: ApplicationId::new(application),
+                tenant_id: TenantId::new(tenant),
+                user_id: UserId::new(user),
+            }),
+            [None, None, None] => None,
+            given => {
+                let missing: Vec<&str> = OWNER
+                    .iter()
+                    .zip(&given)
+                    .filter(|(_, value)| value.is_none())
+                    .map(|(name, _)| *name)
+                    .collect();
+                return Err(format!(
+                    "KARAKA_APPLICATION_ID, KARAKA_TENANT_ID and KARAKA_USER_ID name the sessions' owner together, so set all three or none; {} {} not set",
+                    missing.join(" and "),
+                    if missing.len() == 1 { "is" } else { "are" }
+                ));
+            }
+        };
+
         Ok(Self {
             provider,
             model,
@@ -263,7 +300,8 @@ impl Config {
             session: var("KARAKA_SESSION"),
             presets: var("KARAKA_PRESETS").map(PathBuf::from),
             preset: var("KARAKA_PRESET"),
-            mcp_servers: var("KARAKA_MCP_SERVERS").map(PathBuf::from),
+            plugins: var("KARAKA_PLUGINS").map(PathBuf::from),
+            owner,
         })
     }
 }
@@ -649,5 +687,48 @@ mod tests {
         ])
         .expect("the config reads");
         assert!(!format!("{config:?}").contains("sk-secret"));
+    }
+
+    #[test]
+    fn the_sessions_owner_takes_all_three_ids_or_none() {
+        let key = ("ANTHROPIC_API_KEY", "k");
+        assert_eq!(config(&[key]).unwrap().owner, None);
+        let owner = config(&[
+            key,
+            ("KARAKA_APPLICATION_ID", "play-this-life"),
+            ("KARAKA_TENANT_ID", "tenant"),
+            ("KARAKA_USER_ID", "user"),
+        ])
+        .unwrap()
+        .owner
+        .unwrap();
+        assert_eq!(owner.application_id.as_str(), "play-this-life");
+        assert_eq!(owner.tenant_id.as_str(), "tenant");
+        assert_eq!(owner.user_id.as_str(), "user");
+        assert_eq!(
+            config(&[key, ("KARAKA_APPLICATION_ID", "play-this-life")]).unwrap_err(),
+            "KARAKA_APPLICATION_ID, KARAKA_TENANT_ID and KARAKA_USER_ID name the sessions' owner together, so set all three or none; KARAKA_TENANT_ID and KARAKA_USER_ID are not set"
+        );
+        assert_eq!(
+            config(&[
+                key,
+                ("KARAKA_APPLICATION_ID", "a"),
+                ("KARAKA_TENANT_ID", "t")
+            ])
+            .unwrap_err(),
+            "KARAKA_APPLICATION_ID, KARAKA_TENANT_ID and KARAKA_USER_ID name the sessions' owner together, so set all three or none; KARAKA_USER_ID is not set"
+        );
+    }
+
+    #[test]
+    fn the_old_servers_variable_is_refused() {
+        assert_eq!(
+            config(&[
+                ("ANTHROPIC_API_KEY", "k"),
+                ("KARAKA_MCP_SERVERS", "servers.yml")
+            ])
+            .unwrap_err(),
+            "KARAKA_MCP_SERVERS is no longer read: list its servers as mcp-client rows in the file KARAKA_PLUGINS names"
+        );
     }
 }

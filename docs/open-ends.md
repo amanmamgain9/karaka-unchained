@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the MCP application's catalog, policies and endpoint (step A of mcp-application).
+Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-application).
 
 ## Needs you
 
@@ -251,12 +251,19 @@ Last updated 2026-11-28, after the MCP application's catalog, policies and endpo
   (`authorize`, `Chat is not owned by this caller`), reads a cold
   session's owner (`ownerOfId`), follows lineage through child sessions,
   and persists its records. Until then a host sets each owner on
-  `InMemorySessionOwners` before opening the session's agent. It comes
-  with the app ingress and the webserver. (MCP application, step A)
-- **Application endpoints in the binary.** The binary mounts an empty
-  application catalog only. Reading `application-catalog`,
-  `mcp-application`, `server-auth` and owner rows, and a real call
-  through an application endpoint, are step B. (MCP application, step A)
+  `InMemorySessionOwners` before opening the session's agent; the binary
+  sets one owner, from `KARAKA_APPLICATION_ID`, `KARAKA_TENANT_ID` and
+  `KARAKA_USER_ID`, on the one session a run opens. It comes with the
+  app ingress and the webserver. (MCP application, steps A and B)
+- **Inbound server auth is unused.** `server-auth` rows are read, and
+  their `chatCredential` references checked, but nothing calls
+  `authenticate` until there is an ingress to authenticate. (MCP
+  application, step B)
+- **Plugin rows take literal values.** Play This Life's profile reads
+  settings from the environment inside its rows (`!!js
+  process.env.KARAKA_TOOL_ENDPOINT ?? '…'`). `KARAKA_PLUGINS` rows take
+  literal values; only credentials are read from the environment, by
+  reference. (MCP application, step B)
 - **A delegated header needs the call.** If Play This Life's
   delegated-access tokens must carry the user in the `tools` header,
   the transport's `HeaderSource` will need the request's metadata. It
@@ -293,8 +300,11 @@ From Play This Life's plugin list:
   store and `.env` layers; the process environment is
   `karaka-credentials`).
 - **The rest:** `mcp-resources`, `session-reference`, `webserver`,
-  `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
-  `mcp-application` rows in the binary (step B).
+  `agent-tool-presentation`, `deepseek-llm-api-extensions`.
+- **Play This Life's own global rows** that `KARAKA_PLUGINS` can't name
+  yet, such as `browser-auth` and `delegated-access`; it knows
+  `mcp-client`, `application-catalog`, `server-auth` and
+  `mcp-application`.
 
 Karaka's own: `token-meter`, `compaction-basic`,
 `compaction-tool-result-pruner`, `session-checkpoint-policy`,

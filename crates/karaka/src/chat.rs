@@ -16,12 +16,15 @@ use std::sync::Arc;
 use karaka_agent::Agents;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
+use karaka_credentials::CredentialsPlugin;
 use karaka_fs_local::LocalFsPlugin;
+use karaka_identity::{ApplicationOwner, InMemorySessionOwners, SessionOwnersPlugin};
 use karaka_kernel::{DynPlugin, Runtime};
-use karaka_mcp_application::ApplicationCatalogPlugin;
-use karaka_mcp_client::{Level, McpClientsPlugin};
+use karaka_mcp_application::{ApplicationCatalogPlugin, McpApplicationPlugin};
+use karaka_mcp_client::{Level, Log, McpClientsPlugin};
 use karaka_model::Block;
 use karaka_retry::RetryPlugin;
+use karaka_server_auth::ServerAuthPlugin;
 use karaka_session::{
     Entry, Seq, SessionEvent, SessionId, SessionStore, SessionsPlugin, TurnEndReason, UserMessage,
     UserSource,
@@ -46,6 +49,7 @@ use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
 use crate::current_time::CurrentTimePlugin;
+use crate::plugins::GlobalPlugins;
 use crate::questions::{Lines, TerminalAnswerer, TerminalApprover};
 
 /// The session a chat runs in, unless `KARAKA_SESSION` names another.
@@ -67,9 +71,13 @@ const SHORT_RESULT: usize = 80;
 /// watches them by default: a chat's next step sees a skill added
 /// meanwhile. A single question has no next step to see one.
 ///
-/// MCP servers follow: the global ones from `KARAKA_MCP_SERVERS`, each
-/// waiting for its first connection, and the port a preset's `mcp-client`
-/// rows use.
+/// The global plugins from `KARAKA_PLUGINS` follow (`plugins.rs`): the
+/// MCP servers every session sees, each waiting for its first connection,
+/// with the port a preset's `mcp-client` rows use; the sessions' owners;
+/// the server auth with its credentials, read from the environment; the
+/// application catalog, empty without a row; and each application
+/// endpoint, waiting for its first connection, so its catalog has settled
+/// before the presets' policies read it.
 ///
 /// With `KARAKA_PRESETS`, the agent preset registry goes last, so every
 /// tool a preset's policy names is registered before it is set up. The
@@ -80,7 +88,7 @@ const SHORT_RESULT: usize = 80;
 ///
 /// # Errors
 ///
-/// A presets file that doesn't read or fit.
+/// A presets or plugins file that doesn't read or fit.
 pub fn loop_plugins(
     config: Config,
     approvals: &Approvals,
@@ -95,10 +103,22 @@ pub fn loop_plugins(
         )?),
         None => None,
     };
-    let mcp_servers = match &config.mcp_servers {
-        Some(path) => crate::presets::load_mcp_servers(path)?,
-        None => Vec::new(),
+    let global = match &config.plugins {
+        Some(path) => crate::plugins::load(path)?,
+        None => GlobalPlugins::default(),
     };
+    // An application tool needs an explicit allow from a preset's
+    // tool-policy (`karaka-mcp-application`'s policies), so without presets
+    // an endpoint would offer nothing.
+    if presets.is_none()
+        && let (Some(path), Some(endpoint)) = (&config.plugins, global.applications.first())
+    {
+        return Err(format!(
+            "KARAKA_PLUGINS ({}): the mcp-application row for \"{}\" needs KARAKA_PRESETS: its tools reach only sessions whose preset's tool-policy allows them",
+            path.display(),
+            endpoint.server_name
+        ));
+    }
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
@@ -161,18 +181,30 @@ pub fn loop_plugins(
     // MCP servers: the global ones every session sees, and the port a
     // preset's `mcp-client` rows start theirs through. Their failures are
     // told on stderr, as the loop's warnings would be logged.
-    plugins.push(Box::new(mcp_servers.into_iter().fold(
-        McpClientsPlugin::new().on_log(Arc::new(|level, line| {
-            if level != Level::Info {
-                eprintln!("karaka: {line}");
-            }
-        })),
+    let log: Log = Arc::new(|level, line| {
+        if level != Level::Info {
+            eprintln!("karaka: {line}");
+        }
+    });
+    plugins.push(Box::new(global.mcp_servers.into_iter().fold(
+        McpClientsPlugin::new().on_log(Arc::clone(&log)),
         McpClientsPlugin::server,
     )));
-    // The application catalog a preset's tool policy splits its lists by,
-    // with no application endpoints yet. (Karaka: the
-    // `application-catalog` row.)
-    plugins.push(Box::new(ApplicationCatalogPlugin::default()));
+    // Who owns each session; `KARAKA_APPLICATION_ID` and the rest set the
+    // owner of the one this process opens.
+    plugins.push(Box::new(SessionOwnersPlugin::new()));
+    if let Some(auth) = global.server_auth {
+        plugins.push(Box::new(CredentialsPlugin::new()));
+        plugins.push(Box::new(ServerAuthPlugin::bearer(auth)));
+    }
+    // The application catalog a preset's tool policy splits its lists by.
+    // (Karaka: the `application-catalog` row.)
+    plugins.push(Box::new(ApplicationCatalogPlugin::new(global.catalog)));
+    for endpoint in global.applications {
+        plugins.push(Box::new(
+            McpApplicationPlugin::new(endpoint).on_log(Arc::clone(&log)),
+        ));
+    }
     if let Some(presets) = presets {
         plugins.push(Box::new(presets));
     }
@@ -217,6 +249,17 @@ pub fn select_preset(
         .select(&session, preset)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Makes `owner`, if there is one, own the session `id`. Called before
+/// the session's agent opens, which is when an application endpoint
+/// offers the agent its tools.
+pub fn own_session(runtime: &Runtime, id: &SessionId, owner: Option<&ApplicationOwner>) {
+    if let Some(owner) = owner {
+        runtime
+            .get::<InMemorySessionOwners>()
+            .set(id.clone(), owner.clone());
+    }
 }
 
 /// What the command line says about approvals.
@@ -280,6 +323,7 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
     let Options { approvals, preset } = options;
     let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
     let sessions = config.sessions.clone();
+    let owner = config.owner.clone();
     let mut plugins = loop_plugins(config, &approvals, true)?;
     if let Some(root) = sessions.clone() {
         // The store's sessions kept as JSONL files under the root.
@@ -310,6 +354,7 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
         }
         None => None,
     };
+    own_session(&runtime, &id, owner.as_ref());
     let result = converse(&runtime, &id, &lines, preset.as_deref()).await;
     // Whatever happened, what the chat said is written before it exits.
     if let Some(durable) = durable {

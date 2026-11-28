@@ -10,6 +10,7 @@ mod answer;
 mod chat;
 mod config;
 mod current_time;
+mod plugins;
 mod presets;
 mod questions;
 
@@ -63,10 +64,29 @@ streamable-http, serverName, command, args, env, cwd or url, headers,
 toolCallTimeoutMs, failOnStartupError, reconnect). With presets, skills
 come only from their skill-filesystem rows.
 
-MCP servers' tools are named mcp__<serverName>__<tool>. KARAKA_MCP_SERVERS
-names a YAML list of mcp-client configs every session sees; a preset's
-mcp-client rows are that preset's alone. A server is connected before
-the first message, and reconnected if it drops.
+MCP servers' tools are named mcp__<serverName>__<tool>. A server is
+connected before the first message, and reconnected if it drops. A
+preset's mcp-client rows are that preset's alone.
+
+KARAKA_PLUGINS names a YAML list of global plugin rows, each with a name
+(or an id naming it), an optional disabled, and a config:
+  mcp-client           an MCP server every session sees, with the
+                       config a preset's mcp-client row takes
+  application-catalog  servers: the application endpoints expected
+  server-auth          applications, each with an id, a chatCredential
+                       and a toolCredential: the names of environment
+                       variables holding the bearer values, read at
+                       every use
+  mcp-application      an application's MCP endpoint: applicationId,
+                       serverName, url, headers, toolCallTimeoutMs,
+                       failOnStartupError, allow, deny, reconnect
+Karaka's package names, such as @karaka-ai/mcp-application, work too.
+An application's tools reach a session only when the application owns
+it (KARAKA_APPLICATION_ID and the rest), and only the names both its
+row and the session's preset allow: a preset's tool-policy allow list
+must name them, so an mcp-application row needs KARAKA_PRESETS. Each
+call sends the toolCredential as a Bearer token, with the owner and the
+session's id.
 
 Either may ask you a question on stderr. Answer it on stdin with an
 option's number (numbers separated by commas where several may be
@@ -108,8 +128,11 @@ Settings come from the environment:
                       otherwise)
   KARAKA_PRESET       the default preset's id (optional; the file's first
                       otherwise)
-  KARAKA_MCP_SERVERS  a YAML file listing MCP servers for every session
-                      (optional)
+  KARAKA_PLUGINS      a YAML file of global plugin rows (optional)
+  KARAKA_APPLICATION_ID, KARAKA_TENANT_ID, KARAKA_USER_ID
+                      the owner of the session this run opens: an
+                      application, a tenant and a user, all three or none
+                      (optional; no owner otherwise)
   ANTHROPIC_API_KEY   needed for anthropic
   ANTHROPIC_BASE_URL  another server for anthropic (optional)
   ANTHROPIC_THINKING_DISPLAY
@@ -258,6 +281,7 @@ async fn ask(question: Option<String>, options: Options) -> Result<(), String> {
     // through the agent loop and is retried as the provider's policy says.
     // The answer is printed from the loop's live frames as it is written.
     let route = config.provider.route().to_owned();
+    let owner = config.owner.clone();
     let runtime = Runtime::start(chat::loop_plugins(config, &approvals, false)?)
         .await
         .map_err(|error| error.to_string())?;
@@ -274,6 +298,7 @@ async fn ask(question: Option<String>, options: Options) -> Result<(), String> {
     );
 
     let id = SessionId::new("ask");
+    chat::own_session(&runtime, &id, owner.as_ref());
     let agent = runtime
         .get::<dyn Agents>()
         .open(id.clone())

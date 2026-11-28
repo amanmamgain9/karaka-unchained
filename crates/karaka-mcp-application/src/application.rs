@@ -71,6 +71,92 @@ impl ApplicationConfig {
             deny: Vec::new(),
         }
     }
+
+    /// Reads Karaka's row config: `applicationId`, `serverName` and `url`
+    /// required; `headers`, `toolCallTimeoutMs`, `failOnStartupError`,
+    /// `allow`, `deny` and `reconnect` optional, with the defaults of
+    /// [`new`](Self::new). A key it doesn't know is refused. `serverName`'s
+    /// pattern and `reconnect` are checked when the endpoint starts.
+    ///
+    /// # Errors
+    ///
+    /// A missing or misshapen field, said with `at`.
+    pub fn from_json(value: &Value, at: &str) -> Result<Self, String> {
+        const KEYS: [&str; 9] = [
+            "applicationId",
+            "serverName",
+            "url",
+            "headers",
+            "toolCallTimeoutMs",
+            "failOnStartupError",
+            "allow",
+            "deny",
+            "reconnect",
+        ];
+        let Value::Object(map) = value else {
+            return Err(format!("{at} must be a mapping"));
+        };
+        if let Some(key) = map.keys().find(|key| !KEYS.contains(&key.as_str())) {
+            return Err(format!("{at}: unknown key \"{key}\""));
+        }
+        let required = |key: &str| match map.get(key) {
+            Some(Value::String(text)) => Ok(text.clone()),
+            None | Some(Value::Null) => Err(format!("{at} needs \"{key}\"")),
+            Some(_) => Err(format!("{at}: \"{key}\" must be a string")),
+        };
+        let strings = |key: &str| -> Result<Vec<String>, String> {
+            let wrong = || format!("{at}: \"{key}\" must be a list of strings");
+            match map.get(key) {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|item| item.as_str().map(str::to_owned).ok_or_else(wrong))
+                    .collect(),
+                Some(_) => Err(wrong()),
+            }
+        };
+        let mut config = Self::new(
+            required("applicationId")?,
+            required("serverName")?,
+            required("url")?,
+        );
+        match map.get("headers") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(entries)) => {
+                for (name, value) in entries {
+                    let value = value
+                        .as_str()
+                        .ok_or(format!("{at}: \"headers\" must map names to strings"))?;
+                    config.headers.push((name.clone(), value.to_owned()));
+                }
+            }
+            Some(_) => return Err(format!("{at}: \"headers\" must map names to strings")),
+        }
+        match map.get("toolCallTimeoutMs") {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                config.tool_call_timeout_ms = value.as_u64().filter(|ms| *ms > 0).ok_or(
+                    format!("{at}: \"toolCallTimeoutMs\" must be a positive whole number"),
+                )?;
+            }
+        }
+        match map.get("failOnStartupError") {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(fail)) => config.fail_on_startup_error = *fail,
+            Some(_) => {
+                return Err(format!(
+                    "{at}: \"failOnStartupError\" must be true or false"
+                ));
+            }
+        }
+        config.allow = strings("allow")?;
+        config.deny = strings("deny")?;
+        config.reconnect = map
+            .get("reconnect")
+            .filter(|value| !value.is_null())
+            .cloned();
+        Ok(config)
+    }
 }
 
 /// The ports an endpoint reads. (Karaka: `inject`, with `agents` and the

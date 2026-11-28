@@ -33,6 +33,13 @@ const VARIABLES: &[&str] = &[
     "KARAKA_PRESETS",
     "KARAKA_PRESET",
     "KARAKA_MCP_SERVERS",
+    "KARAKA_PLUGINS",
+    "KARAKA_APPLICATION_ID",
+    "KARAKA_TENANT_ID",
+    "KARAKA_USER_ID",
+    // The credential references the application tests' plugin files name.
+    "APP_CHAT",
+    "APP_TOOLS",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_THINKING_DISPLAY",
@@ -1048,16 +1055,17 @@ fn a_presets_mcp_server_offers_its_tool_and_answers_the_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A global server, from `KARAKA_MCP_SERVERS`, is offered to every session.
+// A global server, an `mcp-client` row of `KARAKA_PLUGINS`, is offered to
+// every session.
 #[test]
 fn a_global_mcp_server_is_offered_to_every_session() {
     let dir = scratch("mcp-global");
     let events = dir.join("events");
     std::fs::write(&events, "").unwrap();
     std::fs::write(
-        dir.join("servers.yml"),
+        dir.join("plugins.yml"),
         format!(
-            "- transport: stdio\n  serverName: fixture\n  command: sh\n  args: [{:?}, {:?}]\n",
+            "- name: mcp-client\n  config:\n    transport: stdio\n    serverName: fixture\n    command: sh\n    args: [{:?}, {:?}]\n",
             mcp_fixture(),
             events.display().to_string()
         ),
@@ -1071,8 +1079,8 @@ fn a_global_mcp_server_is_offered_to_every_session() {
             ("DEEPSEEK_API_KEY", "test-key".into()),
             ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
             (
-                "KARAKA_MCP_SERVERS",
-                dir.join("servers.yml").display().to_string(),
+                "KARAKA_PLUGINS",
+                dir.join("plugins.yml").display().to_string(),
             ),
         ],
         "",
@@ -1085,33 +1093,314 @@ fn a_global_mcp_server_is_offered_to_every_session() {
         tool_names(&body).contains(&"mcp__fixture__add".to_owned()),
         "{body}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-    // A bad config fails before any call.
-    std::fs::write(
-        dir.join("servers.yml"),
-        "- transport: stdio\n  serverName: fixture\n",
+/// What the application fixture was asked to call: each `tools/call`'s
+/// params, and its `authorization` header.
+type AppCalls = std::sync::Arc<std::sync::Mutex<Vec<(Value, Option<String>)>>>;
+
+/// An application's MCP endpoint on a loopback port, speaking the 2025
+/// era, with one tool, `lookup`. Gives its URL, and what it was called
+/// with.
+fn application_endpoint() -> (String, AppCalls) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let calls = AppCalls::default();
+    let kept = AppCalls::clone(&calls);
+    thread::spawn(move || {
+        for socket in listener.incoming() {
+            let Ok(mut socket) = socket else { return };
+            let calls = AppCalls::clone(&kept);
+            thread::spawn(move || {
+                let request = read_request(&mut socket);
+                let (head, body) = request
+                    .split_once("\r\n\r\n")
+                    .expect("headers, then a body");
+                let respond = |socket: &mut TcpStream, status: &str, body: &str| {
+                    let response =
+                        http_response(status, &[("content-type", "application/json")], body);
+                    let _ = socket.write_all(response.as_bytes());
+                };
+                if head.starts_with("GET") {
+                    return respond(&mut socket, "405 Method Not Allowed", "");
+                }
+                let message: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                let id = message["id"].clone();
+                let reply = |result: Value| {
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+                };
+                match message["method"].as_str().unwrap_or_default() {
+                    "server/discover" => respond(
+                        &mut socket,
+                        "200 OK",
+                        &serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } }).to_string(),
+                    ),
+                    "initialize" => respond(
+                        &mut socket,
+                        "200 OK",
+                        &reply(serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "application", "version": "1" },
+                        })),
+                    ),
+                    "tools/list" => respond(
+                        &mut socket,
+                        "200 OK",
+                        &reply(serde_json::json!({ "tools": [{
+                            "name": "lookup",
+                            "description": "Look a task up.",
+                            "inputSchema": { "type": "object", "properties": {} },
+                        }] })),
+                    ),
+                    "tools/call" => {
+                        let authorization = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("authorization")
+                                    .then(|| value.trim().to_owned())
+                            });
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push((message["params"].clone(), authorization));
+                        respond(
+                            &mut socket,
+                            "200 OK",
+                            &reply(serde_json::json!({ "content": [{ "type": "text", "text": "found it" }] })),
+                        );
+                    }
+                    _ => respond(&mut socket, "202 Accepted", ""),
+                }
+            });
+        }
+    });
+    (format!("http://{address}/mcp"), calls)
+}
+
+/// A plugins file with the application `app` and its endpoint at `url`,
+/// whose tool credential is `APP_TOOLS`.
+fn application_plugins(url: &str) -> String {
+    format!(
+        "- id: application-catalog\n  config: {{ servers: [app] }}\n\
+         - name: '@karaka-ai/server-auth'\n  config:\n    applications: [{{ id: app, chatCredential: APP_CHAT, toolCredential: APP_TOOLS }}]\n\
+         - id: app-tools\n  name: '@karaka-ai/mcp-application'\n  config:\n    applicationId: app\n    serverName: app\n    url: {url}\n    allow: [mcp__app__lookup]\n    reconnect: {{ enabled: false }}\n"
     )
-    .unwrap();
-    let output = karaka(
-        &["ask", "hi"],
-        &[
-            ("KARAKA_PROVIDER", "deepseek".into()),
+}
+
+/// A presets file whose one preset allows `todo_write` and the
+/// application's tool.
+const APPLICATION_PRESETS: &str = "- id: main\n  plugins:\n    - name: tool-policy\n      config: { allow: [todo_write, mcp__app__lookup] }\n";
+
+/// The owner variables for `application`, tenant `tenant` and user `user`.
+fn owned_by(application: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("KARAKA_APPLICATION_ID", application.into()),
+        ("KARAKA_TENANT_ID", "tenant".into()),
+        ("KARAKA_USER_ID", "user".into()),
+    ]
+}
+
+/// Anthropic's events for a call to `mcp__app__lookup` with no arguments.
+const ANTHROPIC_APP_LOOKUP: &str = concat!(
+    "event: message_start\n",
+    r#"data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":12,"output_tokens":1}}}"#,
+    "\n\n",
+    "event: content_block_start\n",
+    r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__app__lookup","input":{}}}"#,
+    "\n\n",
+    "event: content_block_delta\n",
+    r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+    "\n\n",
+    "event: content_block_stop\n",
+    r#"data: {"type":"content_block_stop","index":0}"#,
+    "\n\n",
+    "event: message_delta\n",
+    r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}"#,
+    "\n\n",
+    "event: message_stop\n",
+    r#"data: {"type":"message_stop"}"#,
+    "\n\n",
+);
+
+/// `ask hi` against a DeepSeek stand-in, with `env` besides; gives the
+/// tools the request offered.
+fn offered(env: &[(&'static str, String)]) -> Vec<String> {
+    let (address, server) = serve_once(streamed(DEEPSEEK_HELLO));
+    let mut settings = vec![
+        ("KARAKA_PROVIDER", "deepseek".to_owned()),
+        ("DEEPSEEK_API_KEY", "test-key".into()),
+        ("DEEPSEEK_BASE_URL", format!("http://{address}/anthropic")),
+    ];
+    settings.extend_from_slice(env);
+    let output = karaka(&["ask", "hi"], &settings, "");
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let sent = server.join().expect("the server ran");
+    let mut names = tool_names(&serde_json::from_str(body(&sent)).unwrap());
+    names.sort();
+    names
+}
+
+// An application's tool reaches the model only in a session the
+// application owns, and its call carries the bearer the credential
+// reference resolves to, with the owner and the session as
+// `_meta.karaka`.
+#[test]
+fn an_application_tool_reaches_only_its_owners_session_and_carries_the_owner() {
+    let dir = scratch("application");
+    let (url, calls) = application_endpoint();
+    let plugins = dir.join("plugins.yml");
+    std::fs::write(&plugins, application_plugins(&url)).unwrap();
+    std::fs::write(dir.join("presets.yml"), APPLICATION_PRESETS).unwrap();
+    let base = vec![
+        ("KARAKA_PLUGINS", plugins.display().to_string()),
+        (
+            "KARAKA_PRESETS",
+            dir.join("presets.yml").display().to_string(),
+        ),
+        ("APP_TOOLS", "tool-secret".to_owned()),
+    ];
+
+    let (address, server) = serve(vec![
+        streamed(ANTHROPIC_APP_LOOKUP),
+        streamed(&anthropic_text("It is there.")),
+    ]);
+    let mut env = vec![
+        ("ANTHROPIC_API_KEY", "test-key".to_owned()),
+        ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+    ];
+    env.extend(base.clone());
+    env.extend(owned_by("app"));
+    let output = karaka(&["ask", "find the task"], &env, "");
+    let stderr = text(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        text(&output.stdout).contains("It is there."),
+        "{}",
+        text(&output.stdout)
+    );
+    let sent = server.join().expect("the server ran");
+    let first: Value = serde_json::from_str(body(&sent[0])).unwrap();
+    assert!(
+        tool_names(&first).contains(&"mcp__app__lookup".to_owned()),
+        "{first}"
+    );
+    assert!(body(&sent[1]).contains("found it"), "{}", body(&sent[1]));
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        [(
+            serde_json::json!({
+                "name": "lookup",
+                "arguments": {},
+                "_meta": { "karaka": {
+                    "applicationId": "app", "tenantId": "tenant", "userId": "user", "chatId": "ask",
+                } },
+            }),
+            Some("Bearer tool-secret".to_owned()),
+        )]
+    );
+
+    // Another application's session, and one with no owner, aren't
+    // offered it.
+    let mut foreign = base.clone();
+    foreign.extend(owned_by("other"));
+    assert!(!offered(&foreign).contains(&"mcp__app__lookup".to_owned()));
+    assert_eq!(offered(&base), ["todo_write"]);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A preset's tool-policy allow list naming the application's tool keeps
+// it, beside the global tools it names.
+#[test]
+fn a_presets_allow_list_keeps_its_application_tool() {
+    let dir = scratch("application-preset");
+    let (url, _) = application_endpoint();
+    std::fs::write(dir.join("plugins.yml"), application_plugins(&url)).unwrap();
+    std::fs::write(dir.join("presets.yml"), APPLICATION_PRESETS).unwrap();
+    let mut env = vec![
+        (
+            "KARAKA_PLUGINS",
+            dir.join("plugins.yml").display().to_string(),
+        ),
+        (
+            "KARAKA_PRESETS",
+            dir.join("presets.yml").display().to_string(),
+        ),
+        ("APP_TOOLS", "tool-secret".to_owned()),
+    ];
+    env.extend(owned_by("app"));
+    assert_eq!(offered(&env), ["mcp__app__lookup", "todo_write"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bad_plugin_rows_fail_at_startup_saying_where() {
+    let dir = scratch("bad-plugins");
+    let plugins = dir.join("plugins.yml");
+    let run = |env: Vec<(&'static str, String)>| {
+        let mut settings = vec![
+            ("KARAKA_PROVIDER", "deepseek".to_owned()),
             ("DEEPSEEK_API_KEY", "test-key".into()),
             ("DEEPSEEK_BASE_URL", "http://127.0.0.1:1".into()),
-            (
-                "KARAKA_MCP_SERVERS",
-                dir.join("servers.yml").display().to_string(),
-            ),
-        ],
-        "",
-    );
-    assert_eq!(output.status.code(), Some(1));
+        ];
+        settings.extend(env);
+        let output = karaka(&["ask", "hi"], &settings, "");
+        assert_eq!(output.status.code(), Some(1));
+        text(&output.stderr)
+    };
+    let with_file = |contents: &str| {
+        std::fs::write(&plugins, contents).unwrap();
+        run(vec![("KARAKA_PLUGINS", plugins.display().to_string())])
+    };
+    let at = format!("KARAKA_PLUGINS ({})", plugins.display());
     assert_eq!(
-        text(&output.stderr),
+        with_file("- transport: stdio\n  serverName: fixture\n"),
         format!(
-            "karaka: KARAKA_MCP_SERVERS ({}): server 1 needs a \"command\"\n",
-            dir.join("servers.yml").display()
+            "karaka: {at}: plugin 1: unknown key \"transport\"; it may have id, name, disabled, config\n"
         )
+    );
+    assert_eq!(
+        with_file("- name: mcp-client\n  config: { transport: stdio, serverName: fixture }\n"),
+        format!("karaka: {at}: plugin 1 (mcp-client) needs a \"command\"\n")
+    );
+    assert_eq!(
+        with_file(
+            "- id: application-catalog\n  config: { servers: [app] }\n- name: mcp-application\n  config: { applicationId: app, serverName: app, url: 'http://127.0.0.1:1/mcp' }\n"
+        ),
+        format!(
+            "karaka: {at}: plugin 2 (mcp-application): needs a server-auth row, for the endpoint's credentials\n"
+        )
+    );
+    // An endpoint without presets would offer nothing.
+    assert_eq!(
+        with_file(&application_plugins("http://127.0.0.1:1/mcp")),
+        format!(
+            "karaka: {at}: the mcp-application row for \"app\" needs KARAKA_PRESETS: its tools reach only sessions whose preset's tool-policy allows them\n"
+        )
+    );
+    // An endpoint that can't be reached fails the start, before any call.
+    let presets = dir.join("presets.yml");
+    std::fs::write(&presets, APPLICATION_PRESETS).unwrap();
+    let stderr = run(vec![
+        ("KARAKA_PLUGINS", plugins.display().to_string()),
+        ("KARAKA_PRESETS", presets.display().to_string()),
+    ]);
+    assert!(
+        stderr.starts_with("karaka: ") && stderr.contains("Application MCP app could not start"),
+        "{stderr}"
+    );
+    // The old variable, and a partial owner.
+    assert_eq!(
+        run(vec![("KARAKA_MCP_SERVERS", plugins.display().to_string())]),
+        "karaka: KARAKA_MCP_SERVERS is no longer read: list its servers as mcp-client rows in the file KARAKA_PLUGINS names\n"
+    );
+    assert_eq!(
+        run(vec![("KARAKA_APPLICATION_ID", "app".into())]),
+        "karaka: KARAKA_APPLICATION_ID, KARAKA_TENANT_ID and KARAKA_USER_ID name the sessions' owner together, so set all three or none; KARAKA_TENANT_ID and KARAKA_USER_ID are not set\n"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

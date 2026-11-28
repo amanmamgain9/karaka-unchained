@@ -14,6 +14,8 @@ karaka-identity.workspace = true
 karaka-credentials.workspace = true
 # The plugin that puts the provider in a runtime.
 karaka-kernel.workspace = true
+# Its row config is read from JSON.
+serde_json.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

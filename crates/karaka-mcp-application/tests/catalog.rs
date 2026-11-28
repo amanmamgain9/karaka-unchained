@@ -90,3 +90,67 @@ fn a_server_declared_twice_is_refused() {
         "Application catalog server names must be unique"
     );
 }
+
+// The endpoint's row config, with Karaka's defaults. (Karaka: `Config`'s
+// schema.)
+#[test]
+fn an_endpoint_row_reads_with_karakas_defaults() {
+    use karaka_mcp_application::ApplicationConfig;
+    use serde_json::json;
+
+    let config = ApplicationConfig::from_json(
+        &json!({ "applicationId": "app", "serverName": "app", "url": "http://127.0.0.1:1/mcp" }),
+        "row",
+    )
+    .unwrap();
+    assert_eq!(
+        config,
+        ApplicationConfig::new("app", "app", "http://127.0.0.1:1/mcp")
+    );
+    assert_eq!(config.tool_call_timeout_ms, 60_000);
+    assert!(config.fail_on_startup_error);
+    let config = ApplicationConfig::from_json(
+        &json!({
+            "applicationId": "app", "serverName": "app", "url": "u",
+            "headers": { "x-static": "kept" }, "toolCallTimeoutMs": 5,
+            "failOnStartupError": false, "allow": ["a"], "deny": ["b"],
+            "reconnect": { "enabled": false },
+        }),
+        "row",
+    )
+    .unwrap();
+    assert_eq!(config.headers, [("x-static".to_owned(), "kept".to_owned())]);
+    assert_eq!(
+        (config.tool_call_timeout_ms, config.fail_on_startup_error),
+        (5, false)
+    );
+    assert_eq!(
+        (config.allow, config.deny),
+        (vec!["a".to_owned()], vec!["b".to_owned()])
+    );
+    assert_eq!(config.reconnect, Some(json!({ "enabled": false })));
+    for (value, message) in [
+        (json!([]), "row must be a mapping"),
+        (
+            json!({ "serverName": "app", "url": "u" }),
+            "row needs \"applicationId\"",
+        ),
+        (
+            json!({ "applicationId": "app", "serverName": "app", "url": "u", "colour": 1 }),
+            "row: unknown key \"colour\"",
+        ),
+        (
+            json!({ "applicationId": "app", "serverName": "app", "url": "u", "allow": "a" }),
+            "row: \"allow\" must be a list of strings",
+        ),
+        (
+            json!({ "applicationId": "app", "serverName": "app", "url": "u", "toolCallTimeoutMs": 0 }),
+            "row: \"toolCallTimeoutMs\" must be a positive whole number",
+        ),
+    ] {
+        assert_eq!(
+            ApplicationConfig::from_json(&value, "row").unwrap_err(),
+            message
+        );
+    }
+}

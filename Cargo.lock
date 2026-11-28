@@ -648,7 +648,9 @@ dependencies = [
  "karaka-agent-loop",
  "karaka-agent-presets",
  "karaka-anthropic",
+ "karaka-credentials",
  "karaka-fs-local",
+ "karaka-identity",
  "karaka-kernel",
  "karaka-mcp-application",
  "karaka-mcp-client",
@@ -656,6 +658,7 @@ dependencies = [
  "karaka-openai",
  "karaka-persona",
  "karaka-retry",
+ "karaka-server-auth",
  "karaka-session",
  "karaka-session-jsonl",
  "karaka-session-persistence",
@@ -890,6 +893,7 @@ dependencies = [
  "karaka-credentials",
  "karaka-identity",
  "karaka-kernel",
+ "serde_json",
  "tokio",
 ]
 

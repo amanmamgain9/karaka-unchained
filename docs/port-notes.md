@@ -4380,3 +4380,134 @@ app and Karaka"). Nothing of that is built here. The seam it needs:
   open can't fail on it here.
 - **An endpoint's per-agent registrations are never taken back by the
   agent,** which lives for the runtime.
+
+## MCP application, step B: the binary
+
+This step puts step A's plugins in the `karaka` binary: a file of
+global plugin rows, the owner of the run's session, and the startup
+order that lets a preset allow an application's tools.
+
+### `KARAKA_PLUGINS` (`crates/karaka/src/plugins.rs`)
+
+- **The shape.** The file is a YAML list of rows shaped like a Cordis
+  profile's: `id`, `name`, `disabled` and `config`, as Play This Life's
+  `karaka.cordis.yml` writes them.
+  - A row's plugin is its `name`, or its `id` when it has none. A
+    profile row patching a bundle's row names it by `id`, as Play This
+    Life's `- id: application-catalog` does.
+  - `disabled: true` skips the row unread, as Play This Life disables
+    `server-auth`.
+- **The plugins**, by short name or Karaka's package name:
+  - `mcp-client` (`@deepseek-ai/dsh-mcp-client`): one global server,
+    `McpServerConfig::from_json`.
+  - `application-catalog` (`@karaka-ai/mcp-application/catalog`):
+    `servers`.
+  - `server-auth` (`@karaka-ai/server-auth`): `BearerConfig::from_json`,
+    `applications` with `id`, `chatCredential` and `toolCredential`. The
+    ids and references are checked when the file is read.
+  - `mcp-application` (`@karaka-ai/mcp-application`):
+    `ApplicationConfig::from_json`, Karaka's fields and defaults.
+- **`KARAKA_MCP_SERVERS` is gone.** Its servers are `mcp-client` rows
+  now. Setting it fails the start with `KARAKA_MCP_SERVERS is no longer
+  read: list its servers as mcp-client rows in the file KARAKA_PLUGINS
+  names`, rather than being ignored.
+- **I kept the recommended shape.** A key in the presets file would
+  have tied global plugins to presets; one list of profile rows reads
+  Play This Life's rows nearly as written.
+- **Checks across rows**, each said at the row:
+  - one `application-catalog` and one `server-auth` at most;
+  - an endpoint needs a `server-auth` row naming its `applicationId`;
+  - the catalog must list the endpoint's server, and only one endpoint
+    may claim it;
+  - every catalog server needs an endpoint, since an endpoint that never
+    settles would break every preset with a policy.
+- **Without presets, an endpoint fails the start.** An application tool
+  needs an explicit allow from a preset's tool-policy (step A's
+  `policyAllows`), so without `KARAKA_PRESETS` an endpoint would offer
+  nothing. It fails with `… the mcp-application row for "x" needs
+  KARAKA_PRESETS: …` rather than running silently useless. This guard is
+  Karaka's own: Karaka would simply offer no tools.
+
+### The owner of the run's session
+
+- `KARAKA_APPLICATION_ID`, `KARAKA_TENANT_ID` and `KARAKA_USER_ID`, all
+  three or none, name the owner. Play This Life already uses the first
+  two names, for its endpoint's `applicationId` and its tenant. The
+  third is new.
+- A partial set fails with `… name the sessions' owner together, so set
+  all three or none; <missing> is/are not set`.
+- `SessionOwnersPlugin` is always mounted. `ask` and `chat` set the
+  owner on `InMemorySessionOwners` for the session they open
+  (`chat::own_session`), before the agent opens, because that is when
+  an endpoint attaches it.
+
+### Mounting and order
+
+After the tools, the loop and `McpClientsPlugin`, `loop_plugins` mounts:
+
+1. `SessionOwnersPlugin`.
+2. With a `server-auth` row, `CredentialsPlugin` (the process
+   environment) and `ServerAuthPlugin::bearer`.
+3. `ApplicationCatalogPlugin` with the row's servers, or none.
+4. Each `McpApplicationPlugin`.
+5. The presets.
+
+The kernel starts each plugin in turn, and an endpoint's setup waits for
+its first connection and catalog sync, so the catalog has settled before
+any preset's tool-policy reads it. The endpoints' warnings and errors go
+to stderr as `karaka: <line>`, as the MCP servers' do. An endpoint that
+can't connect fails the start (`failOnStartupError` defaults to on) with
+the kernel's `plugin "karaka-mcp-application(x)" failed to start:
+Application MCP x could not start: …`.
+
+### Smaller changes
+
+- The usage text describes `KARAKA_PLUGINS` and its four rows, the owner
+  variables, and that an application's tools need both the session's
+  owner and its preset's allow.
+- `ApplicationConfig::from_json` and `BearerConfig::from_json` are new,
+  in their crates, in `McpServerConfig::from_json`'s style: an unknown
+  key is refused, and a missing one is `<at> needs "<key>"`.
+- The presets file's `ptc` refusal now says it waits on dsh's tool
+  presentation, not the MCP client.
+
+### Tests
+
+- **9 new:**
+  - 2 for the config: the owner's all-or-none rule, and the old variable
+    refused;
+  - 2 for the plugins file: the rows parse, and 15 mistakes, each said
+    where it is;
+  - 1 each for `ApplicationConfig::from_json` and
+    `BearerConfig::from_json`;
+  - 3 CLI cases, plus the rewritten global-server case. They use an
+    in-process HTTP MCP endpoint, a loopback thread speaking the 2025
+    era with one tool, `lookup`.
+- **The CLI cases:**
+  - **Ownership.** Owned by `app`, the first request offers
+    `mcp__app__lookup`. The model's call reaches the endpoint as
+    `{name: "lookup", arguments: {}, _meta: {karaka: {applicationId,
+    tenantId, userId, chatId: "ask"}}}`, with `authorization: Bearer
+    tool-secret` resolved from `APP_TOOLS`. Owned by `other`, or with no
+    owner, the tool isn't offered, and only `todo_write` is.
+  - **A preset's allow list.** `allow: [todo_write, mcp__app__lookup]`
+    offers exactly those two.
+  - **Bad rows fail at startup, saying where:**
+    - an old-style server row;
+    - an `mcp-client` row missing its `command`;
+    - an endpoint without `server-auth`;
+    - an endpoint without presets;
+    - an unreachable endpoint;
+    - `KARAKA_MCP_SERVERS`;
+    - a partial owner.
+- The test harness removes the new variables, and the test credential
+  names `APP_CHAT` and `APP_TOOLS`, from the binary's environment.
+
+### Where it differs
+
+- **Global plugins are a file of their own** where dsh and Karaka have
+  one profile. The rows are the same shape.
+- **Literal values only:** no `!!js` expressions (open ends).
+- **One owner per run,** from the environment (open ends: the identity
+  lifecycle).
+- **An endpoint without presets fails the start.**

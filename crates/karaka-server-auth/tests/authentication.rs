@@ -173,3 +173,32 @@ async fn a_provider_failure_propagates() {
         Err("provider unavailable".into())
     );
 }
+
+#[test]
+fn the_row_config_reads_karakas_shape() {
+    use serde_json::json;
+
+    let config = BearerConfig::from_json(
+        &json!({ "applications": [{ "id": "app", "chatCredential": "CHAT", "toolCredential": "TOOLS" }] }),
+        "row",
+    )
+    .unwrap();
+    assert_eq!(config.applications, [application("app", "CHAT", "TOOLS")]);
+    for (value, message) in [
+        (json!({}), "row needs \"applications\", a list"),
+        (
+            json!({ "applications": [], "extra": 1 }),
+            "row: unknown key \"extra\"",
+        ),
+        (
+            json!({ "applications": [{ "id": "app", "chatCredential": "CHAT" }] }),
+            "row: application 1 needs \"toolCredential\"",
+        ),
+        (
+            json!({ "applications": [{ "id": 1, "chatCredential": "C", "toolCredential": "T" }] }),
+            "row: application 1: \"id\" must be a string",
+        ),
+    ] {
+        assert_eq!(BearerConfig::from_json(&value, "row").unwrap_err(), message);
+    }
+}
