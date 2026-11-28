@@ -668,6 +668,7 @@ dependencies = [
  "karaka-model",
  "karaka-scope",
  "karaka-session",
+ "serde_json",
  "tokio",
 ]
 
@@ -677,6 +678,25 @@ version = "0.1.0"
 dependencies = [
  "futures-core",
  "karaka-agent",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-scope",
+ "karaka-session",
+ "karaka-session-projection",
+ "karaka-system-prompt",
+ "karaka-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-agent-presets"
+version = "0.1.0"
+dependencies = [
+ "futures-core",
+ "karaka-agent",
+ "karaka-agent-loop",
  "karaka-kernel",
  "karaka-model",
  "karaka-scope",

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use karaka_agent::{Agent, Agents, InboxHooks, OpenError, PreStepHooks, RequestErrorHooks};
+use karaka_agent::{
+    Agent, AgentComposition, Agents, InboxHooks, OpenError, PreStepHooks, RequestErrorHooks,
+};
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
 use karaka_model::{Effort, ModelRegistry};
 use karaka_session::{SessionId, SessionStore};
@@ -60,6 +62,8 @@ pub(crate) struct Shared {
     pub(crate) inbox_hooks: Arc<InboxHooks>,
     /// Run before each step starts.
     pub(crate) pre_step: Arc<PreStepHooks>,
+    /// What composes each agent from its session: its preset.
+    pub(crate) composition: Arc<AgentComposition>,
     /// Each step's prompt and tool list are assembled from it.
     pub(crate) prompt: Arc<SystemPrompt>,
     /// Where each agent's inbox is folded, as the `inbox` projection.
@@ -88,6 +92,8 @@ pub struct LoopHooks {
     pub inbox: Arc<InboxHooks>,
     /// Run before each step starts.
     pub pre_step: Arc<PreStepHooks>,
+    /// Where an agent composer is set.
+    pub composition: Arc<AgentComposition>,
 }
 
 impl AgentLoop {
@@ -114,6 +120,7 @@ impl AgentLoop {
                 hooks: hooks.request_error,
                 inbox_hooks: hooks.inbox,
                 pre_step: hooks.pre_step,
+                composition: hooks.composition,
                 prompt,
                 projections,
             }),
@@ -133,7 +140,19 @@ impl Agents for AgentLoop {
         if let Some(agent) = agents.get(&id) {
             return Ok(Arc::clone(agent) as Arc<dyn Agent>);
         }
-        let session = self.shared.sessions.open_or_create(id.clone());
+        // A new session names the preset it is composed from, and a session
+        // that can't be composed refuses to open, before anything runs on it.
+        let composer = self.shared.composition.composer();
+        let session = match &composer {
+            Some(composer) => self
+                .shared
+                .sessions
+                .open_or_create_with(id.clone(), |header| composer.prepare(header)),
+            None => self.shared.sessions.open_or_create(id.clone()),
+        };
+        if let Some(composer) = &composer {
+            composer.check(&session)?;
+        }
         // Nothing runs on a session before its agent exists, so a turn left
         // open here was left by a crash, and closing it is safe.
         session.repair()?;
@@ -181,7 +200,8 @@ impl fmt::Debug for AgentLoop {
 /// session projections and the system prompt. It registers the `inbox`
 /// projection, which holds each agent's pending input, and the prompt
 /// variables `provider` (its route) and `model`, as dsh's loop does. It provides the [`RequestErrorHooks`]
-/// [`InboxHooks`] and [`PreStepHooks`] ports beside `Agents`, empty: the loop
+/// [`InboxHooks`], [`PreStepHooks`] and [`AgentComposition`] ports beside
+/// `Agents`, empty: the loop
 /// runs the hooks, so it owns the lists. A plugin that registers a handler,
 /// such as `karaka-retry`, requires that port, so it starts after this one.
 ///
@@ -209,6 +229,7 @@ impl Plugin for AgentLoopPlugin {
             PortId::of::<RequestErrorHooks>(),
             PortId::of::<InboxHooks>(),
             PortId::of::<PreStepHooks>(),
+            PortId::of::<AgentComposition>(),
         ]
     }
 
@@ -247,6 +268,7 @@ impl Plugin for AgentLoopPlugin {
         ctx.provide(hooks.request_error);
         ctx.provide(hooks.inbox);
         ctx.provide(hooks.pre_step);
+        ctx.provide(hooks.composition);
         Ok(())
     }
 }

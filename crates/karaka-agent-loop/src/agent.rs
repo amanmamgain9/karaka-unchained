@@ -263,10 +263,14 @@ impl LoopAgent {
 }
 
 impl Inner {
-    /// The scopes this agent sees registrations through: its session's,
-    /// with no preset, until presets exist.
+    /// The scopes this agent sees registrations through: the preset its
+    /// composer names, read afresh each time so a selection takes effect at
+    /// once, then its session's.
     pub(crate) fn scope(&self) -> ScopeChain {
-        ScopeChain::session(self.session.id().clone())
+        ScopeChain::new(
+            self.shared.composition.preset(&self.session),
+            Some(self.session.id().clone()),
+        )
     }
 
     /// Runs turns while anything is pending, until a turn fails. (dsh:

@@ -3314,3 +3314,194 @@ Its lookups, the tool's and the listeners', use the agent's chain.
 - **The tool view is worked out on every lookup.** dsh's is too, from its
   live maps. Here it clones the `Arc`s of every tool along the chain under
   the read lock.
+
+## Presets, step 2: the registry
+
+`karaka-agent-presets` ports dsh's `packages/preset/agent-preset-registry`
+(`index.ts`, `mount.ts`, `session.ts`, `definition.ts`, `preset.ts`,
+`types.ts`) and folds in `packages/preset/agent-preset`, the row that
+declares a preset. With it, each agent's scope chain names its session's
+preset, in the one place step 1 left for it.
+
+### A preset is compiled in
+
+- `PresetDefinition { id, name, description, order, plugins }`, where each
+  plugin is a `Box<dyn PresetPlugin>`. dsh's definition is a YAML row of
+  Cordis entries, loaded into a registry-owned scope at run time.
+- **A `PresetPlugin`** has a `name`, an `id` (its name by default, as a
+  diagnostic shows it), the host ports it `requires`, and an async `setup`.
+  - The setup runs against a `PresetContext`. It can `get` the ports the
+    plugin listed, and it knows the preset's `ScopeKey::Preset(id)`, which
+    the plugin files every registration under.
+  - It can't `provide` a port. **That rules out by construction what dsh's
+    mount audits after the fact:** `leakedServices`, a preset publishing a
+    process-global service (`Preset services require isolate realms: …`).
+- **`AgentPresetsPlugin`** sets every preset up when the runtime starts.
+  - It requires the union of its presets' plugins' ports, so the kernel's
+    existing ordering starts their providers first.
+  - A port nobody provides fails the start. In dsh, a row waiting for a
+    missing service stays mounted, and the preset reads as broken (`…:
+    waiting for X`) until the service appears, re-audited on every read.
+    Here the kernel knows the whole plugin list up front, so neither
+    "pending" nor that re-audit exists.
+
+### Startup
+
+- **Definition mistakes fail the start,** with dsh's texts: an empty id
+  gives `Preset id must not be empty`; a repeated id gives `Duplicate
+  agent preset: x`. dsh's `register` throws these to the declaring row and
+  leaves the other presets standing. A compiled-in definition is a
+  programming mistake, so the runtime doesn't start.
+- **Each preset's plugins are set up in order.**
+  - A plugin whose setup fails breaks its preset. The reason has one line
+    per failed plugin, `id (name): message`, as dsh's audit writes it, and
+    the lines are joined by newlines.
+  - The preset's other plugins are still set up, as dsh's tree mounts
+    every row, and every other preset stands.
+  - A broken preset stays in the roster with its reason, and no session
+    can run it.
+  - dsh renders an aggregate error's members beneath its line. A Rust
+    error has no such members, so the line is the error's text.
+- **What a broken preset leaves behind.** dsh disposes a broken preset's
+  scope, which takes back what its rows registered. Karaka has no teardown.
+  What a broken preset's plugins registered before failing stays under its
+  scope, where no chain reaches it, since no agent can run a broken
+  preset. Anything a plugin registered globally stays live. It's recorded
+  in open ends.
+- **dsh's warning** `agent preset <id>: <reason>` has no logger to go to.
+  The reason stays in the roster.
+
+### The registry
+
+`AgentPresets` is the port, dsh's `ctx.agentPresets`.
+
+- **`default_id()`** is the config's `default`, which is required. dsh's
+  `selectedDefault`, the user's default, is more than UI state: new sessions
+  use it over the deployment's. It's edited through a settings service,
+  which Karaka lacks, so it is deferred (open ends).
+- **`list()`** gives every preset, broken ones included, by `order` then
+  id. A preset with no order sorts as infinity, so two such presets fall
+  through to the id, as dsh's NaN does. Ids compare by bytes, where dsh
+  uses `localeCompare`.
+- **`roster()`** gives the rows with `isDefault`, dsh's `list` remote, in
+  dsh's JSON.
+- **`resolve(id?)`** gives `{ id, broken? }` only, as dsh's does, or
+  `agent-preset/not-found`.
+- **`usable(id?)`** is dsh's `retain`, without the revision it leases. It
+  gives `agent-preset/not-found` or `agent-preset/invalid`.
+- **The errors** are `PresetError`, with dsh's texts, codes and details:
+  - `Unknown agent preset: x`, with `{ agentPreset, available }`, where
+    `available` lists the ids in registration order;
+  - the reason, with `{ agentPreset, reason }`;
+  - `This session has already started`, with `{ sessionId, agentPreset }`.
+- **Not ported**, all Cordis-only:
+  - revisions and generations, `retire` and `collect`;
+  - rebinding a live tree (`bind` and `recompose`'s `rebind`);
+  - `acquireScope`'s lease;
+  - `readDocument`'s YAML dump of the rows;
+  - `compositionInventory` and `inspectCompositions`, which read a Loader
+    tree;
+  - `serviceFor`, which reads a service a preset's isolate realm holds.
+
+  A Karaka preset is set up once and never changes, so there is nothing to
+  revise, lease, rebind or collect. Its plugins are Rust values, not
+  entries to dump or inventory, and they can't provide services, so there
+  is nothing for `serviceFor` to find.
+
+### Sessions
+
+- **The header already has `agent_preset`.** The JSONL format reads and
+  writes it as `agentPreset`.
+- **`agent-preset/selected` `{ agentPreset }`** is logged as a passthrough
+  event.
+- **The `agentPreset` projection** starts from the header, takes the latest
+  selection, and is client-visible as its state, as dsh's `wire.view` is.
+- **`select(session, id)`** follows dsh's order:
+  1. `agent-preset/locked` once a turn has started (any `turn/start`,
+     dsh's `turnBoundary`);
+  2. nothing logged when the preset is usable and already recorded;
+  3. otherwise `not-found` or `invalid`;
+  4. then the event.
+
+  Selections run one at a time, under one lock, where dsh chains them per
+  agent.
+- **The default on creation.** A session the loop creates names the
+  default preset in its header, when the roster has it, as dsh's session
+  controller writes the resolved preset into a new session's header.
+
+### Binding
+
+`karaka-agent` gains `AgentComposition`, a port the loop provides empty,
+and the `AgentComposer` trait. The registry sets itself as the composer.
+dsh's analogue is the `setup` callback an agent is created with, where the
+session controller calls `agentPresets.mount`.
+
+- **`prepare(header)`.** The loop's `Agents::open` creates a missing
+  session with `SessionStore::open_or_create_with`, passing the fresh header
+  through the composer, which names the default.
+- **`check(session)`.** Before anything runs on the session, the composer
+  checks it can run its preset: the one recorded, or the default when none
+  is.
+  - An unknown or broken preset refuses the open with
+    `OpenError::Compose`, carrying dsh's code, message and details.
+  - A session naming no preset while the default is missing refuses too,
+    as dsh's `resolve` throws.
+- **`preset(session)`.** `Inner::scope()` reads the composer each time, so
+  a selection takes effect at once: the next request lists the new
+  preset's tools and sections. dsh rebinds the agent's scope
+  (`recompose`).
+- `composeFrom`, a child agent joining its parent's preset, waits on child
+  agents (open ends).
+
+### Tests
+
+- **13 integration tests** on a real runtime: sessions, projections, system
+  prompt, tools, models, the loop, and the registry. dsh's `contribute`
+  fixture row is a preset plugin registering one scoped tool and one
+  scoped section.
+- **They cover:**
+  - each preset's tools and sections reaching only its agents, and the
+    loop writing the default into a new header;
+  - end to end, two presets and two sessions whose requests each list
+    only their own preset's tool and section;
+  - a broken preset's failure lines, its refusal with `invalid` and its
+    details, its row in the roster, and its scoped leftovers unreachable;
+  - an unknown preset's refusal with `not-found` and its details;
+  - a missing default;
+  - a duplicate or empty id, and a missing port, failing the start;
+  - selection while blank, a locked started session, and the chain
+    following the selection;
+  - failed selections leaving the session selectable;
+  - no event for an already recorded preset, the header counting as
+    recorded;
+  - the default running for a session recording none, until it is
+    selected;
+  - the list order, the roster JSON and `resolve`'s shape;
+  - the projection, from `session.spec.ts`.
+- **Skipped dsh tests:**
+  - every revision, lease and rebind case;
+  - `composeFrom` (child agents);
+  - the Loader and Cordis cases: isolated and leaked services, a Host
+    provider still activating, a row waiting for a service, the
+    inventory, the YAML document, `entryListProblem`, and `mount.spec.ts`
+    but its failure lines;
+  - the settings cases (`selectedDefault`, `modeSelectionEnabled`, the
+    Settings pages);
+  - the `tools/change` observer case, since there is no such event.
+
+  The crate's test file names each one.
+- **`agent-preset/tests/skills.spec.ts`** tests the creator skills,
+  templates and display resources dsh ships with its preset package.
+  Karaka ships none, so none of it applies.
+
+### Where it differs from dsh
+
+- **A definition mistake fails the start,** rather than its row.
+- **A missing port fails the start,** rather than leaving the preset
+  broken until the port appears.
+- **Ids sort by bytes,** where dsh uses `localeCompare`.
+- **The chain follows the projection** on every read, where dsh rebinds a
+  scope.
+- **The default is written into the header** only when the roster has it.
+  Otherwise the session is created with no preset and refused, where dsh's
+  controller fails before creating it.

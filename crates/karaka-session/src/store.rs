@@ -432,6 +432,18 @@ impl SessionStore {
     /// Checking and creating happen under one write lock, so two connections
     /// opening the same new id at once get the same session.
     pub fn open_or_create(&self, id: SessionId) -> Session {
+        self.open_or_create_with(id, |header| header)
+    }
+
+    /// As [`open_or_create`](Self::open_or_create), with a new session's
+    /// fresh header passed through `prepare` first, such as to name the
+    /// agent preset it is composed from. `prepare` runs under the store's
+    /// write lock, so it must not call the store.
+    pub fn open_or_create_with(
+        &self,
+        id: SessionId,
+        prepare: impl FnOnce(SessionHeader) -> SessionHeader,
+    ) -> Session {
         if let Some(session) = self.get(&id) {
             return session;
         }
@@ -442,7 +454,11 @@ impl SessionStore {
             Some(session) => session.clone(),
             None => sessions.insert(
                 Meta {
-                    header: fresh_header(id),
+                    // The id stays the one asked for, whatever `prepare` did.
+                    header: SessionHeader {
+                        id: id.clone(),
+                        ..prepare(fresh_header(id))
+                    },
                     inherited_event_count: 0,
                 },
                 SessionLog::new(),

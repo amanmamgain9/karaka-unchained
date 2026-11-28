@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the scope chain (step 1 of presets).
+Last updated 2026-11-28, after the preset registry (step 2 of presets).
 
 ## Needs you
 
@@ -70,7 +70,11 @@ Last updated 2026-11-28, after the scope chain (step 1 of presets).
     runtime's life; a restriction can be lifted;
   - `WorkingDirectory::stop()` and `UserQuestions::close()` have to be
     called by hand;
-  - session-postgres will need a drain on dispose.
+  - session-postgres will need a drain on dispose;
+  - a broken preset's plugins keep what they registered before failing:
+    under its scope, where no chain reaches it, and anything registered
+    globally, which stays live. dsh disposes the preset's scope.
+    (Presets, step 2)
 - **Hooks.** Some exist as small registry ports: request errors, inbox
   signals, the pre-step hook, prompt assembly listeners, the
   user-questions and approval answerer chains, and the tool registry's
@@ -82,28 +86,42 @@ Last updated 2026-11-28, after the scope chain (step 1 of presets).
   after `tools/pre-execute`, which can only deny, globally or per scope.
   They aren't ported, and nor are `presentAs` or `tools/result`.
   (Approvals, step B; Presets, step 1)
-- **Per-agent composition.** Every registry now files registrations
-  under a preset's or a session's scope, and an agent sees them through
-  its chain, global, then preset, then session. Tools can be scoped and
-  restricted too. What is left:
-  - the presets themselves, the preset registry (step 2);
-  - filling each agent's chain from its session's `agentPreset`
-    (step 2). Until then `Agent::scope()` is the session alone;
-  - mounting a preset's plugins into its scope, Play This Life's
-    per-preset `skill-filesystem` among them, with
+- **Per-agent composition.** Every registry files registrations under a
+  preset's or a session's scope, and an agent sees them through its
+  chain. Presets exist (`karaka-agent-presets`), and each agent's chain
+  names its session's preset. What is left:
+  - the binary's presets and persona (step 3);
+  - Play This Life's per-preset mounts: `skill-filesystem` and the other
+    plugins it mounts inside a preset, as `PresetPlugin`s, with
     `includeDefaultRoots: false`, `customSkillDirs: []` and SKILL.md
-    guides. Until then that plugin registers globally;
-  - main-agent's approval gate, to be scoped to main-agent's preset.
+    guides. Until then `skill-filesystem` registers globally;
+  - main-agent's approval gate, to be scoped to main-agent's preset;
+  - `composeFrom`: a child agent joining its parent's preset. It waits on
+    child agents.
 
-  The chain is fixed at three levels, so dsh's re-parenting on recompose
-  has nothing to follow. `RequestErrorHooks` and `InboxHooks` are still
-  global only. (Kernel gaps; Skills, steps A, B and C; Presets, step 1)
+  `RequestErrorHooks` and `InboxHooks` are still global only. (Kernel
+  gaps; Skills, steps A, B and C; Presets, steps 1 and 2)
+- **The user's default preset.** dsh's registry config has a
+  `selectedDefault`, the user's choice of default, edited through
+  Settings, which new sessions use over the deployment's `default`. It
+  waits on a settings service. (Presets, step 2)
+- **Picking a preset when creating a session.** dsh's session controller
+  resolves a requested preset and writes it into the new session's header.
+  Karaka's loop always writes the default; another preset means writing
+  the header first, or selecting while the session is blank. This comes
+  with the session controller. (Presets, step 2)
+- **No `agent-preset/selected` notice.** dsh emits it when a session logs
+  a selection. Karaka has no event bus; a client can watch the
+  `agentPreset` projection instead. (Presets, step 2)
 - **A logger.** dsh warns on a torn log tail and a failed background
   batch. Karaka writes nothing, or prints to stderr. The skill registry
   keeps its warnings (ignored duplicates, skipped providers, panicking
   change listeners, and what a provider reports through its control's
   `warn`, such as skipped skill files and failed watches) for
-  `SkillRegistry::warnings()`, until a logger takes them. (Durable sessions, parts A and B; Skills, steps A and B)
+  `SkillRegistry::warnings()`, until a logger takes them. dsh also warns
+  `agent preset <id>: <reason>` when a preset breaks; Karaka keeps the
+  reason in the roster only. (Durable sessions, parts A and B; Skills,
+  steps A and B; Presets, step 2)
 
 ### The agent loop
 
@@ -158,7 +176,9 @@ Last updated 2026-11-28, after the scope chain (step 1 of presets).
 
 - **No wire to UI clients.** dsh's typert `@Remote` methods aren't
   ported. The user-questions "time remaining" stream is a plain Rust
-  stream for now. This comes with the webserver. (User questions)
+  stream for now. The preset registry's `list` and `select` remotes are
+  Rust methods (`roster`, `select`), with dsh's error codes and details.
+  This comes with the webserver. (User questions; Presets, step 2)
 - **Late replies from the terminal.** The binary mounts the legacy
   `ask_user_question`, as dsh's bundles do, so its questions block and
   never go pending. With the timed tool, a pending question would need a
@@ -192,8 +212,7 @@ From Play This Life's plugin list:
 
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.
-- **Presets and personas:** `agent-preset`, `agent-preset-registry`,
-  `persona`.
+- **Personas:** `persona` (presets, step 3).
 - **The rest:** `mcp-client`, `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 
@@ -203,6 +222,13 @@ Karaka's own: `token-meter`, `compaction-basic`,
 
 ## Decided, not to do
 
+- **Preset revisions.** dsh's presets are rows a running process can add,
+  replace and remove, each change a new revision that live agents keep
+  until they let go. Karaka's presets are compiled in and set up once, so
+  there is one revision each, for the runtime's life: no generations,
+  retiring, leases (`acquireScope`) or rebinding of a live tree, and no
+  `readDocument`, `compositionInventory`, `inspectCompositions` or
+  `serviceFor`, which read a Cordis tree. (Presets, step 2)
 - **No migration of older session formats.** Karaka reads and writes v4
   only, and refuses anything older. (Durable sessions, part C)
 - **Cases Rust rules out**, such as non-integer versions and Promise

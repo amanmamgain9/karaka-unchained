@@ -27,6 +27,7 @@
 //! (`pre_step.rs`).
 
 mod cancel;
+mod compose;
 mod inbox;
 mod inbox_hooks;
 mod pre_step;
@@ -34,6 +35,7 @@ mod request_error;
 mod stream;
 
 pub use cancel::{CancelSwitch, Cancellation, cancellation};
+pub use compose::{AgentComposer, AgentComposition, ComposeError, CompositionTaken};
 pub use inbox::{InboxError, SpliceCause};
 pub use inbox_hooks::{InboxHooks, InboxListener};
 pub use pre_step::{
@@ -197,6 +199,9 @@ pub enum OpenError {
     Session(SessionError),
     /// The session's queued input doesn't fold.
     Inbox(InboxError),
+    /// The session can't be composed, such as one naming a preset that
+    /// doesn't exist or is broken.
+    Compose(ComposeError),
 }
 
 impl std::fmt::Display for OpenError {
@@ -204,6 +209,7 @@ impl std::fmt::Display for OpenError {
         match self {
             Self::Session(error) => error.fmt(f),
             Self::Inbox(error) => error.fmt(f),
+            Self::Compose(error) => error.fmt(f),
         }
     }
 }
@@ -213,6 +219,7 @@ impl std::error::Error for OpenError {
         match self {
             Self::Session(error) => Some(error),
             Self::Inbox(error) => Some(error),
+            Self::Compose(error) => Some(error),
         }
     }
 }
@@ -220,6 +227,12 @@ impl std::error::Error for OpenError {
 impl From<SessionError> for OpenError {
     fn from(error: SessionError) -> Self {
         Self::Session(error)
+    }
+}
+
+impl From<ComposeError> for OpenError {
+    fn from(error: ComposeError) -> Self {
+        Self::Compose(error)
     }
 }
 

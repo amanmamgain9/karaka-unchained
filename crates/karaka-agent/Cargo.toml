@@ -16,6 +16,8 @@ karaka-session.workspace = true
 # The scopes an agent sees registrations through, and the pre-step hook's
 # listeners are filed under.
 karaka-scope.workspace = true
+# A composer's error carries dsh's details as JSON.
+serde_json.workspace = true
 # The retry policy a failed request's provider asks for.
 karaka-model.workspace = true
 # Only `sync`, for the watch channel behind a turn's cancel switch. It needs

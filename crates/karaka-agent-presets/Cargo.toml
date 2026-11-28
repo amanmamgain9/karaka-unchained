@@ -1,0 +1,31 @@
+[package]
+name = "karaka-agent-presets"
+description = "Agent presets: compiled-in compositions of scoped tools, prompt and skills, the registry that lists and resolves them, and each session's selected preset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# For the plugin that sets presets up and provides the registry.
+karaka-kernel.workspace = true
+# A preset is a scope; its plugins register under its key.
+karaka-scope.workspace = true
+# The composer the loop asks, and the error a refused open carries.
+karaka-agent.workspace = true
+# The header's preset, the selection event, and the session it is logged to.
+karaka-session.workspace = true
+# The `agentPreset` projection.
+karaka-session-projection.workspace = true
+# The roster and the errors' details, in dsh's JSON.
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+karaka-agent-loop.workspace = true
+karaka-model.workspace = true
+karaka-system-prompt.workspace = true
+karaka-tools.workspace = true
+futures-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
