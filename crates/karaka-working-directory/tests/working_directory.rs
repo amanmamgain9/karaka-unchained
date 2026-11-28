@@ -1079,3 +1079,18 @@ async fn a_request_shows_the_directory_as_it_is_when_it_is_sent() {
         assert_eq!(ending, Some(TurnEndReason::Completed));
     }
 }
+
+// A session's turn lock is freed once its operation ends, so a server
+// opening many sessions doesn't keep one for each forever. (dsh frees the
+// chain with its session.)
+#[tokio::test]
+async fn a_sessions_turn_lock_is_freed_after_its_operation() {
+    let f = fixture().await;
+    let agent = f.agent();
+    f.mkdir("child");
+    assert_eq!(f.wd.turn_locks(), 0);
+    f.wd.set(agent.as_ref(), "child", None).await.unwrap();
+    assert_eq!(f.wd.turn_locks(), 0);
+    let _ = f.wd.set(agent.as_ref(), "", None).await;
+    assert_eq!(f.wd.turn_locks(), 0);
+}

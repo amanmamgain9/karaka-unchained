@@ -348,12 +348,29 @@ impl WorkingDirectory {
             self.check(signal)?;
             action.await
         };
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = lifecycle.wait() => Err(WorkingDirectoryError::Disposed),
             () = caller.wait() => Err(WorkingDirectoryError::Cancelled),
             result = run => result,
+        };
+        // The session's lock goes once no one else holds or waits on it, as
+        // dsh's chain is freed with its session: the map's reference and
+        // this one are the last.
+        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        if Arc::strong_count(&turn) == 2 {
+            turns.remove(session.id());
         }
+        result
+    }
+
+    /// How many sessions hold a turn lock now: for tests.
+    #[doc(hidden)]
+    pub fn turn_locks(&self) -> usize {
+        self.turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Refuses once stopped or cancelled. (dsh: `throwIfAborted`.)

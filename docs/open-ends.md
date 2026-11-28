@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the identity lifecycle and the startup gate (step 2 of the HTTP ingress).
+Last updated 2026-11-28, after the application chat routes (step 3 of the HTTP ingress).
 
 ## Needs you
 
@@ -35,10 +35,6 @@ Last updated 2026-11-28, after the identity lifecycle and the startup gate (step
 
 ## Small fixes in what is built
 
-- **Working-directory keeps a lock per session forever.** Its `turns`
-  map never shrinks. dsh's is freed with the session. This matters only
-  for a long-running server, so fix it before `karaka serve` opens
-  sessions (HTTP ingress, step 3). (Working directory)
 - **Endpoints settle before presets only by plugin order.** Nothing
   requires an application endpoint, so the kernel doesn't hold the
   presets for it. They start after it only because the list puts them
@@ -118,11 +114,13 @@ Last updated 2026-11-28, after the identity lifecycle and the startup gate (step
   `selectedDefault`, the user's choice of default, edited through
   Settings, which new sessions use over the deployment's `default`. It
   waits on a settings service. (Presets, step 2)
-- **Picking a preset when creating a session.** dsh's session controller
-  resolves a requested preset and writes it into the new session's header.
-  Karaka's loop always writes the default; another preset means writing
-  the header first, or selecting while the session is blank. This comes
-  with the session controller. (Presets, step 2)
+- **Picking a preset when creating a session.** The application routes
+  name a new chat's preset in its header (`DurableSessions::open_with`),
+  as dsh's `agents.create` takes `meta.agentPreset`. The loop's own
+  `open` still writes the default, so a host opening a session itself
+  writes the header first, or selects while the session is blank. The
+  rest comes with dsh's session controller. (Presets, step 2; HTTP
+  ingress, step 3)
 - **No `agent-preset/selected` notice.** dsh emits it when a session logs
   a selection. Karaka has no event bus; a client can watch the
   `agentPreset` projection instead. (Presets, step 2)
@@ -192,8 +190,10 @@ Last updated 2026-11-28, after the identity lifecycle and the startup gate (step
   turn instead. (Part A)
 - **Smaller ones:** the cold-log memo, list concurrency, and
   frame-by-frame cancellation of zstd decoding. (Parts A and B)
-- **User message `source.rpcId`**, which Play This Life uses for prompt
-  idempotency and its tool guard. (Audit: what Play This Life reads)
+- **User message `source.rpcId` in Play This Life's tool guard.** The
+  application routes write it and dedupe prompts by it. The guard that
+  reads it is Play This Life's own plugin, not ported. (Audit: what Play
+  This Life reads; HTTP ingress, step 3)
 
 ### Clients
 
@@ -280,17 +280,46 @@ Last updated 2026-11-28, after the identity lifecycle and the startup gate (step
 
 ### HTTP ingress
 
-- **The plan.** Steps 1 and 2 are built: the webserver and `karaka
-  serve`, then the identity lifecycle and the startup gate. Still to do:
-  - step 3, Karaka's application chat routes (`transport-http`'s
-    `index.ts`, `application.ts`, `application-state.ts`, `http.ts`), to
-    `@karaka-ai/sdk`'s wire contract byte for byte, with the
-    `agentDefaultModel`, `sessionQuery` and `sessionPersistence` they
-    inject decided then;
-  - step 4, browser access: `browser-auth` (ES256 JWT) and
-    `transport-http`'s `browser*.ts` routes and WebSocket.
-
-  (HTTP ingress, steps 1 and 2)
+- **The plan.** Steps 1 to 3 are built: the webserver and `karaka
+  serve`, the identity lifecycle and the startup gate, and the
+  application chat routes. Still to do: step 4, browser access:
+  `browser-auth` (ES256 JWT) and `transport-http`'s `browser*.ts` routes
+  and WebSocket. An `application-http` row's browser fields are checked
+  and left unmounted, with a warning. (HTTP ingress, steps 1 to 3)
+- **Images in application prompts.** A prompt with an image part is
+  refused (`Image attachments are unavailable`, 400), as Karaka's
+  controller refuses one without an attachment store. Admitting them
+  waits on attachments, and on the model's input modalities
+  (`resolveModelInfo`), which Karaka's models don't publish. (HTTP
+  ingress, step 3)
+- **Model selection checks only what Karaka knows.** `selectModel`'s
+  `resolveCallConfig` checks that the provider is a registered route and
+  that the effort is one Karaka sends. dsh also checks the exact model,
+  rejects an effort that model lacks, and fills in its default effort;
+  Karaka's models publish no catalog to check against. (HTTP ingress,
+  step 3)
+- **A chat's last-used model is matched by provider name.** Karaka's
+  loop writes the provider's name in `request/header`, where dsh writes
+  the route, so a chat's restored `lastUsed` selection is used only when
+  its provider is also a registered route; otherwise the default is.
+  (HTTP ingress, step 3)
+- **A request's operation outlives its client.** Karaka aborts an
+  admitted operation when its HTTP peer leaves. Here a stream ends when
+  its peer leaves, but other operations, which are short (a lock, a
+  flush), run to their end. (HTTP ingress, step 3)
+- **The application state is folded each time it's read.** Karaka keeps
+  `karakaApplication` as a session projection with checkpoints; here a
+  prompt and an activation fold the chat's events. A long chat would
+  want the projection. (HTTP ingress, step 3)
+- **The default model is fixed at start.** dsh's `agent-default-model`
+  is settings-backed: it changes while the runtime runs, and
+  `saveSelection` writes it back through the config editor. Both wait on
+  dsh's settings service. (HTTP ingress, step 3)
+- **Transport disposal.** Karaka rejects pending questions with `Karaka
+  HTTP transport was disposed` and closes their streams when the plugin
+  unloads. The kernel unloads nothing; `serve` closes every connection
+  on shutdown, and a question still pending is cut with its process.
+  (HTTP ingress, step 3)
 - **The webserver's TLS listener.** dsh's `tls` (`certFile`, `keyFile`),
   read once before binding, and `protocol` `https:`, aren't ported.
   Karaka's own profile sets no `tls`, and a deployment terminates TLS in
@@ -334,18 +363,19 @@ Last updated 2026-11-28, after the identity lifecycle and the startup gate (step
 
 From Play This Life's plugin list:
 
-- **Models and storage:** `agent-default-model` (needs dsh's settings
-  service), `session-query-sqlite`, `storage`, `credentials-local` (its
+- **Models and storage:** `session-query` beyond observing one session,
+  and `session-query-sqlite`, `storage`, `credentials-local` (its
   store and `.env` layers; the process environment is
   `karaka-credentials`).
 - **The rest:** `mcp-resources`, `session-reference` (and Karaka's
   owner-aware resolver over it),
   `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
-  `transport-http` and `browser-auth` (HTTP ingress, steps 2 to 4).
+  `browser-auth` with `transport-http`'s browser routes (HTTP ingress,
+  step 4).
 - **Play This Life's own global rows** that `KARAKA_PLUGINS` can't name
   yet, such as `browser-auth` and `delegated-access`; it knows
-  `mcp-client`, `application-catalog`, `server-auth` and
-  `mcp-application`.
+  `mcp-client`, `application-catalog`, `server-auth`, `mcp-application`
+  and `application-http`.
 
 Karaka's own: `token-meter`, `compaction-basic`,
 `compaction-tool-result-pruner`, `session-checkpoint-policy`,

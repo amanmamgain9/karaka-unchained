@@ -58,17 +58,40 @@ impl Inner {
     /// such as DeepSeek's `off`, can't be sent, so it doesn't carry on.
     pub(crate) fn call_config(&self, provider: &str) -> (CallConfig, Option<Effort>) {
         let config = &self.shared.config;
-        let effort = config.effort.or_else(|| self.restored_effort(provider));
-        let mut call = CallConfig::new(provider, &config.model);
+        let (_, model, explicit) = self.selected();
+        let effort = explicit.or_else(|| self.restored_effort(provider));
+        let mut call = CallConfig::new(provider, &model);
         call.reasoning_effort = effort.map(|effort| effort_name(effort).to_owned());
         call.max_tokens = config.max_tokens.map(u64::from);
         (call, effort)
     }
 
+    /// The route, model and explicit effort requests go to: the agent's
+    /// selection, or the loop's config.
+    pub(crate) fn selected(&self) -> (String, String, Option<Effort>) {
+        let selection = self
+            .selection
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match selection {
+            Some(selection) => (
+                selection.provider,
+                selection.model,
+                selection.reasoning_effort.as_deref().and_then(effort_named),
+            ),
+            None => (
+                self.shared.config.route.clone(),
+                self.shared.config.model.clone(),
+                self.shared.config.effort,
+            ),
+        }
+    }
+
     fn restored_effort(&self, provider: &str) -> Option<Effort> {
         let header = self.session.request_header()?;
-        let same_route =
-            header.config.provider == provider && header.config.model == self.shared.config.model;
+        let (_, model, _) = self.selected();
+        let same_route = header.config.provider == provider && header.config.model == model;
         let defaulted = header
             .adapter_defaults
             .is_some_and(|defaults| defaults.reasoning_effort);
@@ -151,7 +174,7 @@ fn effort_name(effort: Effort) -> &'static str {
 }
 
 /// The level dsh names `name`, if Karaka has one.
-fn effort_named(name: &str) -> Option<Effort> {
+pub(crate) fn effort_named(name: &str) -> Option<Effort> {
     [
         Effort::Low,
         Effort::Medium,

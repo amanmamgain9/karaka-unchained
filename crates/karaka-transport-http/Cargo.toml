@@ -1,0 +1,50 @@
+[package]
+name = "karaka-transport-http"
+description = "Karaka's application chat routes: the HTTP JSON and SSE contract an application server speaks to Karaka, over its identity, agents and sessions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The routes mount on the webserver, behind the startup gate.
+karaka-webserver.workspace = true
+karaka-startup.workspace = true
+# Who calls, and who owns each chat.
+karaka-server-auth.workspace = true
+karaka-identity.workspace = true
+# The agents, their presets, their default model and the registry it
+# names.
+karaka-agent.workspace = true
+karaka-agent-presets.workspace = true
+karaka-agent-default-model.workspace = true
+karaka-model.workspace = true
+# Sessions: live, durable, and observed.
+karaka-session.workspace = true
+karaka-session-persistence.workspace = true
+karaka-session-query.workspace = true
+# The transport answers a chat's questions.
+karaka-user-questions.workspace = true
+karaka-kernel.workspace = true
+# The wire is JSON, its keys in Karaka's order.
+serde_json = { workspace = true, features = ["preserve_order"] }
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+# Random interaction and message ids, as `randomUUID`; already in the tree
+# through rustls.
+ring = "0.17"
+
+[dev-dependencies]
+futures-core.workspace = true
+karaka-agent-loop.workspace = true
+karaka-session-jsonl.workspace = true
+karaka-session-projection.workspace = true
+karaka-system-prompt.workspace = true
+karaka-tools.workspace = true
+karaka-scope.workspace = true
+karaka-tool-ask-user.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net", "io-util"] }

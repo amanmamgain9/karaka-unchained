@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, IsTerminal, Write};
 use std::sync::Arc;
 
-use karaka_agent::{AgentComposition, Agents};
+use karaka_agent::{AgentComposition, Agents, ModelSelection};
+use karaka_agent_default_model::AgentDefaultModelPlugin;
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
 use karaka_credentials::CredentialsPlugin;
@@ -25,6 +26,7 @@ use karaka_kernel::{DynPlugin, Runtime};
 use karaka_mcp_application::{ApplicationCatalogPlugin, McpApplicationPlugin};
 use karaka_mcp_client::{Level, Log, McpClientsPlugin};
 use karaka_model::Block;
+use karaka_model::Effort;
 use karaka_retry::RetryPlugin;
 use karaka_server_auth::ServerAuthPlugin;
 use karaka_session::{
@@ -34,8 +36,10 @@ use karaka_session::{
 use karaka_session_jsonl::{JsonlConfig, JsonlPlugin};
 use karaka_session_persistence::{DurableSessions, DurableSessionsPlugin};
 use karaka_session_projection::SessionProjectionsPlugin;
+use karaka_session_query::SessionQueryPlugin;
 use karaka_skill::SkillsPlugin;
 use karaka_skill_filesystem::{SkillFilesystemConfig, SkillFilesystemPlugin};
+use karaka_startup::KarakaStartupPlugin;
 use karaka_system_prompt::{SystemPromptConfig, SystemPromptPlugin};
 use karaka_tool_ask_user::{AskUserConfig, AskUserPlugin};
 use karaka_tool_skill::ToolSkillPlugin;
@@ -45,12 +49,25 @@ use karaka_tools::{
     PreExecuteFuture, PreExecuteListener, PreExecuteNext, PreToolDecision, ToolExecution,
     ToolRegistry, ToolsPlugin,
 };
+use karaka_transport_http::TransportHttpPlugin;
 use karaka_user_approval::{ApprovalConfig, ApprovalPlugin, ApprovalPolicy, ApprovalService};
 use karaka_user_questions::{UserQuestions, UserQuestionsPlugin};
+use karaka_webserver::{WebServerConfig, WebServerPlugin};
 use karaka_working_directory::WorkingDirectoryPlugin;
 
 use crate::config::Config;
 use crate::current_time::CurrentTimePlugin;
+
+/// dsh's name for an effort level, as its adapters write `reasoningEffort`.
+fn effort_name(effort: Effort) -> &'static str {
+    match effort {
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
+        Effort::XHigh => "xhigh",
+        Effort::Max => "max",
+    }
+}
 use crate::plugins::GlobalPlugins;
 use crate::questions::{Lines, TerminalAnswerer, TerminalApprover};
 
@@ -94,10 +111,13 @@ const SHORT_RESULT: usize = 80;
 pub fn loop_plugins(
     config: Config,
     approvals: &Approvals,
-    chat: bool,
+    mode: Mode,
 ) -> Result<Vec<Box<dyn DynPlugin>>, String> {
+    let chat = mode == Mode::Chat;
     let watch_skills = chat;
-    let config_sessions = config.sessions.is_some();
+    // `ask` keeps nothing; `chat` and `serve` keep their sessions in
+    // `KARAKA_SESSIONS` when it is set.
+    let persist = mode != Mode::Ask && config.sessions.is_some();
     let presets = match &config.presets {
         Some(path) => Some(crate::presets::load(
             path,
@@ -122,6 +142,13 @@ pub fn loop_plugins(
             endpoint.server_name
         ));
     }
+    // The model an agent uses until a chat selects another. (dsh: the
+    // `agent-default-model` row.)
+    let default_model = ModelSelection {
+        provider: config.provider.route().to_owned(),
+        model: config.model.clone(),
+        reasoning_effort: config.effort.map(|effort| effort_name(effort).to_owned()),
+    };
     let mut loop_config = LoopConfig::new(config.provider.route(), config.model);
     loop_config.max_tokens = config.max_tokens;
     loop_config.effort = config.effort;
@@ -141,7 +168,7 @@ pub fn loop_plugins(
     // in the list, so what requires the persistence port, the authority
     // among them, starts in its place, and the application endpoints
     // still settle before the presets.
-    if chat && let Some(root) = &config.sessions {
+    if persist && let Some(root) = &config.sessions {
         plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root.clone()))));
         plugins.push(Box::new(DurableSessionsPlugin));
     }
@@ -205,7 +232,7 @@ pub fn loop_plugins(
     // `KARAKA_APPLICATION_ID` and the rest admit the owner of the one this
     // process opens (`admit`). A chat kept in `KARAKA_SESSIONS` has durable
     // storage, so its chats are acknowledged and restored through it.
-    plugins.push(Box::new(if chat && config_sessions {
+    plugins.push(Box::new(if persist {
         KarakaIdentityPlugin::with_persistence()
     } else {
         KarakaIdentityPlugin::new()
@@ -222,10 +249,44 @@ pub fn loop_plugins(
             McpApplicationPlugin::new(endpoint).on_log(Arc::clone(&log)),
         ));
     }
+    let has_presets = presets.is_some();
     if let Some(presets) = presets {
         plugins.push(Box::new(presets));
     }
+    if let Mode::Serve(listen) = mode {
+        plugins.push(Box::new(
+            WebServerPlugin::new(listen).on_log(Arc::new(|line: &str| eprintln!("karaka: {line}"))),
+        ));
+        // The ingress admits requests only once every plugin has started.
+        plugins.push(Box::new(KarakaStartupPlugin));
+        if let Some((transport, warnings)) = global.transport {
+            if !persist {
+                return Err(format!(
+                    "{}: the application-http row needs KARAKA_SESSIONS: a chat is acknowledged once it is stored",
+                    global.at
+                ));
+            }
+            for warning in warnings {
+                eprintln!("karaka: {warning}");
+            }
+            plugins.push(Box::new(SessionQueryPlugin::with_persistence()));
+            plugins.push(Box::new(AgentDefaultModelPlugin::new(default_model)));
+            plugins.push(Box::new(TransportHttpPlugin::new(transport, has_presets)?));
+        }
+    }
     Ok(plugins)
+}
+
+/// Which command the plugins are for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// `karaka ask`: one question, nothing kept, nothing watched.
+    Ask,
+    /// `karaka chat`: a conversation, its skills watched.
+    Chat,
+    /// `karaka serve`: the webserver on this address, and the
+    /// application routes when the plugins file has their row.
+    Serve(WebServerConfig),
 }
 
 /// What the command line says: approvals, and the preset to run.
@@ -396,7 +457,7 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
     let sessions = config.sessions.clone();
     let owner = config.owner.clone();
     // With `KARAKA_SESSIONS`, the plugins keep the sessions durable.
-    let plugins = loop_plugins(config, &approvals, true)?;
+    let plugins = loop_plugins(config, &approvals, Mode::Chat)?;
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;

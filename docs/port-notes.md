@@ -4888,3 +4888,301 @@ Two changes went with it:
     Loader audit of pending, inactive and unimportable entries, and
     throwing `disabled` expressions. The kernel has no Loader.
   - `session-reference.spec.ts`, which waits on dsh's resolver.
+
+## HTTP ingress, step 3: the application routes
+
+This step ports Karaka's `@karaka-ai/transport-http` backend half
+(`index.ts`, `application.ts`, `application-state.ts`, `http.ts`) as
+`karaka-transport-http`. The wire is `@karaka-ai/sdk`'s `protocol.ts`, read
+from Play This Life's installed `0.1.2-alpha.7`. Its `protocol.js` and
+`client.js` are identical to the `0.1.2-alpha.5` Karaka's workspace pins.
+dsh's `agent-default-model` (dsh-v4, from the scratchpad clone) is ported
+as `karaka-agent-default-model`, and a minimal `karaka-session-query`. The
+browser half is step 4.
+
+### The three services Karaka lacked
+
+- **`agentDefaultModel`** (`karaka-agent-default-model`):
+  - `AgentDefaultModel::current_selection()` gives `{ provider, model,
+    reasoningEffort? }`. In the binary that is the route, `KARAKA_MODEL`
+    and `KARAKA_EFFORT`.
+  - The volatile, settings-backed config and `saveSelection` wait on a
+    settings service (open ends).
+  - The `llm` calls the routes make map onto Karaka's `ModelRegistry`:
+    - `listProviders` becomes `list_providers`, the registered routes.
+    - `resolveCallConfig` becomes `resolve_call_config`. It refuses an
+      unregistered provider with dsh's `no adapter registered for provider
+      "x"` (`NO_ADAPTER`), and an effort Karaka can't send with dsh's
+      `UNSUPPORTED_REASONING_EFFORT` message.
+    - No Karaka equivalent: the exact model's check, the default-effort
+      fill, and `resolveModelInfo` (input modalities). Karaka's models
+      publish no catalog (open ends).
+- **`sessionQuery`** (`karaka-session-query`): only `observeSession(id,
+  { projectionMode: 'none' })`.
+  - It reads the live session, or reads a stored one cold through a read
+    handle, without opening or repairing it.
+  - `session "x" not found` is `SESSION_QUERY_SESSION_NOT_FOUND`, which
+    the routes expose as 404 `CHAT_NOT_FOUND`.
+  - The rest of dsh's session query is still to port.
+- **`sessionPersistence`** already existed.
+  - New: `DurableSessions::open_with(id, cwd, prepare)`, so a new chat's
+    header names its preset (dsh: `agents.create`'s `meta.agentPreset`).
+
+### New in the agent and the loop
+
+- **`Agent::interrupt(cause)`** stops the running turn and keeps the
+  queue. That is dsh's `cancel(..., { keepInbox: true })`, which the
+  `cancel` route uses. The default is `cancel`.
+- **`Agent::select_model(ModelSelection)` and `model_selection()`.**
+  - The loop's agent keeps a selection, and its requests go to the
+    selection's route, model and effort instead of the loop's config.
+  - It is dsh's `ModelSelectionRef` and `installModelSelection`. An effort
+    Karaka has no level for isn't sent.
+  - `ModelSelection` is in `karaka-agent`.
+
+### The controller (`controller.rs`, from `application.ts`)
+
+Every operation on a chat runs under `KarakaIdentity::with_chat_lock`.
+
+- **`list_agents`** gives each usable preset as `{ id, name (the id when it
+  has none), description? }`; with no presets, `[]`.
+- **`prepare`.**
+  - A chat with a known owner is authorized.
+  - A stored chat with none is restored to the caller, after the preset
+    check.
+  - A new one passes.
+- **`create`.**
+  1. `prepare`.
+  2. Another preset already is `session/conflict` (`Chat already uses
+     another Agent preset`).
+  3. `reserve`. An existing chat is activated. A new one:
+     - checks the preset is usable, with its `agent-preset/*` code;
+     - makes the session through `open_with`, named for the preset;
+     - is bound, its agent opened, and its selection installed.
+  4. `markReady`.
+  5. It answers `{ chatId, agentId }`.
+
+  Without presets it fails with `Application creation requires Agent
+  presets`.
+- **`activate`.**
+  1. `prepare`, then `authorize`.
+  2. A live agent must be one this controller opened (`Agent is owned by
+     another controller`, `session/conflict`).
+  3. A cold chat is resumed through `DurableSessions::open`, then
+     `authorizeSession`. Its agent is opened with its recorded preset,
+     and its selection installed.
+
+  With no preset: `Application Session has no resolvable Agent preset`.
+- **`install_selection`** picks the pending selection, else the last used,
+  else the default. One whose provider isn't a registered route falls to
+  the default (open ends).
+- **`prompt`.**
+  - A request id already admitted is a duplicate, by the application
+    state over the chat's events.
+  - Otherwise these are checked:
+    - the selected provider must be registered (`Selected model provider
+      is unavailable`, `session/model-unavailable`);
+    - an image part is refused (`Image attachments are unavailable`,
+      `session/attachment-invalid`), since there is no attachment store.
+  - The text parts are queued as one user message, its source `{ kind:
+    'user', rpcId: requestId }` and a random UUID id.
+  - `markReady` flushes the queued message before the receipt `{
+    accepted, duplicate }`.
+- **`cancel`** calls `interrupt(User)` and answers `{ accepted: true }`.
+- **`select_model`.**
+  1. `resolve_call_config`.
+  2. It appends `model/selection` with `{ provider, model,
+     reasoningEffort? }`.
+  3. It sets the agent's selection and calls `markReady`.
+  4. It answers `{ selected }`.
+- **`events`**: `prepare`, `authorize`, then the session query's events.
+- **`follow`.**
+  1. It subscribes before reading the snapshot.
+  2. The snapshot is the header, the events, and the cursor, which is the
+     last seq or -1.
+  3. Then each durable event comes once: one at or below the cursor is
+     skipped, a gap fails with `Application event stream lost sequence
+     continuity`.
+  4. Text deltas come at the log's cursor; one below the follow's cursor
+     is skipped.
+  5. The owner is authorized again before each delivery.
+
+### The application state (`state.rs`, from `application-state.ts`)
+
+The fold is Karaka's:
+
+- request ids come from `user/message` and `agent/inbox/spliced` messages
+  with `source.kind === 'user'` and an `rpcId`, each once;
+- `model/selection` sets the pending selection;
+- `request/header` sets the last used, without an adapter-default effort,
+  and consumes a pending selection it matches.
+
+Karaka keeps it as the `karakaApplication` projection; here it is folded
+from the events when read (open ends).
+
+### The routes (`routes.rs`, `wire.rs`, `error.rs`, from `index.ts` and `http.ts`)
+
+- **One prefix route at `path`**, default `/v1`. A bad path fails with
+  `transport-http path must start with / and have no trailing slash`.
+- **The order of checks:**
+  1. The startup gate: 503 with `STARTING_BODY` before `commit`.
+  2. `ServerAuth::authenticate` on the `Authorization` header. No match
+     is 401 `{"code":"UNAUTHORIZED","message":"Invalid server
+     credential"}`.
+  3. The route.
+- **Matching:**
+  - `GET /agents` answers 200.
+  - `POST /chats` answers 201.
+  - `POST /chats/:id/(messages|stream|history|cancel|model|responses)`
+    answers 202 for messages and 200 for the rest.
+  - Anything else is 404 `{"code":"NOT_FOUND","message":"Route not
+    found"}`.
+  - The id is `decodeURIComponent`'d. A malformed escape is a URIError,
+    so 500 `INTERNAL_ERROR`, as in Karaka.
+- **Bodies** (`readObject`):
+  - at most `maxBodyBytes` (default 1 MiB), counted as they arrive;
+  - decoded as UTF-8 with replacement, as Node decodes;
+  - parsed, and an object required.
+  - Each failure is `BAD_REQUEST`.
+- **Schemas** (`wire.rs`) are `@karaka-ai/sdk`'s strict Zod objects:
+  - unknown keys are refused;
+  - `min(1)` strings;
+  - the content union by `type`, with the image `mediaType` enum and the
+    optional `name`;
+  - a `cursor` that is a safe integer of at least -1;
+  - the respond answers' shape.
+
+  A refusal is 400 `Invalid request`, as a `ZodError` is.
+- **Responses.**
+  - JSON is `application/json; charset=utf-8`, the bodies' keys in
+    Karaka's order: `{ chatId, requestId, accepted, duplicate }`, `{
+    chatId, agentId }`, `{ chatId, events }`, `{ accepted: true }`, `{
+    selected }`.
+  - `exposeError`'s table is ported whole. Every internal code maps to
+    its status, exposed code and fixed message, and anything else is 500
+    `INTERNAL_ERROR` `Internal server error`.
+- **History and stream events** (`projectWireEvent`) come from each
+  event's stored v4 JSON:
+  - `user-message`, only for `source.kind === 'user'`, whose `content`
+    is the whole message;
+  - `assistant-message`, whose `content` is `data.message`;
+  - `tool-call` with `callId`, `name` and `arguments`;
+  - `tool-result` with `callId` from `data.message.source` and
+    `content` `data.message`;
+  - `turn-end` with `reason`;
+  - nothing for other events.
+- **The stream.**
+  1. The follow is opened. A `cursor` past its snapshot is 400 before any
+     header is sent.
+  2. Then 200 with `text/event-stream; charset=utf-8`, `cache-control:
+     no-cache, no-transform` and `connection: keep-alive`.
+  3. The snapshot's records after the cursor, then `{ type: 'snapshot',
+     cursor }`.
+  4. Then each frame, as `data: <JSON>\n\n` over a channel body.
+  5. Interactions:
+     - those pending for the chat and owner are replayed;
+     - live ones come through the chat's subscription;
+     - each is buffered until the stream's durable cursor reaches its own,
+       and deduplicated by id.
+  6. A failure after the headers is an `{ type: 'error', code, message }`
+     event, then the end. The peer leaving ends the writer, and with it
+     the follow's subscription.
+- **Questions** (`questions.rs`, `handleQuestions`, default true).
+  - The transport is a `UserQuestions` answerer.
+  - A question from an agent whose session has an application owner
+    becomes a pending interaction: a random UUID, at the log's cursor,
+    published as `interaction-required` with the questions' JSON.
+  - It is answered once through `responses`. A missing interaction, or
+    one for another chat or owner, is 403 `CHAT_FORBIDDEN` (`Interaction
+    is not pending for this chat`).
+  - A cancelled request takes it back.
+  - Other questions go down the chain.
+  - Approvals reach only browsers in Karaka (`browserEvents`), so they
+    come with step 4.
+- **Live delivery** (`hub.rs`):
+  - one `SessionListener` fans each appended event out to its chat's
+    follows;
+  - an `AgentOpenHooks` listener subscribes every agent's frames, and
+    forwards its text deltas.
+
+### The binary
+
+- **An `application-http` row** (or `@karaka-ai/transport-http`) in
+  `KARAKA_PLUGINS` takes `path`, `handleQuestions` and `maxBodyBytes`.
+- **Its browser fields** are checked as Karaka checks them:
+  - origins required;
+  - non-blank presets required;
+  - paths disjoint.
+
+  Then they are left unmounted, with a warning on stderr. I chose the
+  warning over refusing, because ignoring them withholds routes and
+  exposes nothing, and it lets Play This Life's own row, which sets
+  `browserPath`, serve its backend routes now.
+- **A row's `inject`** (Play This Life's row has one) is accepted and
+  ignored: the kernel orders plugins by what they require.
+- **The row needs:**
+  - a `server-auth` row, checked when the file is read;
+  - `KARAKA_SESSIONS`, because a chat is acknowledged only once stored.
+    It is checked at start, with `... the application-http row needs
+    KARAKA_SESSIONS: a chat is acknowledged once it is stored`.
+- **`loop_plugins` takes a `Mode`: `Ask`, `Chat`, or `Serve(listen)`.**
+  - `chat` and `serve` keep sessions in `KARAKA_SESSIONS`.
+  - `Serve` mounts the webserver, the startup gate, and, with the row,
+    the session query, the default model and the transport.
+  - `serve` closes the durable sessions after the server on shutdown.
+- **Usage** describes the row.
+
+### Working directory
+
+The per-session turn lock is now freed once no one holds or waits on it,
+as dsh frees the chain with its session. `serve` opens many sessions, so
+this was the open end to close now.
+
+### Tests
+
+- **18 new.**
+- **`karaka-transport-http`, 12:**
+  - The routes over a real runtime and loopback HTTP (8): a scripted
+    model, two presets, JSONL sessions in a temporary directory, the
+    identity, a fixed credential.
+    - the startup gate and credentials, with exact bodies;
+    - bad bodies, a malformed escape, a multibyte body at the limit;
+    - create, conflict, foreign owner and unknown preset; a live follow
+      through a prompt to `turn-end` with text deltas; duplicate receipts;
+      history; the cursor checks;
+    - cancel and model selection, the next request going to the selected
+      model, an image refused;
+    - an unavailable default provider;
+    - a cold chat restored and resumed after a restart, its receipts
+      kept;
+    - a question published, refused to a foreign owner and another chat,
+      answered once, and replayed to a later stream;
+    - questions going down the chain without `handleQuestions`.
+  - `exposeError`'s whole table, the schemas, and the application-state
+    fold.
+  - `decodeURIComponent`.
+- **Elsewhere:**
+  - `agent-default-model` (2);
+  - `session-query` (1);
+  - the working-directory lock (1);
+  - CLI (2): `karaka serve` with a scripted Anthropic server: list
+    agents, create, refuse a bad credential, follow, prompt, read the
+    text deltas to `turn-end`, read the history, and shut down cleanly
+    with the chat stored. Also the row's startup errors.
+- **Skipped,** with reasons in each file's header:
+  - the browser and approval cases (step 4);
+  - the attachment-store cases;
+  - disposal;
+  - the controller-stub failures a real controller can't produce;
+  - `http.spec`'s Node stream mechanics.
+
+### Where it differs from Karaka
+
+- **Images are always refused,** with no attachment store.
+- **Model checks are limited to the registry,** with no model catalog.
+- **The application state is folded on read,** not projected.
+- **A last-used selection is matched by provider name.**
+- **An ordinary operation runs to its end** when its client leaves.
+- **There is no transport disposal.**
+
+All six are in open ends.

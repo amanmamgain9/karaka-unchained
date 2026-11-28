@@ -646,6 +646,7 @@ version = "0.1.0"
 dependencies = [
  "httpdate",
  "karaka-agent",
+ "karaka-agent-default-model",
  "karaka-agent-loop",
  "karaka-agent-presets",
  "karaka-anthropic",
@@ -664,6 +665,7 @@ dependencies = [
  "karaka-session-jsonl",
  "karaka-session-persistence",
  "karaka-session-projection",
+ "karaka-session-query",
  "karaka-skill",
  "karaka-skill-filesystem",
  "karaka-startup",
@@ -674,6 +676,7 @@ dependencies = [
  "karaka-tool-todo",
  "karaka-tool-working-directory",
  "karaka-tools",
+ "karaka-transport-http",
  "karaka-user-approval",
  "karaka-user-questions",
  "karaka-webserver",
@@ -691,6 +694,16 @@ dependencies = [
  "karaka-scope",
  "karaka-session",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-agent-default-model"
+version = "0.1.0"
+dependencies = [
+ "karaka-agent",
+ "karaka-kernel",
+ "karaka-model",
  "tokio",
 ]
 
@@ -946,6 +959,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "karaka-session-query"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "karaka-session",
+ "karaka-session-persistence",
+ "tokio",
+]
+
+[[package]]
 name = "karaka-skill"
 version = "0.1.0"
 dependencies = [
@@ -1103,6 +1126,40 @@ dependencies = [
  "karaka-scope",
  "karaka-session",
  "karaka-system-prompt",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-transport-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "http",
+ "http-body",
+ "http-body-util",
+ "karaka-agent",
+ "karaka-agent-default-model",
+ "karaka-agent-loop",
+ "karaka-agent-presets",
+ "karaka-identity",
+ "karaka-kernel",
+ "karaka-model",
+ "karaka-scope",
+ "karaka-server-auth",
+ "karaka-session",
+ "karaka-session-jsonl",
+ "karaka-session-persistence",
+ "karaka-session-projection",
+ "karaka-session-query",
+ "karaka-startup",
+ "karaka-system-prompt",
+ "karaka-tool-ask-user",
+ "karaka-tools",
+ "karaka-user-questions",
+ "karaka-webserver",
+ "ring",
  "serde_json",
  "tokio",
 ]

@@ -401,14 +401,15 @@ impl Inner {
             }
 
             let config = &self.shared.config;
+            let (route, model_id, _) = self.selected();
             let model = self
                 .shared
                 .models
-                .get(&config.route)
-                .ok_or_else(|| Stop::Failed(no_model(&config.route)))?;
+                .get(&route)
+                .ok_or_else(|| Stop::Failed(no_model(&route)))?;
             let (call, effort) = self.call_config(model.provider());
             let History { system, messages } = self.session.history();
-            let mut request = Request::new(config.model.clone(), messages);
+            let mut request = Request::new(model_id.clone(), messages);
             request.system = system;
             request.tools = tools.to_vec();
             request.max_tokens = config.max_tokens;
@@ -438,7 +439,7 @@ impl Inner {
                         turn,
                         step,
                         model.provider(),
-                        &config.model,
+                        &model_id,
                         &response,
                     );
                     // The finish record carries the replay state the message's
@@ -612,12 +613,9 @@ impl Inner {
         usage: Option<Usage>,
         stream: Vec<Value>,
     ) -> Result<Seq, LogError> {
-        let message = AssistantMessage::from_model(
-            self.next_id("assistant"),
-            provider,
-            &self.shared.config.model,
-            content,
-        );
+        let (_, model, _) = self.selected();
+        let message =
+            AssistantMessage::from_model(self.next_id("assistant"), provider, &model, content);
         self.session
             .append(SessionEvent::assistant(AssistantMessageData {
                 turn,

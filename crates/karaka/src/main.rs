@@ -26,8 +26,9 @@ use karaka_agent::Agents;
 use karaka_kernel::Runtime;
 use karaka_model::{Model, ModelRegistry};
 use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSource};
-use karaka_startup::{KarakaStartup, KarakaStartupPlugin};
-use karaka_webserver::{WebServer, WebServerPlugin};
+use karaka_session_persistence::DurableSessions;
+use karaka_startup::KarakaStartup;
+use karaka_webserver::WebServer;
 
 use crate::answer::Printer;
 use crate::chat::Options;
@@ -53,8 +54,9 @@ the conversation.
 
 serve starts the same runtime with an HTTP server on KARAKA_HOST and
 KARAKA_PORT, says where on stderr, and runs until Ctrl-C or SIGTERM,
-which close every connection before it exits. No routes are mounted yet,
-so every request is answered 404.
+which close every connection and write every chat before it exits. With
+an application-http row in KARAKA_PLUGINS it serves Karaka's application
+chat routes, which @karaka-ai/sdk calls; anything else is answered 404.
 
 All three load skills: a directory holding a SKILL.md file, under the
 project's .dsh/skills or .agents/skills, or ~/.dsh/skills or
@@ -89,6 +91,12 @@ KARAKA_PLUGINS names a YAML list of global plugin rows, each with a name
   mcp-application      an application's MCP endpoint: applicationId,
                        serverName, url, headers, toolCallTimeoutMs,
                        failOnStartupError, allow, deny, reconnect
+  application-http     serve's application chat routes: path (/v1),
+                       handleQuestions (true), maxBodyBytes (1048576).
+                       It needs a server-auth row, whose chatCredential
+                       the application server sends, and KARAKA_SESSIONS.
+                       Its browser fields are checked, then not mounted:
+                       browser access comes later
 Karaka's package names, such as @karaka-ai/mcp-application, work too.
 An application's tools reach a session only when the application owns
 it (KARAKA_APPLICATION_ID and the rest), and only the names both its
@@ -305,7 +313,7 @@ async fn ask(question: Option<String>, options: Options) -> Result<(), String> {
     // The answer is printed from the loop's live frames as it is written.
     let route = config.provider.route().to_owned();
     let owner = config.owner.clone();
-    let runtime = Runtime::start(chat::loop_plugins(config, &approvals, false)?)
+    let runtime = Runtime::start(chat::loop_plugins(config, &approvals, chat::Mode::Ask)?)
         .await
         .map_err(|error| error.to_string())?;
     // Checked before the turn, so an unknown route lists the routes there
@@ -364,12 +372,8 @@ async fn serve(options: Options) -> Result<(), String> {
     let lookup = |name: &str| std::env::var(name).ok();
     let config = Config::from_env(lookup)?;
     let listen = config::listen(lookup)?;
-    let mut plugins = chat::loop_plugins(config, &options.approvals, false)?;
-    plugins.push(Box::new(
-        WebServerPlugin::new(listen).on_log(Arc::new(|line: &str| eprintln!("karaka: {line}"))),
-    ));
-    // The ingress admits requests only once every plugin has started.
-    plugins.push(Box::new(KarakaStartupPlugin));
+    let durable = config.sessions.is_some();
+    let plugins = chat::loop_plugins(config, &options.approvals, chat::Mode::Serve(listen))?;
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;
@@ -394,6 +398,14 @@ async fn serve(options: Options) -> Result<(), String> {
     }
     startup.withdraw();
     server.close().await;
+    // What the chats said is written before the process exits.
+    if durable {
+        runtime
+            .get::<DurableSessions>()
+            .close()
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     eprintln!("karaka: stopped");
     Ok(())
 }

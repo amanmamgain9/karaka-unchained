@@ -100,6 +100,8 @@ pub(crate) struct Inner {
     /// The runtime-context snapshot in effect, worked out from the log the
     /// agent was made with. Only the driver uses it.
     pub(crate) runtime_context: Mutex<RuntimeContextProjection>,
+    /// The model this agent's requests go to, when not the loop's.
+    pub(crate) selection: std::sync::RwLock<Option<karaka_agent::ModelSelection>>,
 }
 
 struct State {
@@ -137,6 +139,7 @@ impl LoopAgent {
         let runtime_context =
             RuntimeContextProjection::restore(&session.events(), &session.surface_nodes());
         let inner = Inner {
+            selection: std::sync::RwLock::new(None),
             runtime_context: Mutex::new(runtime_context),
             header_logged: AtomicBool::new(false),
             frames: FrameListeners::new(),
@@ -194,6 +197,31 @@ impl Agent for LoopAgent {
         for message in &dropped {
             self.inner.shared.inbox_hooks.discarded(self, message);
         }
+    }
+
+    /// Stops the running turn and keeps the queue: the switch is cancelled,
+    /// and the inbox isn't cleared.
+    fn interrupt(&self, cause: CancelCause) {
+        let state = self.inner.lock();
+        if let Some(switch) = &state.switch {
+            switch.cancel(cause);
+        }
+    }
+
+    fn select_model(&self, selection: karaka_agent::ModelSelection) {
+        *self
+            .inner
+            .selection
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selection);
+    }
+
+    fn model_selection(&self) -> Option<karaka_agent::ModelSelection> {
+        self.inner
+            .selection
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Every handle on this agent wraps one core, and the driver's own

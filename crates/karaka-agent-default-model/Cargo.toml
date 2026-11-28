@@ -1,0 +1,19 @@
+[package]
+name = "karaka-agent-default-model"
+description = "dsh's default model selection for agents created without one, and the call-config checks over the model registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The selection is the agent's.
+karaka-agent.workspace = true
+# Providers are the registry's routes.
+karaka-model.workspace = true
+# The plugin that puts it in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

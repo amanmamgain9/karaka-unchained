@@ -1362,7 +1362,7 @@ fn bad_plugin_rows_fail_at_startup_saying_where() {
     assert_eq!(
         with_file("- transport: stdio\n  serverName: fixture\n"),
         format!(
-            "karaka: {at}: plugin 1: unknown key \"transport\"; it may have id, name, disabled, config\n"
+            "karaka: {at}: plugin 1: unknown key \"transport\"; it may have id, name, disabled, inject, config\n"
         )
     );
     assert_eq!(
@@ -2078,5 +2078,261 @@ fn a_stored_chats_owner_is_restored_on_the_next_run() {
             "{request}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One JSON request to a `serve` at `origin`, with `credential`: the
+/// status and the body.
+fn http_json(origin: &str, path: &str, credential: &str, body: &Value) -> (u16, String) {
+    let body = body.to_string();
+    let mut socket = TcpStream::connect(origin).unwrap();
+    socket
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut answer = String::new();
+    socket.read_to_string(&mut answer).unwrap();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+    (
+        head.split(' ').nth(1).unwrap().parse().unwrap(),
+        body.to_owned(),
+    )
+}
+
+// `serve` with an `application-http` row: an application server creates a
+// chat, follows it, prompts it, and reads its history back, as Play This
+// Life's app does through `@karaka-ai/sdk`.
+#[test]
+fn serve_runs_an_application_chat_over_http() {
+    use std::io::BufRead;
+
+    let dir = scratch("serve-application");
+    std::fs::write(
+        dir.join("plugins.yml"),
+        "- name: server-auth\n  config:\n    applications: [{ id: app, chatCredential: APP_CHAT, toolCredential: APP_TOOLS }]\n\
+         - id: application-http\n  inject: [agentPresets, agentDefaultModel]\n  config: { path: /v1, handleQuestions: false }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("presets.yml"), "- id: main\n  name: Main agent\n").unwrap();
+    let (address, model) = serve(vec![streamed(&anthropic_text("Hello from Karaka."))]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_karaka"));
+    command
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in VARIABLES {
+        command.env_remove(name);
+    }
+    let nowhere = std::env::temp_dir().join(format!("karaka-cli-no-skills-{}", std::process::id()));
+    for name in ["DSH_HOME", "DSH_AGENTS_HOME", "DSH_BUNDLED_SKILL_DIR"] {
+        command.env(name, nowhere.join(name));
+    }
+    command
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", format!("http://{address}"))
+        .env("KARAKA_PORT", "0")
+        .env("KARAKA_PLUGINS", dir.join("plugins.yml"))
+        .env("KARAKA_PRESETS", dir.join("presets.yml"))
+        .env("KARAKA_SESSIONS", dir.join("sessions"))
+        .env("APP_CHAT", "chat-secret");
+    let mut child = command.spawn().expect("the binary runs");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    let origin = line
+        .trim()
+        .strip_prefix("karaka: listening on http://")
+        .unwrap_or_else(|| panic!("{line:?}"))
+        .to_owned();
+    let credential = "Bearer chat-secret";
+    let user = serde_json::json!({ "tenantId": "tenant", "userId": "user" });
+    let with = |extra: Value| {
+        let mut body = user.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    let (status, agents) = {
+        let mut socket = TcpStream::connect(&origin).unwrap();
+        socket
+            .write_all(format!("GET /v1/agents HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nConnection: close\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut answer = String::new();
+        socket.read_to_string(&mut answer).unwrap();
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+        (head.split(' ').nth(1).unwrap().to_owned(), body.to_owned())
+    };
+    assert_eq!(
+        (status.as_str(), agents.as_str()),
+        ("200", r#"[{"id":"main","name":"Main agent"}]"#)
+    );
+    assert_eq!(
+        http_json(
+            &origin,
+            "/v1/chats",
+            credential,
+            &with(serde_json::json!({ "agentId": "main", "chatId": "chat-1" }))
+        ),
+        (201, r#"{"chatId":"chat-1","agentId":"main"}"#.to_owned())
+    );
+    assert_eq!(
+        http_json(&origin, "/v1/chats", "Bearer wrong", &user).0,
+        401
+    );
+
+    // Follow the chat, then prompt it.
+    let body = user.to_string();
+    let mut follow = TcpStream::connect(&origin).unwrap();
+    follow
+        .write_all(
+            format!(
+                "POST /v1/chats/chat-1/stream HTTP/1.1\r\nHost: x\r\nAuthorization: {credential}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut events = std::io::BufReader::new(follow);
+    let mut next = || -> Option<Value> {
+        loop {
+            let mut line = String::new();
+            if events.read_line(&mut line).ok()? == 0 {
+                return None;
+            }
+            if let Some(data) = line.trim_end().strip_prefix("data: ") {
+                return Some(serde_json::from_str(data).unwrap());
+            }
+        }
+    };
+    let snapshot = next().unwrap();
+    assert_eq!(snapshot["type"], "snapshot");
+    let prompt = with(
+        serde_json::json!({ "requestId": "request-1", "content": [{ "type": "text", "text": "Say hello" }] }),
+    );
+    assert_eq!(
+        http_json(&origin, "/v1/chats/chat-1/messages", credential, &prompt),
+        (
+            202,
+            r#"{"chatId":"chat-1","requestId":"request-1","accepted":true,"duplicate":false}"#
+                .to_owned()
+        )
+    );
+    let mut text = String::new();
+    let mut kinds = Vec::new();
+    while let Some(event) = next() {
+        let kind = event["type"].as_str().unwrap().to_owned();
+        if kind == "text-delta" {
+            text.push_str(event["text"].as_str().unwrap());
+        }
+        kinds.push(kind.clone());
+        if kind == "turn-end" {
+            break;
+        }
+    }
+    assert_eq!(text, "Hello from Karaka.");
+    assert!(kinds.contains(&"assistant-message".to_owned()), "{kinds:?}");
+
+    let (status, history) = http_json(&origin, "/v1/chats/chat-1/history", credential, &user);
+    assert_eq!(status, 200);
+    let history: Value = serde_json::from_str(&history).unwrap();
+    let kinds: Vec<&str> = history["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["user-message", "assistant-message", "turn-end"]);
+    assert_eq!(
+        history["events"][1]["content"]["content"][0]["text"],
+        "Hello from Karaka."
+    );
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(status.success(), "{rest}");
+    let sent = model.join().expect("the model ran");
+    assert!(sent[0].contains("Say hello"), "{}", sent[0]);
+    // The chat is stored.
+    assert!(dir.join("sessions").read_dir().unwrap().next().is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_application_http_row_needs_stored_sessions() {
+    let dir = scratch("serve-application-unstored");
+    std::fs::write(
+        dir.join("plugins.yml"),
+        "- name: server-auth\n  config:\n    applications: [{ id: app, chatCredential: APP_CHAT, toolCredential: APP_TOOLS }]\n- name: '@karaka-ai/transport-http'\n",
+    )
+    .unwrap();
+    let plugins = dir.join("plugins.yml");
+    let output = karaka(
+        &["serve"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("KARAKA_PORT", "0".into()),
+            ("KARAKA_PLUGINS", plugins.display().to_string()),
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "karaka: KARAKA_PLUGINS ({}): the application-http row needs KARAKA_SESSIONS: a chat is acknowledged once it is stored\n",
+            plugins.display()
+        )
+    );
+    // And a server credential.
+    std::fs::write(
+        &plugins,
+        "- name: application-http\n  config: { path: /v1/ }\n",
+    )
+    .unwrap();
+    let output = karaka(
+        &["serve"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("KARAKA_PLUGINS", plugins.display().to_string()),
+        ],
+        "",
+    );
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "karaka: KARAKA_PLUGINS ({}): plugin 1 (application-http): transport-http path must start with / and have no trailing slash\n",
+            plugins.display()
+        )
+    );
+    std::fs::write(&plugins, "- name: application-http\n").unwrap();
+    let output = karaka(
+        &["serve"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("KARAKA_PLUGINS", plugins.display().to_string()),
+        ],
+        "",
+    );
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "karaka: KARAKA_PLUGINS ({}): plugin 1 (application-http): needs a server-auth row, for the application servers' credentials\n",
+            plugins.display()
+        )
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

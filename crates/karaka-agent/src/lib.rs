@@ -115,6 +115,27 @@ pub trait Agent: Send + Sync {
     /// cause for a turn counts. (dsh: `cancel`, without `keepInbox`.)
     fn cancel(&self, cause: CancelCause);
 
+    /// Stops the running turn, which ends with `cause`, and keeps every
+    /// queued message for the next. (dsh: `cancel` with `keepInbox: true`.)
+    ///
+    /// The default is [`cancel`](Self::cancel), for an agent with no queue
+    /// of its own to keep.
+    fn interrupt(&self, cause: CancelCause) {
+        self.cancel(cause);
+    }
+
+    /// Makes the agent's next requests go to `selection` instead of the
+    /// loop's default. (dsh: the agent's `ModelSelectionRef`, set by
+    /// `installModelSelection`.)
+    ///
+    /// The default ignores it, for an agent that calls no model.
+    fn select_model(&self, _selection: ModelSelection) {}
+
+    /// The selection [`select_model`](Self::select_model) made, if any.
+    fn model_selection(&self) -> Option<ModelSelection> {
+        None
+    }
+
     /// Resolves once the agent is idle: no driver is running its turns.
     /// (dsh: `whenIdle`.)
     ///
@@ -154,6 +175,16 @@ pub trait Agent: Send + Sync {
     fn scope(&self) -> ScopeChain {
         ScopeChain::session(self.id().clone())
     }
+}
+
+/// Where an agent's requests go: a provider route in the model registry,
+/// the model's id there, and the provider's own name for an effort level.
+/// (dsh: `ModelSelection`.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelSelection {
+    pub provider: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
 }
 
 /// The future [`Agent::when_idle`] returns. Boxed so the trait works as

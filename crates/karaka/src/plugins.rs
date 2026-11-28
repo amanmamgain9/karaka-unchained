@@ -44,6 +44,7 @@ use karaka_credentials::EnvCredentials;
 use karaka_mcp_application::{ApplicationCatalog, ApplicationConfig};
 use karaka_mcp_client::McpServerConfig;
 use karaka_server_auth::{BearerConfig, BearerServerAuth};
+use karaka_transport_http::{TransportConfig, normalize_base};
 use serde_json::{Map, Value};
 use yaml_rust2::YamlLoader;
 
@@ -60,6 +61,11 @@ pub struct GlobalPlugins {
     pub server_auth: Option<BearerConfig>,
     /// Every `mcp-application` row's endpoint.
     pub applications: Vec<ApplicationConfig>,
+    /// The `application-http` row's routes, and the warnings to show for
+    /// what of it isn't mounted yet.
+    pub transport: Option<(TransportConfig, Vec<String>)>,
+    /// The file, for errors that name it.
+    pub at: String,
 }
 
 /// The global plugins in the file at `path`.
@@ -84,7 +90,11 @@ pub fn parse(text: &str, at: &str) -> Result<GlobalPlugins, String> {
         None | Some(Value::Null) => Vec::new(),
         _ => return Err(format!("{at}: must be a list of plugin rows")),
     };
-    let mut plugins = GlobalPlugins::default();
+    let mut plugins = GlobalPlugins {
+        at: at.to_owned(),
+        ..GlobalPlugins::default()
+    };
+    let mut transport_at: Option<String> = None;
     // Where each single row and each endpoint was, for the checks across
     // rows.
     let mut catalog_at: Option<String> = None;
@@ -93,7 +103,9 @@ pub fn parse(text: &str, at: &str) -> Result<GlobalPlugins, String> {
     let empty = Value::Object(Map::new());
     for (index, row) in rows.iter().enumerate() {
         let place = format!("{at}: plugin {}", index + 1);
-        let row = object(row, &place, &["id", "name", "disabled", "config"])?;
+        // `inject` names a Cordis row's services; the kernel orders plugins
+        // by what they require, so it is read and ignored.
+        let row = object(row, &place, &["id", "name", "disabled", "inject", "config"])?;
         let name = match string(row, "name", &place)? {
             Some(name) => name,
             None => string(row, "id", &place)?.ok_or(format!("{place} needs a \"name\""))?,
@@ -141,16 +153,94 @@ pub fn parse(text: &str, at: &str) -> Result<GlobalPlugins, String> {
                     .push(ApplicationConfig::from_json(config, &place)?);
                 endpoints_at.push(place);
             }
+            "application-http" | "@karaka-ai/transport-http" => {
+                if transport_at.is_some() {
+                    return Err(format!(
+                        "{place}: only one application-http row may be given"
+                    ));
+                }
+                plugins.transport = Some(transport(config, &place)?);
+                transport_at = Some(place);
+            }
             other => {
                 return Err(format!(
                     "{place}: unknown plugin \"{other}\"; the global plugins may be mcp-client, \
-                     application-catalog, server-auth and mcp-application"
+                     application-catalog, server-auth, mcp-application and application-http"
                 ));
             }
         }
     }
     check_applications(&plugins, catalog_at.as_deref(), &endpoints_at)?;
+    if let Some(at) = &transport_at
+        && plugins.server_auth.is_none()
+    {
+        return Err(format!(
+            "{at}: needs a server-auth row, for the application servers' credentials"
+        ));
+    }
     Ok(plugins)
+}
+
+/// Reads an `application-http` row: Karaka's `handleQuestions`, `path`
+/// and `maxBodyBytes`, and its browser fields, checked as Karaka checks
+/// them, then left unmounted with a warning, as browser access is HTTP
+/// ingress step 4.
+fn transport(config: &Value, at: &str) -> Result<(TransportConfig, Vec<String>), String> {
+    const BROWSER: [&str; 6] = [
+        "browserPath",
+        "browserOrigins",
+        "browserAgentIds",
+        "browserMethods",
+        "browserEvents",
+        "browserHeartbeatMs",
+    ];
+    let keys: Vec<&str> = ["handleQuestions", "path", "maxBodyBytes"]
+        .into_iter()
+        .chain(BROWSER)
+        .collect();
+    let map = object(config, at, &keys)?;
+    let mut transport = TransportConfig::default();
+    if let Some(handle) = boolean(map, "handleQuestions", at)? {
+        transport.handle_questions = handle;
+    }
+    if let Some(path) = string(map, "path", at)? {
+        normalize_base(&path).map_err(|error| format!("{at}: {error}"))?;
+        transport.path = path;
+    }
+    match map.get("maxBodyBytes") {
+        None | Some(Value::Null) => {}
+        Some(value) => {
+            transport.max_body_bytes = value
+                .as_u64()
+                .and_then(|bytes| usize::try_from(bytes).ok())
+                .ok_or(format!("{at}: \"maxBodyBytes\" must be a whole number"))?;
+        }
+    }
+    let mut warnings = Vec::new();
+    if let Some(browser) = string(map, "browserPath", at)? {
+        let origins = strings(map, "browserOrigins", at)?.unwrap_or_default();
+        if origins.is_empty() {
+            return Err(format!("{at}: Browser transport requires explicit origins"));
+        }
+        let presets = strings(map, "browserAgentIds", at)?.unwrap_or_default();
+        if presets.is_empty() || presets.iter().any(|id| id.trim().is_empty()) {
+            return Err(format!(
+                "{at}: Browser transport requires explicit Agent presets"
+            ));
+        }
+        normalize_base(&browser).map_err(|error| format!("{at}: {error}"))?;
+        let base = &transport.path;
+        if browser == *base
+            || browser.starts_with(&format!("{base}/"))
+            || base.starts_with(&format!("{browser}/"))
+        {
+            return Err(format!("{at}: Browser and backend paths must be disjoint"));
+        }
+        warnings.push(format!(
+            "{at}: browser access at {browser} isn't mounted: it comes with HTTP ingress step 4"
+        ));
+    }
+    Ok((transport, warnings))
 }
 
 /// That every endpoint has credentials and a place in the catalog, and
@@ -248,11 +338,11 @@ mod tests {
             ("- config: {}".to_owned(), "plugins.yml: plugin 1 needs a \"name\""),
             (
                 "- name: shell".to_owned(),
-                "plugins.yml: plugin 1 (shell): unknown plugin \"shell\"; the global plugins may be mcp-client, application-catalog, server-auth and mcp-application",
+                "plugins.yml: plugin 1 (shell): unknown plugin \"shell\"; the global plugins may be mcp-client, application-catalog, server-auth, mcp-application and application-http",
             ),
             (
                 "- name: mcp-client\n  colour: red".to_owned(),
-                "plugins.yml: plugin 1: unknown key \"colour\"; it may have id, name, disabled, config",
+                "plugins.yml: plugin 1: unknown key \"colour\"; it may have id, name, disabled, inject, config",
             ),
             (
                 "- name: application-catalog".to_owned(),

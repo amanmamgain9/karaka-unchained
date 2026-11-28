@@ -62,6 +62,11 @@ karaka-identity.workspace = true
 karaka-webserver.workspace = true
 # The gate the ingress admits requests through, opened once it has started.
 karaka-startup.workspace = true
+# `serve`'s application routes, from an `application-http` row, with the
+# default model and the session query they use.
+karaka-transport-http.workspace = true
+karaka-agent-default-model.workspace = true
+karaka-session-query.workspace = true
 # Reads the presets file. The YAML 1.2 parser skill frontmatter is read
 # with, pinned to the same release.
 yaml-rust2 = { version = "=0.13.0", default-features = false }

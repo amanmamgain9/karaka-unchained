@@ -156,6 +156,26 @@ impl DurableSessions {
     ///
     /// If called outside a Tokio runtime.
     pub async fn open(&self, id: SessionId, cwd: Option<String>) -> Result<Session, DurableError> {
+        self.open_with(id, cwd, |header| header).await
+    }
+
+    /// As [`open`](Self::open), with a new session's header passed through
+    /// `prepare` first, such as to name the agent preset it is composed
+    /// from. (dsh: `agents.create`'s `meta`.)
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    ///
+    /// # Panics
+    ///
+    /// If called outside a Tokio runtime.
+    pub async fn open_with(
+        &self,
+        id: SessionId,
+        cwd: Option<String>,
+        prepare: impl FnOnce(SessionHeader) -> SessionHeader + Send,
+    ) -> Result<Session, DurableError> {
         let _one_at_a_time = self.opening.lock().await;
         if let Some(session) = self.store.get(&id) {
             if self.router.writer(&id).is_some() {
@@ -165,7 +185,7 @@ impl DurableSessions {
         }
         match self.persistence.open(&id, SessionAccess::Write).await {
             Ok(handle) => self.resume(id, handle).await,
-            Err(PersistenceError::NotFound(_)) => self.create(id, cwd).await,
+            Err(PersistenceError::NotFound(_)) => self.create(id, cwd, prepare).await,
             Err(error) => Err(error.into()),
         }
     }
@@ -227,10 +247,16 @@ impl DurableSessions {
         }
     }
 
-    async fn create(&self, id: SessionId, cwd: Option<String>) -> Result<Session, DurableError> {
+    async fn create(
+        &self,
+        id: SessionId,
+        cwd: Option<String>,
+        prepare: impl FnOnce(SessionHeader) -> SessionHeader,
+    ) -> Result<Session, DurableError> {
         let created_at = u64::try_from(Time::now().0).unwrap_or(0);
         let mut header = SessionHeader::new(id.clone(), created_at);
         header.cwd = cwd;
+        let header = prepare(header);
         let handle = self
             .persistence
             .create(header.clone(), CreateOptions::default())

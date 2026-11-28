@@ -1,0 +1,17 @@
+[package]
+name = "karaka-session-query"
+description = "A session's events, live or stored: the part of dsh's session query that observes one session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karaka-session.workspace = true
+karaka-session-persistence.workspace = true
+# The plugin that puts it in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
