@@ -1,0 +1,27 @@
+[package]
+name = "karaka-mcp-client"
+description = "An MCP client: JSON-RPC over stdio and Streamable HTTP, dsh's version negotiation, and its reconnecting connection supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The wire is JSON-RPC. `preserve_order`, so messages keep the key order the
+# SDK writes them in.
+serde_json = { workspace = true, features = ["preserve_order"] }
+# Tasks per transport and connection, process spawning, timers and channels.
+tokio = { workspace = true, features = ["rt", "process", "io-util", "sync", "time", "macros"] }
+# Streamable HTTP, through the HTTP client the model providers already use.
+reqwest.workspace = true
+# Its SSE responses, through the providers' parser.
+karaka-sse.workspace = true
+# A request's cancel, the signal the question and approval services take.
+karaka-fs.workspace = true
+# SIGTERM for a stdio server's close; already in the tree through tokio.
+libc = "0.2"
+
+[dev-dependencies]
+karaka-fs.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }

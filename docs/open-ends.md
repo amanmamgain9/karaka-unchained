@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after persona, the tool policy and presets in the binary (step 3 of presets).
+Last updated 2026-11-28, after the MCP client's protocol and connection (step A of mcp-client).
 
 ## Needs you
 
@@ -67,7 +67,10 @@ Last updated 2026-11-28, after persona, the tool policy and presets in the binar
   back the plugins that already started. Because of this:
   - the tool registry can't remove a tool, scoped ones included, so
     `todo_write` and `working_directory` stay registered for the
-    runtime's life; a restriction can be lifted;
+    runtime's life; a restriction can be lifted. The MCP client's tool
+    sync (step B) needs removal: each connection generation replaces the
+    previous one's tools, giving up after the reconnect budget clears
+    them, and disposal clears them. Step B adds tool unregistration;
   - `WorkingDirectory::stop()` and `UserQuestions::close()` have to be
     called by hand;
   - session-postgres will need a drain on dispose;
@@ -121,8 +124,10 @@ Last updated 2026-11-28, after persona, the tool policy and presets in the binar
   `warn`, such as skipped skill files and failed watches) for
   `SkillRegistry::warnings()`, until a logger takes them. dsh also warns
   `agent preset <id>: <reason>` when a preset breaks; Karaka keeps the
-  reason in the roster only. (Durable sessions, parts A and B; Skills,
-  steps A and B; Presets, step 2)
+  reason in the roster only. The MCP supervisor's lines (retries, giving
+  up, failed closes) go to its `ConnectionObserver::log`, which step B
+  has to route somewhere. (Durable sessions, parts A and B; Skills,
+  steps A and B; Presets, step 2; MCP client, step A)
 
 ### The agent loop
 
@@ -189,6 +194,29 @@ Last updated 2026-11-28, after persona, the tool policy and presets in the binar
   aren't ported, `skill`'s `Load skill <name>` among them. (The
   todo_write tool; Skills, step C)
 
+### MCP
+
+- **The modern era is partly ported.** A `2026-07-28` verdict works:
+  the envelope on every message, the HTTP headers it implies, the
+  `subscriptions/listen` change subscription, and the era's method set.
+  Its `input_required` results, `Mcp-Param-*` headers, the `tools/list`
+  response cache, and resuming `subscriptions/listen` aren't ported.
+  (MCP client, step A)
+- **The probe's corrective retry.** On an `UnsupportedProtocolVersion`
+  (-32022) naming a mutual modern revision, the SDK retries the probe
+  once. Karaka treats every JSON-RPC error as a 2025-era server; with one
+  modern revision there is nothing else to retry with yet. (MCP client,
+  step A)
+- **Streamable HTTP extras.** Resuming a POST's SSE stream with
+  `last-event-id` (the GET stream's resumption is ported),
+  `terminateSession` (DELETE), and the SDK's OAuth, DPoP and 401 re-auth
+  aren't ported. An application that needs per-request headers brings
+  its own transport through the `Transport` seam. (MCP client, step A)
+- **The rest of mcp-client** is step B: tool definitions and their
+  public names, the plugin and its `serverName` reservations, the
+  server's prompt section and resources, and the binary. (MCP client,
+  step A)
+
 ### Platform
 
 - **Windows.** `karaka-fs-local` and the JSONL session backend build on
@@ -219,7 +247,8 @@ From Play This Life's plugin list:
 
 - **Models and storage:** `agent-default-model` (needs dsh's settings
   service), `session-query-sqlite`, `storage`, `credentials-local`.
-- **The rest:** `mcp-client`, `session-reference`, `webserver`,
+- **The rest:** `mcp-client` (its protocol and connection are ported;
+  its tools and plugin are step B), `session-reference`, `webserver`,
   `agent-tool-presentation`, `deepseek-llm-api-extensions`.
 
 Karaka's own: `token-meter`, `compaction-basic`,

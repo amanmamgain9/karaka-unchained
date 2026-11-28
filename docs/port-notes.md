@@ -3637,3 +3637,231 @@ see its skills.
   requires `default`.
 - **A tool policy's names are checked at startup** against the global
   tools. Karaka's original takes application tools out first.
+
+## MCP client, step A: protocol and connection
+
+`karaka-mcp-client` ports the protocol half of dsh's
+`packages/mcp/mcp-client` (`connection.ts`, `transport.ts`), and the
+behaviour dsh gets from `@modelcontextprotocol/client` 2.2.0, which it
+builds on. Tool definitions, the plugin, the server's prompt section and
+resources, and the binary are step B.
+
+### The MCP layer: hand-rolled
+
+I wrote the client by hand: JSON-RPC 2.0 over newline-delimited stdio and
+over Streamable HTTP. It reuses reqwest, the HTTP client the providers use,
+and `karaka-sse`, the providers' SSE parser. I chose it over the `rmcp`
+crate for three reasons:
+
+- **What dsh observably does is the TypeScript SDK's, not just MCP's.** The
+  connection opens with a `server/discover` probe (`versionNegotiation:
+  { mode: 'auto' }`). On stdio that probe runs on a disposable twin
+  process, reaped before the real one starts. Whether the server reads
+  as 2025-era or modern follows the SDK's own rules: any JSON-RPC error is
+  2025-era; on stdio a close or a timeout is too; on HTTP a close or a
+  timeout fails the connection; 401, 403 and 5xx fail it with fixed
+  texts. dsh's supervisor tests turn on those rules and texts.
+  - `rmcp` negotiates and handshakes its own way, and owns its transports
+    and their child processes. Matching dsh would mean working around it
+    rather than through it.
+  - A hand-rolled client keeps every step visible: the probe, its
+    classification, the handshake, timeouts and `notifications/cancelled`,
+    `ping`, the close sequence, and the error texts.
+- **No new crates.** `libc`, for the stdio close's SIGTERM, is already in
+  the tree through tokio. `rmcp` would bring its macro crate, `schemars`
+  and its transport stack. I didn't evaluate a pinned `rmcp` release,
+  since there is no network here to fetch one.
+- **The seam step B and Karaka's application catalog need is small.** A
+  `Transport` trait, and a factory the supervisor calls once per attempt.
+  `mcp-application` builds its own HTTP transport with per-request
+  headers, and it plugs in there.
+
+### What is ported
+
+- **The SDK's constants** (`protocol.rs`):
+  - `LATEST_PROTOCOL_VERSION` is 2025-11-25, and `SUPPORTED_PROTOCOL_VERSIONS`
+    are the five 2025-era revisions, in order;
+  - the modern revision is 2026-07-28;
+  - the 60 s request timeout, and the 10 MiB stdio buffer;
+  - the JSON-RPC codes, the `_meta` envelope keys, and dsh's client info,
+    `dsh-mcp-client` 0.0.1.
+- **`McpError`** keeps a server's error message exactly as the server
+  wrote it, as the SDK's `ProtocolError` does: no `MCP error -32601:`
+  prefix. `display_with_name()` gives JavaScript's `String(error)`, `Name:
+  message`, which is what dsh logs.
+- **The client** (`client.rs`), one connection:
+  - **The probe.** `server/discover`, with id `server-discover-probe-N` and
+    the envelope. On stdio it runs on the transport's `sibling()` twin;
+    anything else probes in place, dropping every inbound message but the
+    probe's answer.
+  - **Classification.**
+    - A result offering 2026-07-28 with capabilities is modern.
+    - Any JSON-RPC error, a misshapen result, or another 4xx is legacy.
+    - 401, 403 and 5xx fail with the SDK's texts, and a network error
+      fails with `Version negotiation probe failed: …`.
+    - A close or a timeout is legacy on stdio. On HTTP it fails, with
+      `Connection closed during the version negotiation probe` or
+      `Version negotiation probe timed out after Nms`.
+  - **The 2025-era handshake.** `initialize`, id 0, offering 2025-11-25. A
+    reply outside the five 2025-era revisions fails with `Server's
+    protocol version is not supported: …`. Then come capabilities,
+    serverInfo and instructions, `set_protocol_version`, and
+    `notifications/initialized`.
+  - **The modern era.** The connection adopts the discover result: no
+    `initialize`, the envelope on every message, and only the era's
+    methods (`Method '…' is not supported by the negotiated protocol
+    version …`). Tool changes come through `subscriptions/listen` (id
+    `listen:0`). A missing ack is reported as `subscriptions/listen ack
+    timed out`, and doesn't fail the connection.
+  - **Requests.**
+    - Ids are numbers from 0.
+    - A timeout fails with `Request timed out`; a cancel through a
+      `karaka-fs` `AbortSignal` fails with `AbortError: This operation was
+      aborted`. Both are the SDK's `REQUEST_TIMEOUT`, and both send
+      `notifications/cancelled` with the SDK's reason, except for
+      `initialize`, and except on a modern HTTP connection.
+    - A close fails what is pending with `Connection closed`; a request
+      after it fails with `Not connected`.
+  - **`tools/list`.** One page for a cursor, or every page up to 64, and
+    none for a server without `tools`.
+  - **What the server sends unasked.**
+    - `ping` gets `{}` (2025 era only), and any other request
+      `-32601 Method not found`. On a modern stdio connection an inbound
+      request is dropped and reported.
+    - `notifications/tools/list_changed` calls the owner back only when the
+      server declares `tools.listChanged`, as the SDK registers its handler.
+  - **`shutdown()`** is dsh's `closeGeneration` with `waitForClose`. A
+    started transport has to report its close within 5 s
+    (`GENERATION_CLOSE_TIMEOUT_MS`). For one never started, a close that
+    succeeds is enough.
+- **stdio** (`stdio.rs`):
+  - **Spawning.** The command and args run directly, with no shell, in
+    `cwd` when given. The environment is dsh's `scrubbedParentEnv`: this
+    process's, minus names matching `KEY|PASSWORD|SECRET|TOKEN` in any case
+    and every `DSH_*`, plus the spec's `env`. stderr is inherited, as dsh's
+    servers' is; the probe twin's is discarded.
+  - **Framing.** Newline-delimited JSON. A line that isn't JSON is skipped,
+    as the SDK skips it. JSON that isn't JSON-RPC is reported, and reading
+    goes on. Output past 10 MiB is reported and ends the process.
+  - **Close.** Stdin ends; then SIGTERM after 2 s, and SIGKILL after another
+    2 s. The twin gets SIGTERM at once and SIGKILL after 1 s. The close is
+    reported once the process has exited and its output is read.
+- **Streamable HTTP** (`http.rs`):
+  - **Every POST** carries the configured headers, `accept:
+    application/json, text/event-stream`, the session id (except on
+    `initialize`), and the negotiated revision. A modern message also
+    carries `mcp-protocol-version`, `mcp-method` and `mcp-name`, from its
+    envelope.
+  - **The session id** is taken from `initialize`'s answer.
+  - **Replies:**
+    - 202 is drained;
+    - JSON is one message or an array;
+    - SSE is read through `karaka-sse`, which now also gives an event's
+      name and id and the `retry` field. Only unnamed and `message`
+      events are taken.
+    - A modern request's 400 with its JSON-RPC error is that error.
+    - Any other non-2xx is `Error POSTing to endpoint: <body>`, keeping
+      the status for the probe.
+  - **The GET stream** opens after `notifications/initialized`'s 202. A
+    405 ends it quietly. When it drops, it resumes with `last-event-id`,
+    at most twice, waiting `1000 × 1.5ⁿ` ms (at most 30 s) or the
+    server's `retry`.
+  - **Redirects are followed,** as `fetch` follows them by default.
+  - **`close()`** ends every stream and reports the close; it sends no
+    DELETE, as the SDK's doesn't.
+- **The supervisor** (`connection.rs`), ported from `connection.ts`:
+  - **`resolve_reconnect_policy(config, path)`** takes the raw JSON
+    `reconnect` config. It gives `RECONNECT_DEFAULTS` (on, 500 ms, 30 s,
+    10), with dsh's messages for an unknown key, an out-of-range delay
+    (up to `MAX_TIMER_DELAY_MS`), an initial delay over the ceiling, and
+    a non-positive-integer attempt cap.
+  - **Each attempt is a generation:** a fresh transport from the factory
+    and a fresh `Client`. Only the current generation acts, so a replaced
+    one's close or `list_changed` is ignored.
+  - **Syncs.** The `ConnectionObserver`'s syncs (step B's tool sync) run
+    one at a time, and the give-up's clear queues behind them.
+  - **Backoff.** The delay is `min(max, initial × 2ⁿ⁻¹)`, and an outage
+    shares one budget. Uptime past `max_delay_ms` resets the budget. Going
+    past the cap clears the tools and stops.
+  - **The supervisor's lines are dsh's:**
+    - `connection lost; reconnecting in …`;
+    - `connection failed; retrying in …`;
+    - `connection attempt failed: …`;
+    - `reconnected and re-synced tools …`;
+    - `giving up after …`;
+    - the two `reconnect is disabled` lines;
+    - `failed generation could not confirm transport closure …`, after
+      which no replacement starts;
+    - `tool list changed, re-syncing` and `tool re-sync failed: …`.
+  - **Startup.** `fail_on_startup_error` makes the first attempt's sync
+    strict, as dsh's `startupOpts` do. `ready()` gives the first attempt's
+    error, and step B's plugin decides whether that is fatal.
+  - **Instructions.** `### MCP server: <name>\n\n<text, trimmed at the
+    end>`. Over `max_instruction_bytes` (32768 by default) the attempt
+    fails with `<label>: server instructions exceed maxInstructionBytes
+    (N)`: dsh rejects the attempt, it doesn't truncate. The text is empty
+    while no generation is connected, and after disposal.
+  - **`client()`** gives the connected generation, or `<label>: server is
+    disconnected`.
+  - **`dispose()`:**
+    1. stops reconnecting;
+    2. closes the current generation, reporting a close it can't confirm;
+    3. waits for the attempt in flight and for the queued syncs;
+    4. clears the tools.
+
+### Tests
+
+- **34 new:**
+  - 10 protocol cases against a scripted in-process server (`tests/common`
+    is a `Transport` over a script, with knobs for a failing start,
+    failing closes, a close never reported, and a probe twin);
+  - 18 supervisor cases: from `reconnect.spec.ts`, and two scripted ones
+    from `negotiation-lifecycle.spec.ts`;
+  - 3 stdio cases against `tests/fixtures/server.sh`, a 2025-era server
+    needing only `sh` and `sed`. It records each process's start, whether
+    the previous one was still alive, and its requests;
+  - 2 HTTP cases against a small in-process HTTP server;
+  - 1 for `karaka-sse`'s fuller events.
+- **What the stdio round trip shows:**
+  - the probe twin is reaped before the session's process starts;
+  - the session never sees `server/discover`;
+  - tools and a call go through;
+  - disposal ends both processes.
+- **What the HTTP case shows:** the probe's headers, the session id from
+  `initialize` on every later request, an SSE reply, and the GET stream's
+  405.
+- **Skipped dsh tests:**
+  - **protocol.spec's resource and tool cases** (the shared resource
+    tools, cursors through them, the `mcp__` tool names, a cancelled
+    call's tool result): they need step B. `list_changed` and
+    cancellation are covered at the client level.
+  - **negotiation-lifecycle's "disposes during a probe without starting or
+    retaining a serving process":** it needs a fixture that holds the
+    probe open, which `server.sh` doesn't.
+  - **reconnect.spec's cases that go through `apply`** (load-time failure,
+    the plugin's dispose): step B.
+  - **The SDK-internal close races:** a resolving connect, and a transport
+    attaching after disposal. A client that owns its read loop covers
+    them in `a_close_during_the_handshake_registers_nothing`.
+  - **The e2e suite and `tool-definition.spec`:** step B.
+
+### Left out, or different
+
+- **Not ported** (all in open ends):
+  - the probe's corrective retry for -32022;
+  - the modern era's `input_required`, `Mcp-Param-*` headers, `tools/list`
+    cache, and listen resumption;
+  - resuming a POST's SSE stream;
+  - `terminateSession`;
+  - OAuth and re-auth;
+  - `callTool`'s output-schema check, which goes with the tool definitions
+    in step B.
+- **A spawn failure** says `spawn <command> <io error>`, where Node says
+  `spawn <command> ENOENT`, and it fails `start` without also reporting
+  through `onerror`.
+- **JSON that isn't a JSON-RPC message** is reported as `Invalid JSON-RPC
+  message: …`, where the SDK reports a zod error.
+- **No logger.** The supervisor's lines go to `ConnectionObserver::log`
+  (open ends).
+- **Generations replace each other's tools,** so step B needs the tool
+  registry to remove tools (open ends, "No teardown").
