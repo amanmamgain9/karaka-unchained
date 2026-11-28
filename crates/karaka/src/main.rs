@@ -1,10 +1,11 @@
 //! `karaka`, the Karaka runtime binary.
 //!
-//! For now it does two things, both through the agent loop, with one model
-//! provider and the retry plugin. `karaka ask <question>` asks one question
-//! in a turn of its own and prints the answer as it is written. `karaka
-//! chat` adds one tool and holds a conversation read line by line from
-//! stdin.
+//! For now it does three things, all through the agent loop, with one
+//! model provider and the retry plugin. `karaka ask <question>` asks one
+//! question in a turn of its own and prints the answer as it is written.
+//! `karaka chat` adds one tool and holds a conversation read line by line
+//! from stdin. `karaka serve` starts the same plugins with the webserver,
+//! and runs until it is stopped.
 
 mod answer;
 mod chat;
@@ -25,6 +26,7 @@ use karaka_agent::Agents;
 use karaka_kernel::Runtime;
 use karaka_model::{Model, ModelRegistry};
 use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSource};
+use karaka_webserver::{WebServer, WebServerPlugin};
 
 use crate::answer::Printer;
 use crate::chat::Options;
@@ -35,6 +37,7 @@ const USAGE: &str = "\
 Usage: karaka ask [options] <question...>
        karaka ask [options] [-]
        karaka chat [options]
+       karaka serve [--approval-policy <p>]
 
 ask asks a model one question and prints the answer as it is written.
 With no question, or with -, the question is read from stdin. A request
@@ -47,7 +50,12 @@ such as a rate limit, is tried again first. With KARAKA_SESSIONS set, the
 chat is stored there, and the next chat in the same session carries on
 the conversation.
 
-Both load skills: a directory holding a SKILL.md file, under the
+serve starts the same runtime with an HTTP server on KARAKA_HOST and
+KARAKA_PORT, says where on stderr, and runs until Ctrl-C or SIGTERM,
+which close every connection before it exits. No routes are mounted yet,
+so every request is answered 404.
+
+All three load skills: a directory holding a SKILL.md file, under the
 project's .dsh/skills or .agents/skills, or ~/.dsh/skills or
 ~/.agents/skills. The model is shown each skill's name and description
 and loads the ones a task needs; /name in a message loads that skill for
@@ -129,6 +137,11 @@ Settings come from the environment:
   KARAKA_PRESET       the default preset's id (optional; the file's first
                       otherwise)
   KARAKA_PLUGINS      a YAML file of global plugin rows (optional)
+  KARAKA_HOST         the address serve listens on: one IPv4 or IPv6
+                      address of this machine, never 0.0.0.0 or ::
+                      (optional; 127.0.0.1 otherwise)
+  KARAKA_PORT         the port serve listens on; 0 picks a free one
+                      (optional; 8787 otherwise)
   KARAKA_APPLICATION_ID, KARAKA_TENANT_ID, KARAKA_USER_ID
                       the owner of the session this run opens: an
                       application, a tenant and a user, all three or none
@@ -163,6 +176,8 @@ enum Command {
     AskFromStdin(Options),
     /// Hold a conversation read from stdin.
     Chat(Options),
+    /// Serve HTTP until stopped.
+    Serve(Options),
     /// Print the usage text: for `--help`, or a command line that isn't right.
     Usage,
     /// Print this, then the usage text.
@@ -174,7 +189,7 @@ fn parse_args(args: &[String]) -> Command {
     let Some((command, rest)) = args.split_first() else {
         return Command::Usage;
     };
-    if command != "ask" && command != "chat" {
+    if command != "ask" && command != "chat" && command != "serve" {
         return Command::Usage;
     }
     let (parsed, words) = match options(rest) {
@@ -186,6 +201,12 @@ fn parse_args(args: &[String]) -> Command {
         ("ask", [dash]) if dash == "-" => Command::AskFromStdin(parsed),
         ("ask", words) => Command::Ask(words.join(" "), parsed),
         ("chat", []) => Command::Chat(parsed),
+        ("serve", []) if parsed.preset.is_some() || !parsed.approvals.ask_before.is_empty() => {
+            Command::Invalid(
+                "serve takes no --preset or --ask-before: it opens no session, and has no terminal to ask on".into(),
+            )
+        }
+        ("serve", []) => Command::Serve(parsed),
         _ => Command::Usage,
     }
 }
@@ -241,6 +262,7 @@ async fn main() -> ExitCode {
             Ok(config) => chat::chat(config, options).await,
             Err(message) => Err(message),
         },
+        Ok(Command::Serve(options)) => serve(options).await,
         Ok(Command::Invalid(message)) => {
             eprintln!("karaka: {message}");
             eprint!("{USAGE}");
@@ -331,6 +353,41 @@ async fn ask(question: Option<String>, options: Options) -> Result<(), String> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .finish(ending.as_ref())
+}
+
+/// Starts the runtime with the webserver, says where it listens, and runs
+/// until Ctrl-C or SIGTERM, then closes every connection.
+async fn serve(options: Options) -> Result<(), String> {
+    let lookup = |name: &str| std::env::var(name).ok();
+    let config = Config::from_env(lookup)?;
+    let listen = config::listen(lookup)?;
+    let mut plugins = chat::loop_plugins(config, &options.approvals, false)?;
+    plugins.push(Box::new(
+        WebServerPlugin::new(listen).on_log(Arc::new(|line: &str| eprintln!("karaka: {line}"))),
+    ));
+    let runtime = Runtime::start(plugins)
+        .await
+        .map_err(|error| error.to_string())?;
+    let server = runtime.get::<WebServer>();
+    match server.origin() {
+        Ok(origin) => eprintln!("karaka: listening on {origin}"),
+        Err(_) => eprintln!(
+            "karaka: listening on {} port {}",
+            server.host(),
+            server.port()
+        ),
+    }
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("couldn't watch for SIGTERM: {error}"))?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("couldn't watch for Ctrl-C: {error}"))?;
+        }
+        _ = terminate.recv() => {}
+    }
+    server.close().await;
+    eprintln!("karaka: stopped");
+    Ok(())
 }
 
 /// The model registered under `route`, or an error that lists the routes
@@ -483,6 +540,33 @@ mod tests {
             parse(&["ask", "--ask-before=", "why"]),
             Command::Invalid("--ask-before needs a value".into())
         );
+    }
+
+    #[test]
+    fn serve_takes_only_the_approval_policy() {
+        assert_eq!(parse(&["serve"]), Command::Serve(Options::default()));
+        assert_eq!(
+            parse(&["serve", "--approval-policy", "never"]),
+            Command::Serve(Options {
+                approvals: Approvals {
+                    policy: ApprovalPolicy::Never,
+                    ask_before: Vec::new(),
+                },
+                preset: None,
+            })
+        );
+        assert_eq!(parse(&["serve", "now"]), Command::Usage);
+        for args in [
+            &["serve", "--preset", "a"][..],
+            &["serve", "--ask-before", "x"],
+        ] {
+            assert_eq!(
+                parse(args),
+                Command::Invalid(
+                    "serve takes no --preset or --ask-before: it opens no session, and has no terminal to ask on".into()
+                )
+            );
+        }
     }
 
     #[test]

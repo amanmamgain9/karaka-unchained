@@ -37,6 +37,8 @@ const VARIABLES: &[&str] = &[
     "KARAKA_APPLICATION_ID",
     "KARAKA_TENANT_ID",
     "KARAKA_USER_ID",
+    "KARAKA_HOST",
+    "KARAKA_PORT",
     // The credential references the application tests' plugin files name.
     "APP_CHAT",
     "APP_TOOLS",
@@ -1964,5 +1966,76 @@ fn a_bad_approval_policy_prints_why_and_the_usage() {
     assert!(
         stderr.starts_with("karaka: approval policy must be one of \"ask\" or \"never\"\nUsage:"),
         "{stderr}"
+    );
+}
+
+// `serve` listens where it says, answers 404 with no routes mounted, and
+// on SIGTERM closes and exits cleanly.
+#[test]
+fn serve_listens_until_sigterm() {
+    use std::io::BufRead;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_karaka"));
+    command
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in VARIABLES {
+        command.env_remove(name);
+    }
+    let nowhere = std::env::temp_dir().join(format!("karaka-cli-no-skills-{}", std::process::id()));
+    for name in ["DSH_HOME", "DSH_AGENTS_HOME", "DSH_BUNDLED_SKILL_DIR"] {
+        command.env(name, nowhere.join(name));
+    }
+    command
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+        .env("KARAKA_PORT", "0");
+    let mut child = command.spawn().expect("the binary runs");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    let origin = line
+        .trim()
+        .strip_prefix("karaka: listening on http://")
+        .unwrap_or_else(|| panic!("{line:?}"))
+        .to_owned();
+    let mut socket = TcpStream::connect(&origin).unwrap();
+    socket
+        .write_all(b"GET /anything HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut answer = String::new();
+    socket.read_to_string(&mut answer).unwrap();
+    assert!(answer.starts_with("HTTP/1.1 404 Not Found\r\n"), "{answer}");
+    assert!(answer.ends_with("\r\n\r\n"), "{answer}");
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = child.wait().unwrap();
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(status.success(), "{rest}");
+    assert_eq!(rest, "karaka: stopped\n");
+    assert!(TcpStream::connect(&origin).is_err());
+}
+
+#[test]
+fn serve_refuses_a_wildcard_host_before_listening() {
+    let output = karaka(
+        &["serve"],
+        &[
+            ("ANTHROPIC_API_KEY", "test-key".into()),
+            ("KARAKA_HOST", "0.0.0.0".into()),
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        text(&output.stderr),
+        "karaka: webserver: host \"0.0.0.0\" is an unspecified (wildcard) address, which is not supported: binding every interface would expose remote code execution to the network; bind one concrete IPv4 or IPv6 address of a local interface instead\n"
     );
 }

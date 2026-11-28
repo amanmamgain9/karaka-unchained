@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-application).
+Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the HTTP ingress).
 
 ## Needs you
 
@@ -37,8 +37,8 @@ Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-
 
 - **Working-directory keeps a lock per session forever.** Its `turns`
   map never shrinks. dsh's is freed with the session. This matters only
-  for a long-running server, so fix it with the webserver. (Working
-  directory)
+  for a long-running server, so fix it before `karaka serve` opens
+  sessions (HTTP ingress, step 3). (Working directory)
 - **Compare agents by `instance()`, not by `Arc`.** The loop gives tool
   calls a different `Arc` from the one `Agents::open` returns.
   `Agent::instance()` gives both the same identity. Nothing is wrong
@@ -193,7 +193,8 @@ Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-
   ported. The user-questions "time remaining" stream is a plain Rust
   stream for now. The preset registry's `list` and `select` remotes are
   Rust methods (`roster`, `select`), with dsh's error codes and details.
-  This comes with the webserver. (User questions; Presets, step 2)
+  This comes with the HTTP ingress, whose webserver is built. (User
+  questions; Presets, step 2)
 - **Late replies from the terminal.** The binary mounts the legacy
   `ask_user_question`, as dsh's bundles do, so its questions block and
   never go pending. With the timed tool, a pending question would need a
@@ -253,8 +254,8 @@ Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-
   and persists its records. Until then a host sets each owner on
   `InMemorySessionOwners` before opening the session's agent; the binary
   sets one owner, from `KARAKA_APPLICATION_ID`, `KARAKA_TENANT_ID` and
-  `KARAKA_USER_ID`, on the one session a run opens. It comes with the
-  app ingress and the webserver. (MCP application, steps A and B)
+  `KARAKA_USER_ID`, on the one session a run opens. It is step 2 of the
+  HTTP ingress. (MCP application, steps A and B)
 - **Inbound server auth is unused.** `server-auth` rows are read, and
   their `chatCredential` references checked, but nothing calls
   `authenticate` until there is an ingress to authenticate. (MCP
@@ -269,6 +270,41 @@ Last updated 2026-11-28, after the MCP application in the binary (step B of mcp-
   the transport's `HeaderSource` will need the request's metadata. It
   takes none, as Karaka's `headers(signal)` takes none. (MCP
   application, step A)
+
+### HTTP ingress
+
+- **The plan.** Step 1, the webserver and `karaka serve`, is built. Still
+  to do:
+  - step 2, Karaka's identity lifecycle (`identity/src/index.ts`,
+    `records.ts`, `session-reference.ts`) and `transport-http`'s
+    `karakaStartup`, the admission gate (`STARTING` until every plugin
+    is up);
+  - step 3, Karaka's application chat routes (`transport-http`'s
+    `index.ts`, `application.ts`, `application-state.ts`, `http.ts`), to
+    `@karaka-ai/sdk`'s wire contract byte for byte, with the
+    `agentDefaultModel`, `sessionQuery` and `sessionPersistence` they
+    inject decided then;
+  - step 4, browser access: `browser-auth` (ES256 JWT) and
+    `transport-http`'s `browser*.ts` routes and WebSocket.
+
+  (HTTP ingress, step 1)
+- **The webserver's TLS listener.** dsh's `tls` (`certFile`, `keyFile`),
+  read once before binding, and `protocol` `https:`, aren't ported.
+  Karaka's own profile sets no `tls`, and a deployment terminates TLS in
+  front of it. `tokio-rustls` is in the tree already if it's wanted.
+  (HTTP ingress, step 1)
+- **The webserver's gzip.** dsh's `compression: gzip`, its level and
+  threshold, and its eligibility rules (no SSE, ranges, `no-transform`)
+  aren't ported. dsh's default is none, and Karaka's profile keeps it.
+  (HTTP ingress, step 1)
+- **Index injections and taps.** dsh's `tapIndex`, `applyIndexTaps`,
+  `collectIndexInjections`, `renderIndex` and the
+  `webserver/index-inject` event serve the web shell's SPA, which Karaka
+  has none of. The fallback seat is ported. (HTTP ingress, step 1)
+- **Node's other timeouts.** The 60-second header timeout is
+  `node:http`'s `headersTimeout`. Its 5-second idle keep-alive timeout
+  and 300-second `requestTimeout` for a whole request aren't set: hyper
+  has no setting of either kind. (HTTP ingress, step 1)
 
 ### Platform
 
@@ -299,8 +335,9 @@ From Play This Life's plugin list:
   service), `session-query-sqlite`, `storage`, `credentials-local` (its
   store and `.env` layers; the process environment is
   `karaka-credentials`).
-- **The rest:** `mcp-resources`, `session-reference`, `webserver`,
-  `agent-tool-presentation`, `deepseek-llm-api-extensions`.
+- **The rest:** `mcp-resources`, `session-reference`,
+  `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
+  `transport-http` and `browser-auth` (HTTP ingress, steps 2 to 4).
 - **Play This Life's own global rows** that `KARAKA_PLUGINS` can't name
   yet, such as `browser-auth` and `delegated-access`; it knows
   `mcp-client`, `application-catalog`, `server-auth` and

@@ -58,6 +58,8 @@ karaka-mcp-application.workspace = true
 karaka-server-auth.workspace = true
 karaka-credentials.workspace = true
 karaka-identity.workspace = true
+# `karaka serve`: the HTTP server the ingress routes mount on.
+karaka-webserver.workspace = true
 # Reads the presets file. The YAML 1.2 parser skill frontmatter is read
 # with, pinned to the same release.
 yaml-rust2 = { version = "=0.13.0", default-features = false }
@@ -71,4 +73,5 @@ httpdate.workspace = true
 # `rt-multi-thread` is the executor a server will need, so the binary starts
 # on it now. `macros` is for `#[tokio::main]`.
 # `sync` for handing a line of stdin to whoever asked for it.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+# `signal` for `serve`'s Ctrl-C and SIGTERM.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal"] }

@@ -13,6 +13,7 @@ use karaka_identity::{ApplicationId, ApplicationOwner, TenantId, UserId};
 use karaka_kernel::DynPlugin;
 use karaka_model::{Effort, ModelsPlugin, RetryPolicyConfig};
 use karaka_openai::{OpenAiConfig, OpenAiPlugin};
+use karaka_webserver::WebServerConfig;
 
 /// Used when `KARAKA_MODEL` isn't set and the provider is Anthropic.
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5-5";
@@ -304,6 +305,26 @@ impl Config {
             owner,
         })
     }
+}
+
+/// Where `serve` listens: `KARAKA_HOST` and `KARAKA_PORT`, by default
+/// `127.0.0.1` and 8787, as Karaka's own profile sets its webserver row.
+///
+/// # Errors
+///
+/// A host that isn't one concrete address, in dsh's words, or a port that
+/// isn't one.
+pub fn listen(lookup: impl Fn(&str) -> Option<String>) -> Result<WebServerConfig, String> {
+    let var = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
+    let host =
+        var("KARAKA_HOST").map_or_else(|| "127.0.0.1".to_owned(), |host| host.trim().to_owned());
+    let port = match var("KARAKA_PORT") {
+        None => 8787,
+        Some(text) => text.trim().parse::<u16>().map_err(|_| {
+            format!("KARAKA_PORT is \"{text}\", but it must be a port number from 0 to 65535")
+        })?,
+    };
+    WebServerConfig::new(host, port)
 }
 
 /// The value matching `text` among `options`, for a variable that takes one
@@ -729,6 +750,31 @@ mod tests {
             ])
             .unwrap_err(),
             "KARAKA_MCP_SERVERS is no longer read: list its servers as mcp-client rows in the file KARAKA_PLUGINS names"
+        );
+    }
+
+    #[test]
+    fn serve_listens_on_karakas_defaults_or_the_variables() {
+        use super::listen;
+        let read = |vars: &'static [(&'static str, &'static str)]| {
+            listen(move |name| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            })
+        };
+        let default = read(&[]).unwrap();
+        assert_eq!((default.host(), default.port()), ("127.0.0.1", 8787));
+        let set = read(&[("KARAKA_HOST", "::1"), ("KARAKA_PORT", "0")]).unwrap();
+        assert_eq!((set.host(), set.port()), ("::1", 0));
+        assert_eq!(
+            read(&[("KARAKA_PORT", "70000")]).unwrap_err(),
+            "KARAKA_PORT is \"70000\", but it must be a port number from 0 to 65535"
+        );
+        assert!(
+            read(&[("KARAKA_HOST", "0.0.0.0")])
+                .unwrap_err()
+                .contains("is an unspecified (wildcard) address")
         );
     }
 }

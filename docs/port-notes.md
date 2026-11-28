@@ -4511,3 +4511,211 @@ Application MCP x could not start: …`.
 - **One owner per run,** from the environment (open ends: the identity
   lifecycle).
 - **An endpoint without presets fails the start.**
+
+## HTTP ingress, step 1: the webserver
+
+This step ports dsh's shared webserver, `@deepseek-ai/dsh-host-webserver`
+at `dsh-v0.2.1-rc.2` (`host/webserver/src/index.ts` and `injections.ts`,
+708 lines), as `karaka-webserver`, and adds `karaka serve`. Steps 2 to 4
+(identity, the application routes, browser access) mount on it. Their
+sources were read for fit, not ported.
+
+### What dsh's webserver is, and isn't
+
+The brief listed things a webserver might own. dsh's owns few of them:
+
+- **Owned by dsh's webserver:**
+  - the listen config, `host` and `port`, with no defaults and no
+    environment variables of its own;
+  - exact and prefix routes;
+  - exact-path upgrade routes;
+  - one fallback seat;
+  - optional TLS and gzip;
+  - index injections for the web shell;
+  - `port`, `host`, `protocol` and `getOrigin`;
+  - a disposal that closes every connection.
+- **Not in it:**
+  - **Body size limits.** Karaka's `transport-http` owns `maxBodyBytes`,
+    in its own `readObject`.
+  - **Trusted proxies.** `ipaddr.js` is used only to judge the bind
+    address. `protocol` is documented as never read from a forwarded
+    header.
+  - **CORS.** `transport-http`'s browser routes check `browserOrigins`
+    themselves.
+  - **JSON error bodies.** A miss is `404` and a failed handler `400`,
+    both with no body.
+  - **A health route.** Neither dsh nor Karaka has one, so none is added.
+- **Defaults.** Karaka's profile (`packages/karaka/agent/cordis.patch.yml`)
+  gives the row `host: KARAKA_HOST ?? '127.0.0.1'` and
+  `port: KARAKA_PORT ?? 8787`, with no TLS or compression. The binary
+  takes those.
+
+### Framework: hyper, not axum
+
+dsh's routing is its own: exact over the whole table, then the longest
+prefix, then the fallback, with a handler owning the whole response.
+axum's router matches differently (nesting, path parameters, method
+routing), so it would have to be worked around. hyper alone is a direct
+fit:
+
+- `hyper::server::conn::http1` serves each connection with
+  `.with_upgrades()`;
+- a service function does dsh's `match`;
+- `hyper::upgrade::on` hands an upgraded connection over.
+
+**Dependency cost: no new crates.** `hyper` 1.12.0, `hyper-util` 0.1.21,
+`http` 1.5.0, `http-body` 1.1.0, `http-body-util` 0.1.5 and `bytes`
+1.12.1 are all in `Cargo.lock` already, through reqwest. They are pinned
+exactly (`=`) in the workspace to those locked versions, so their age is
+the tree's. The only new code compiled is hyper's `server` and `http1`
+features, whose one extra dependency, `httpdate`, is in the tree too. The
+lockfile gains only the `karaka-webserver` entry. `libc`, already used,
+gives `if_nametoindex` for a zone named by its interface.
+
+### The crate
+
+- **Bind addresses** (`address.rs`):
+  - `check_host` keeps dsh's two errors: `is not a concrete IPv4 or IPv6
+    address literal`, and the wildcard refusal, word for word, with the
+    host quoted as `JSON.stringify` quotes it.
+  - `is_wildcard_host`, `is_loopback_host`, `normalize_bind_address` and
+    `bind_url_host` are dsh's.
+  - dsh rewrites a dotted-quad IPv6 tail before `ipaddr.js` parses it, so
+    `::0.0.0.1` is `::1`. Rust's `Ipv6Addr` already reads a tail that
+    way, and mapped addresses become IPv4 via `to_ipv4_mapped`.
+  - A `%zone` is allowed on IPv6 only, as `node:net`'s `isIP` allows it.
+    It becomes the socket's scope id, by number or by interface name.
+- **`WebServerConfig::new(host, port)`** validates the host; the port is
+  a `u16`. `origin_at(port)` gives dsh's `getOrigin` text, or its zone
+  error.
+- **`WebServer::listen`** binds at once and serves. A bind failure, such
+  as a port in use, fails with `webserver: listen <address>: <OS
+  error>`, which fails the plugin's start, as dsh's fails the fiber.
+  `WebServerPlugin` provides the port; its setup is the bind.
+- **Routes:**
+  - `register(WebRoute)` and `register_upgrade(UpgradeRoute)` refuse a
+    duplicate with dsh's `webserver: duplicate exact route "/p"`
+    (`prefix`, `upgrade`).
+  - `register_fallback` refuses a second owner with dsh's `webserver:
+    fallback already registered`.
+  - Each returns a `RouteRegistration` to `remove()`. A removal is keyed
+    by registration, so a stale one can't remove a later route on the
+    same path; dsh's disposer deletes by path.
+- **Matching** is dsh's `match`, on the pathname as `new URL(req.url,
+  'http://x').pathname` reads it:
+  - a `//host` start is an authority;
+  - `.` and `..` segments, `%2e` spellings included, are resolved;
+  - the query is dropped.
+
+  So `/api/../admin` can't reach `/api`'s prefix route.
+- **Handlers.** A `Handler` returns a `Response` whose body is `Body`, a
+  boxed body:
+  - `body::full` and `body::empty` for whole bodies;
+  - `body::channel(capacity)` for a body written as it happens, which is
+    how step 3's SSE will stream. Its `BodySender::send` waits on a full
+    queue, as a Node write waits for `drain`. It fails with `Closed` once
+    the peer is gone, and `closed()` resolves then.
+
+  A handler's error answers `400` with no body and is logged, and the
+  server carries on, as dsh's guard does. An error in a body already
+  under way cuts the connection, as dsh destroys a response whose
+  headers are out.
+- **Upgrades.**
+  - A request with an `Upgrade` header and `Connection: upgrade` goes to
+    the upgrade table, matched exactly, as `node:http`'s `upgrade` event
+    does.
+  - With no route, or when the handler fails, the connection is closed
+    with nothing written, as dsh destroys the socket.
+  - A handler answers `101` and passes `hyper::upgrade::on(&mut request)`
+    to `Upgrades::adopt`. The server runs the connection as a task of
+    its own, which it aborts on close (dsh's `upgradedSockets`).
+  - To refuse, the handler answers any other status, which is how step
+    4's `refuse(socket, 403)` maps.
+  - A WebSocket library such as `tokio-tungstenite` (step 4, not yet a
+    dependency) takes the `TokioIo<Upgraded>` the task is given.
+- **Close.** `WebServer::close()` stops accepting, then aborts every
+  connection's task and every adopted upgrade's, and waits for them. It
+  cuts responses in flight, as dsh's `closeAllConnections` and its
+  socket tracking do. The kernel has no teardown, so the binary calls it.
+- **HTTP/1.1 only,** as `node:http` serves. The header timeout is 60
+  seconds, `headersTimeout`'s default.
+- **Warnings** (a failed handler, an accept error) go to an optional
+  `on_log`, as `ctx.logger.warn`.
+
+### How steps 2 to 4 fit
+
+- **Step 3**'s routes are a `prefix` route at the backend base.
+  - Its body reading caps `Incoming` with `http_body_util::Limited`, for
+    `maxBodyBytes`.
+  - Its JSON answers are `body::full`, and its SSE a `body::channel`.
+  - A peer leaving shows as hyper dropping the handler's future, or as
+    `Closed` on the channel. That is what `transport-http` uses
+    `response.once('close')` for.
+- **Karaka's `inject: [karakaStartup]` and `503 STARTING`.** The server
+  listens during its setup, and routes registered by later plugins
+  answer from then on. Requests before that are 404, as in dsh. Step 2's
+  startup gate can be a flag the binary sets once `Runtime::start`
+  returns, which the routes check.
+- **Step 4**'s socket is an upgrade route at `<browser>/socket`.
+
+### The binary
+
+- **`karaka serve [--approval-policy <p>]`** starts `ask`'s and `chat`'s
+  plugins plus `WebServerPlugin` on `KARAKA_HOST` and `KARAKA_PORT`
+  (defaults `127.0.0.1` and 8787; 0 picks a port).
+  - It writes `karaka: listening on <origin>` to stderr.
+  - On Ctrl-C or SIGTERM it closes the server, writes `karaka: stopped`,
+    and exits 0.
+  - `--preset` and `--ask-before` are refused: serve opens no session,
+    and has no terminal to ask on.
+  - With no routes mounted yet, every request is a 404.
+- **`KARAKA_PORT`** that isn't a port fails with `KARAKA_PORT is "x",
+  but it must be a port number from 0 to 65535`. A bad host fails with
+  dsh's error.
+- The usage text has the command and both variables. `tokio`'s `signal`
+  feature is added to the binary.
+
+### Tests
+
+- **14 new.**
+- **Ported specs** from `webserver.spec.ts`, against a real loopback
+  listener (10 cases):
+  - literals accepted, zones included;
+  - every wildcard spelling refused, and non-literals;
+  - loopback classification;
+  - dotted-quad tails;
+  - URL host forms and the zone origin error;
+  - routes, precedence, methods, the fallback seat, `400` containment,
+    duplicates and removal;
+  - upgrades: exact match with a query, a duplicate refused, a failed
+    handler and an unrouted upgrade closed, the server serving on, and
+    close closing the upgraded connection and the listener;
+  - a port in use.
+- **New cases:**
+  - pathname resolution;
+  - a channel body reaching the client before it ends;
+  - `karaka serve`: a 404 at the origin it printed, then SIGTERM, a clean
+    exit and a closed port;
+  - `serve` refusing a wildcard host;
+  - the listen settings;
+  - `serve`'s options.
+- **Skipped:**
+  - gzip;
+  - the four TLS cases;
+  - index injections and taps;
+  - the Loader's failed-fiber cases, which here are a failed start;
+  - "no origin before binding", since a `WebServer` exists only once
+    bound;
+  - "closes the listener when disposal lands while the TLS material is
+    still being read", which is TLS.
+
+### Where it differs from dsh
+
+- **Not ported:** TLS, gzip, index injections and taps, and Node's
+  keep-alive and request timeouts (open ends).
+- **A handler returns its response** rather than writing a
+  `ServerResponse`, and an upgrade handler answers with a response rather
+  than writing to the raw socket.
+- **A route's removal is keyed by registration,** not by path.
+- **A failed upgrade handler gets no response at all.** That is dsh's
+  destroy. A refusal must be an answered status.

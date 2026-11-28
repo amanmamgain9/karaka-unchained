@@ -1,0 +1,28 @@
+[package]
+name = "karaka-webserver"
+description = "dsh's shared HTTP server: exact, prefix, upgrade and fallback routes that plugins mount, on one HTTP/1.1 listener"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The HTTP/1.1 server, through the crates reqwest already pulls in; only
+# their server halves are new code (see the workspace's pins).
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "macros", "time"] }
+# dsh's errors quote a host as JSON does.
+serde_json.workspace = true
+# `if_nametoindex`, for an IPv6 zone named by its interface.
+libc = "0.2"
+# The plugin that puts the server in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "macros", "time", "io-util"] }

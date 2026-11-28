@@ -377,6 +377,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -674,6 +675,7 @@ dependencies = [
  "karaka-tools",
  "karaka-user-approval",
  "karaka-user-questions",
+ "karaka-webserver",
  "karaka-working-directory",
  "serde_json",
  "tokio",
@@ -1129,6 +1131,22 @@ dependencies = [
  "karaka-system-prompt",
  "karaka-tools",
  "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "karaka-webserver"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "karaka-kernel",
+ "libc",
  "serde_json",
  "tokio",
 ]
