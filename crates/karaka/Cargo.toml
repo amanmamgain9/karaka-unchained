@@ -60,6 +60,8 @@ karaka-credentials.workspace = true
 karaka-identity.workspace = true
 # `karaka serve`: the HTTP server the ingress routes mount on.
 karaka-webserver.workspace = true
+# The gate the ingress admits requests through, opened once it has started.
+karaka-startup.workspace = true
 # Reads the presets file. The YAML 1.2 parser skill frontmatter is read
 # with, pinned to the same release.
 yaml-rust2 = { version = "=0.13.0", default-features = false }

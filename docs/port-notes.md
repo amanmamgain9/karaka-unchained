@@ -4719,3 +4719,172 @@ gives `if_nametoindex` for a zone named by its interface.
 - **A route's removal is keyed by registration,** not by path.
 - **A failed upgrade handler gets no response at all.** That is dsh's
   destroy. A refusal must be an answered status.
+
+## HTTP ingress, step 2: identity and startup
+
+This step ports Karaka's `KarakaIdentity` (`identity/src/index.ts`,
+`records.ts`) into `karaka-identity`, and `transport-http`'s
+`karakaStartup` (`startup.ts`) as `karaka-startup`. `ask` and `chat`
+admit their owner through the real lifecycle now. `session-reference.ts`
+waits on dsh's session-reference resolver (open ends).
+
+### Where owners live: nowhere durable
+
+Karaka's authority is process-local over unchanged dsh sessions, and its
+package says so. The owner is in neither the session header nor any
+session event:
+
+- a chat is reserved, bound and acknowledged in memory;
+- after a restart the ingress calls `restore(id, owner)` for a stored
+  root, once the application has verified access;
+- children inherit through `parentSession`.
+
+So Play This Life's stored sessions read exactly as before, and nothing
+is ported for storage. The binding a record keeps is the header's
+immutable fields: `id`, `createdAt`, `cwd`, `parentSession`, `isSeeded`,
+`origin`, `delegationDepth` (0 when absent) and `agentPreset`. A session
+whose header differs is "not the one bound".
+
+### `KarakaIdentity` (`authority.rs`, `records.rs`)
+
+- **`with_chat_lock(id, operation)`** runs operations on one chat in
+  order. Each chat has a FIFO `tokio` mutex, dropped once no one waits.
+  Other chats run meanwhile. A closed authority refuses.
+- **`reserve`, `bind`, `mark_ready`, `restore`, `authorize`,
+  `authorize_session`, `owner_of_session` (`ownerOf`), `owner_of_id`,
+  `owner_of_cached_session` (`ownerOfCached`) and `close`** keep Karaka's
+  logic branch for branch.
+  - `reserve` returns `Reservation::Create` or `Reservation::Existing`.
+  - A failed, unpublished attempt may be reserved again.
+  - `bind` checks a child's parent owner.
+  - `mark_ready` gives a child that inherits its owner no record.
+  - A lookup refuses a reserved record.
+  - The lineage walk refuses a cycle.
+- **Every `IdentityError` text and code is Karaka's:**
+  - `Chat is not owned by this caller`
+  - `Chat has no bound authority`
+  - `Acknowledged chat data is missing`
+  - `Chat parent is unavailable`
+  - `Chat parent has no application owner`
+  - `Chat has no durability provider`
+  - `Flushed chat data is unavailable`
+  - `Chat source does not match its authority`
+  - `Chat is unavailable for restoration`
+  - `Only application root chats can restore ownership`
+  - `Chat has no application authority`
+  - `Cyclic chat lineage`
+  - `Karaka authority is closed`
+- **The seams.**
+  - It observes a session through `SessionStore::get`, then
+    `SessionPersistence::stat`.
+  - `mark_ready` flushes through `SessionStore::flush`, whose `false` is
+    Karaka's "no durability provider", then checks the stored header.
+  - Both seams exist, so nothing was missing.
+  - Persistence is optional (`KarakaIdentityPlugin::new` versus
+    `with_persistence`). Without it, only live sessions are observed, and
+    a chat can't be acknowledged or restored, which Karaka's messages say.
+- **Session ids, and sessions.** Karaka's methods take a `Session`; the
+  Rust ones take `&Session` where Karaka takes one, and `&SessionId`
+  where it takes an id.
+  - `SessionOwners` is now implemented by `KarakaIdentity` too. It takes
+    a session id: a live session's own lineage, otherwise what is
+    observed or seen of it.
+  - mcp-application reads it unchanged.
+  - `InMemorySessionOwners` stays, for hosts and tests without the
+    lifecycle.
+- **`KarakaIdentityPlugin`** provides `KarakaIdentity`, and the same as
+  `dyn SessionOwners`. It requires the session store, and the
+  persistence port with `with_persistence`. It scans nothing at start,
+  as Karaka's mounts "without startup Session enumeration". The kernel
+  has no teardown, so `close` is the host's.
+- **Departures:**
+  - A failed flush or `stat` is an `IdentityError` with code
+    `unavailable` and the storage error's message. Karaka lets the
+    storage error itself propagate, and `IdentityError` here carries
+    only a code and a message.
+  - `close` waits for each chat's admitted operations by taking its lock
+    in turn, where Karaka awaits its promise chains.
+
+### `karakaStartup` (`karaka-startup`)
+
+- Karaka's gate waits for the launcher's `appReady`, then audits the
+  Loader: every enabled entry must be active, or it logs `Karaka startup
+  failed:` and exits 1.
+- The kernel starts every plugin or fails as a whole, so
+  `Runtime::start` returning is the audit passing. A failed plugin fails
+  the start with its own error.
+- `KarakaStartup` is closed until the host `commit`s it, and `withdraw`
+  closes it again for shutdown. `KarakaStartupPlugin` provides it.
+- `STARTING_STATUS` (503), `STARTING_CONTENT_TYPE` and `STARTING_BODY`
+  (`{"code":"STARTING","message":"Application is starting"}`, as
+  `JSON.stringify` writes it) are what step 3's routes answer while it
+  is closed.
+- `karaka serve` mounts it, commits once `Runtime::start` returns, and
+  withdraws before closing the server.
+
+### The binary
+
+`ask` and `chat` admit the owner of the three variables through the
+lifecycle, in `chat::admit`, under `with_chat_lock` and before the agent
+opens:
+
+- **With `KARAKA_SESSIONS` and the chat already stored,** it calls
+  `restore`. The operator who set the variables is trusted, since no
+  application is there to verify access (open ends).
+- **Otherwise** it calls `reserve`, then makes the session. A chat with
+  `KARAKA_SESSIONS` makes it through `DurableSessions::open`. `ask`, and
+  `chat` without storage, make it as the loop's `open` would, named for
+  its preset through the composer. Then it calls `bind`, and with storage
+  `mark_ready`, which flushes and checks the stored header.
+- **Without storage,** the record stays bound, which is enough for every
+  lookup.
+- **Errors** read `the session's owner: <Karaka's message>`.
+
+Two changes went with it:
+
+- `KarakaIdentityPlugin` replaces `SessionOwnersPlugin`, with
+  persistence when `chat` has `KARAKA_SESSIONS`.
+- The JSONL and durable-sessions plugins now sit right after the session
+  projections in `loop_plugins`, not at the end of the list. At the end,
+  the authority, which requires the persistence port, and with it the
+  application endpoint, started after the presets, whose policy then saw
+  an unsettled catalog. The new CLI case caught it, and the fragility is
+  an open end.
+
+### Tests
+
+- **19 new.**
+- **Ported** from `authority.spec.ts`, `records.spec.ts` and
+  `plugin.spec.ts` (16 cases), with a stored-header stand-in for
+  persistence and a flush listener that stores the live header, as
+  Karaka's `helpers.ts` does:
+  - foreign owner components;
+  - a restart needing explicit restoration, with nothing opened or listed;
+  - missing, unpublished and child sessions not restored;
+  - child inheritance and a conflicting reservation;
+  - an explicitly reserved child;
+  - changed stored or live fields;
+  - a stored header disagreeing with a live session;
+  - per-chat serialization through a failure;
+  - reservations failing closed, and a retry;
+  - missing acknowledged data and bad bindings;
+  - cyclic lineage;
+  - the three `mark_ready` failures;
+  - close waiting for admitted operations;
+  - both record cases;
+  - the plugin.
+
+  Sessions Karaka makes with `Session.create` outside the store are made
+  in a second store here.
+- **From `startup.spec.ts`, 2:** the gate opens only on commit and
+  closes on withdrawal; a failed plugin fails the start, so nothing
+  commits.
+- **CLI, 1:** a stored chat with an owner is acknowledged on its first
+  run and restored on the next, and both runs offer the application's
+  tool. The ownership tests from mcp-application step B pass through the
+  real lifecycle too.
+- **Skipped:**
+  - Karaka's `startup.spec` cases for missing launcher services, the
+    Loader audit of pending, inactive and unimportable entries, and
+    throwing `disabled` expressions. The kernel has no Loader.
+  - `session-reference.spec.ts`, which waits on dsh's resolver.

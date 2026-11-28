@@ -2,13 +2,17 @@
 //! tenant and user that application asserted. (Karaka's own:
 //! `@karaka-ai/identity`, `identity/src/owner.ts`.)
 //!
-//! Only what the MCP application needs is ported: the ids, the owner,
-//! [`same_owner`], [`IdentityError`], and a [`SessionOwners`] port with
-//! Karaka's two lookups, `ownerOf` and `ownerOfCached`. Karaka's
-//! `KarakaIdentity` service also reserves, binds and readies chats, locks
-//! them per chat, and authorizes callers against them
-//! (`identity/src/index.ts`); that comes with the app ingress. Until then a
-//! host sets owners on [`InMemorySessionOwners`].
+//! - The ids, the owner, [`same_owner`] and [`IdentityError`]
+//!   (`owner.ts`).
+//! - [`KarakaIdentity`], Karaka's authority (`index.ts`, `records.ts`):
+//!   chats reserved, bound to their sessions and acknowledged once
+//!   durable, one operation per chat at a time, roots restored after a
+//!   restart, and owners inherited through child sessions.
+//!   [`KarakaIdentityPlugin`] provides it, and as [`SessionOwners`].
+//! - The [`SessionOwners`] port, Karaka's `ownerOf` and `ownerOfCached` by
+//!   session id, which the MCP application reads. [`InMemorySessionOwners`]
+//!   is a simpler implementation, owners set by hand, for hosts and tests
+//!   without the lifecycle.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -17,7 +21,14 @@ use std::pin::Pin;
 use std::sync::{Arc, PoisonError, RwLock};
 
 use karaka_kernel::{BoxError, Plugin, PluginContext, PortId};
-use karaka_session::SessionId;
+use karaka_session::{SessionId, SessionStore};
+use karaka_session_persistence::SessionPersistence;
+
+mod authority;
+mod records;
+
+pub use authority::{KarakaIdentity, Reservation};
+pub use records::{IdentityRecord, SessionBinding, binding_of, matches_binding};
 
 macro_rules! id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -223,6 +234,60 @@ impl Plugin for SessionOwnersPlugin {
         let owners = Arc::clone(&self.owners);
         ctx.provide::<dyn SessionOwners>(Arc::clone(&owners) as Arc<dyn SessionOwners>);
         ctx.provide(owners);
+        Ok(())
+    }
+}
+
+/// Provides [`KarakaIdentity`], and the same as [`SessionOwners`]. It
+/// requires the session store and, with
+/// [`with_persistence`](Self::with_persistence), the persistence port it
+/// observes stored sessions through. (Karaka: the `karaka-identity` plugin,
+/// which injects `sessions` and `sessionPersistence`.)
+#[derive(Debug, Default)]
+pub struct KarakaIdentityPlugin {
+    persistence: bool,
+}
+
+impl KarakaIdentityPlugin {
+    /// Live sessions only, for a runtime with no durable storage. Chats
+    /// can't be acknowledged or restored then.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stored sessions observed through the runtime's persistence too.
+    pub fn with_persistence() -> Self {
+        Self { persistence: true }
+    }
+}
+
+impl Plugin for KarakaIdentityPlugin {
+    fn name(&self) -> &str {
+        "karaka-identity"
+    }
+
+    fn provides(&self) -> Vec<PortId> {
+        vec![
+            PortId::of::<KarakaIdentity>(),
+            PortId::of::<dyn SessionOwners>(),
+        ]
+    }
+
+    fn requires(&self) -> Vec<PortId> {
+        let mut ports = vec![PortId::of::<SessionStore>()];
+        if self.persistence {
+            ports.push(PortId::of::<dyn SessionPersistence>());
+        }
+        ports
+    }
+
+    async fn setup(&self, ctx: &mut PluginContext<'_>) -> Result<(), BoxError> {
+        let persistence = self
+            .persistence
+            .then(|| ctx.get::<dyn SessionPersistence>());
+        let identity = Arc::new(KarakaIdentity::new(ctx.get::<SessionStore>(), persistence));
+        ctx.provide::<dyn SessionOwners>(Arc::clone(&identity) as Arc<dyn SessionOwners>);
+        ctx.provide(identity);
         Ok(())
     }
 }

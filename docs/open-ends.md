@@ -4,7 +4,7 @@ Everything left undone, in one place. `port-notes.md` explains each item
 in the section named after it. When a step finishes, add what it left
 undone here, and delete anything it closed.
 
-Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the HTTP ingress).
+Last updated 2026-11-28, after the identity lifecycle and the startup gate (step 2 of the HTTP ingress).
 
 ## Needs you
 
@@ -39,6 +39,14 @@ Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the H
   map never shrinks. dsh's is freed with the session. This matters only
   for a long-running server, so fix it before `karaka serve` opens
   sessions (HTTP ingress, step 3). (Working directory)
+- **Endpoints settle before presets only by plugin order.** Nothing
+  requires an application endpoint, so the kernel doesn't hold the
+  presets for it. They start after it only because the list puts them
+  later, and nothing an endpoint requires comes later still. Moving the
+  JSONL plugins to the end once put the authority, and so the endpoint,
+  after the presets, which then broke on an unsettled catalog. A port
+  the endpoints provide and the presets require would make it hold
+  whatever the order. (HTTP ingress, step 2)
 - **Compare agents by `instance()`, not by `Arc`.** The loop gives tool
   calls a different `Arc` from the one `Agents::open` returns.
   `Agent::instance()` gives both the same identity. Nothing is wrong
@@ -244,18 +252,17 @@ Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the H
 
 ### Applications
 
-- **Karaka's identity lifecycle.** Only the owner types and a
-  `SessionOwners` port with an in-memory store are ported. Karaka's
-  `KarakaIdentity` (`identity/src/index.ts`) reserves, binds and readies
-  each chat (`reserve`, `bind`, `markReady`), serializes work per chat
-  (`withChatLock`), authorizes a caller against a chat's owner
-  (`authorize`, `Chat is not owned by this caller`), reads a cold
-  session's owner (`ownerOfId`), follows lineage through child sessions,
-  and persists its records. Until then a host sets each owner on
-  `InMemorySessionOwners` before opening the session's agent; the binary
-  sets one owner, from `KARAKA_APPLICATION_ID`, `KARAKA_TENANT_ID` and
-  `KARAKA_USER_ID`, on the one session a run opens. It is step 2 of the
-  HTTP ingress. (MCP application, steps A and B)
+- **Owner-aware session references.** Karaka's
+  `KarakaSessionReferenceResolver` (`identity/src/session-reference.ts`)
+  filters dsh's session-reference candidates and refuses a reference to
+  another owner's chat (`Referenced chat is not owned by this caller`).
+  It extends dsh's `session-reference` resolver, which isn't ported, so
+  it waits on that. (HTTP ingress, step 2)
+- **The CLI restores a stored chat to the operator's owner.** With
+  `KARAKA_SESSIONS`, a chat already stored is restored to the owner the
+  three variables name, as the ingress restores one once the application
+  has verified access. There is no application to ask on the command
+  line, so whoever runs it is trusted. (HTTP ingress, step 2)
 - **Inbound server auth is unused.** `server-auth` rows are read, and
   their `chatCredential` references checked, but nothing calls
   `authenticate` until there is an ingress to authenticate. (MCP
@@ -273,12 +280,8 @@ Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the H
 
 ### HTTP ingress
 
-- **The plan.** Step 1, the webserver and `karaka serve`, is built. Still
-  to do:
-  - step 2, Karaka's identity lifecycle (`identity/src/index.ts`,
-    `records.ts`, `session-reference.ts`) and `transport-http`'s
-    `karakaStartup`, the admission gate (`STARTING` until every plugin
-    is up);
+- **The plan.** Steps 1 and 2 are built: the webserver and `karaka
+  serve`, then the identity lifecycle and the startup gate. Still to do:
   - step 3, Karaka's application chat routes (`transport-http`'s
     `index.ts`, `application.ts`, `application-state.ts`, `http.ts`), to
     `@karaka-ai/sdk`'s wire contract byte for byte, with the
@@ -287,7 +290,7 @@ Last updated 2026-11-28, after the webserver and `karaka serve` (step 1 of the H
   - step 4, browser access: `browser-auth` (ES256 JWT) and
     `transport-http`'s `browser*.ts` routes and WebSocket.
 
-  (HTTP ingress, step 1)
+  (HTTP ingress, steps 1 and 2)
 - **The webserver's TLS listener.** dsh's `tls` (`certFile`, `keyFile`),
   read once before binding, and `protocol` `https:`, aren't ported.
   Karaka's own profile sets no `tls`, and a deployment terminates TLS in
@@ -335,7 +338,8 @@ From Play This Life's plugin list:
   service), `session-query-sqlite`, `storage`, `credentials-local` (its
   store and `.env` layers; the process environment is
   `karaka-credentials`).
-- **The rest:** `mcp-resources`, `session-reference`,
+- **The rest:** `mcp-resources`, `session-reference` (and Karaka's
+  owner-aware resolver over it),
   `agent-tool-presentation`, `deepseek-llm-api-extensions`, and Karaka's
   `transport-http` and `browser-auth` (HTTP ingress, steps 2 to 4).
 - **Play This Life's own global rows** that `KARAKA_PLUGINS` can't name

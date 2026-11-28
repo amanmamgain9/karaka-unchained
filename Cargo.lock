@@ -666,6 +666,7 @@ dependencies = [
  "karaka-session-projection",
  "karaka-skill",
  "karaka-skill-filesystem",
+ "karaka-startup",
  "karaka-system-prompt",
  "karaka-tool-ask-user",
  "karaka-tool-policy",
@@ -778,6 +779,7 @@ version = "0.1.0"
 dependencies = [
  "karaka-kernel",
  "karaka-session",
+ "karaka-session-persistence",
  "tokio",
 ]
 
@@ -974,6 +976,14 @@ dependencies = [
 [[package]]
 name = "karaka-sse"
 version = "0.1.0"
+
+[[package]]
+name = "karaka-startup"
+version = "0.1.0"
+dependencies = [
+ "karaka-kernel",
+ "tokio",
+]
 
 [[package]]
 name = "karaka-system-prompt"

@@ -2039,3 +2039,44 @@ fn serve_refuses_a_wildcard_host_before_listening() {
         "karaka: webserver: host \"0.0.0.0\" is an unspecified (wildcard) address, which is not supported: binding every interface would expose remote code execution to the network; bind one concrete IPv4 or IPv6 address of a local interface instead\n"
     );
 }
+
+// A stored chat's owner is acknowledged when the chat is made, and
+// restored when a later run carries the chat on: both runs offer the
+// application's tool.
+#[test]
+fn a_stored_chats_owner_is_restored_on_the_next_run() {
+    let dir = scratch("application-chat");
+    let (url, _) = application_endpoint();
+    std::fs::write(dir.join("plugins.yml"), application_plugins(&url)).unwrap();
+    std::fs::write(dir.join("presets.yml"), APPLICATION_PRESETS).unwrap();
+    let sessions = dir.join("sessions");
+    for answer in ["First.", "Second."] {
+        let (address, server) = serve_once(streamed(&anthropic_text(answer)));
+        let mut env = vec![
+            ("ANTHROPIC_API_KEY", "test-key".to_owned()),
+            ("ANTHROPIC_BASE_URL", format!("http://{address}")),
+            (
+                "KARAKA_PLUGINS",
+                dir.join("plugins.yml").display().to_string(),
+            ),
+            (
+                "KARAKA_PRESETS",
+                dir.join("presets.yml").display().to_string(),
+            ),
+            ("KARAKA_SESSIONS", sessions.display().to_string()),
+            ("APP_TOOLS", "tool-secret".to_owned()),
+        ];
+        env.extend(owned_by("app"));
+        let output = karaka(&["chat"], &env, "hello\n");
+        let stderr = text(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(text(&output.stdout), format!("{answer}\n"));
+        let sent = server.join().expect("the server ran");
+        let request: Value = serde_json::from_str(body(&sent)).unwrap();
+        assert!(
+            tool_names(&request).contains(&"mcp__app__lookup".to_owned()),
+            "{request}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

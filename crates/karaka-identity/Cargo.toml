@@ -1,6 +1,6 @@
 [package]
 name = "karaka-identity"
-description = "Karaka's application ownership: application, tenant and user ids, and the port that says which application owns a session"
+description = "Karaka's application authority: which application owns each chat, reserved, bound and acknowledged over unchanged sessions, and the port that says so"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,10 @@ publish.workspace = true
 karaka-session.workspace = true
 # The plugin that puts the owners in a runtime.
 karaka-kernel.workspace = true
+# Sessions are observed live, or stored through the persistence port.
+karaka-session-persistence.workspace = true
+# One operation per chat at a time, waited for in order.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

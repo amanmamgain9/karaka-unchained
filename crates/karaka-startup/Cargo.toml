@@ -1,0 +1,15 @@
+[package]
+name = "karaka-startup"
+description = "Karaka's startup gate: the ingress admits requests only once every plugin has started"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The plugin that puts the gate in a runtime.
+karaka-kernel.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

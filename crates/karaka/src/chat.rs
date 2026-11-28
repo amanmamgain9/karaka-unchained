@@ -13,12 +13,14 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, IsTerminal, Write};
 use std::sync::Arc;
 
-use karaka_agent::Agents;
+use karaka_agent::{AgentComposition, Agents};
 use karaka_agent_loop::{AgentLoopPlugin, LoopConfig};
 use karaka_agent_presets::AgentPresets;
 use karaka_credentials::CredentialsPlugin;
 use karaka_fs_local::LocalFsPlugin;
-use karaka_identity::{ApplicationOwner, InMemorySessionOwners, SessionOwnersPlugin};
+use karaka_identity::{
+    ApplicationOwner, IdentityError, KarakaIdentity, KarakaIdentityPlugin, Reservation,
+};
 use karaka_kernel::{DynPlugin, Runtime};
 use karaka_mcp_application::{ApplicationCatalogPlugin, McpApplicationPlugin};
 use karaka_mcp_client::{Level, Log, McpClientsPlugin};
@@ -95,6 +97,7 @@ pub fn loop_plugins(
     chat: bool,
 ) -> Result<Vec<Box<dyn DynPlugin>>, String> {
     let watch_skills = chat;
+    let config_sessions = config.sessions.is_some();
     let presets = match &config.presets {
         Some(path) => Some(crate::presets::load(
             path,
@@ -134,6 +137,14 @@ pub fn loop_plugins(
     plugins.push(Box::new(ToolsPlugin));
     plugins.push(Box::new(SessionsPlugin));
     plugins.push(Box::new(SessionProjectionsPlugin));
+    // A chat's sessions kept as JSONL files under `KARAKA_SESSIONS`. Early
+    // in the list, so what requires the persistence port, the authority
+    // among them, starts in its place, and the application endpoints
+    // still settle before the presets.
+    if chat && let Some(root) = &config.sessions {
+        plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root.clone()))));
+        plugins.push(Box::new(DurableSessionsPlugin));
+    }
     // The host's files, relative paths from the process's directory.
     plugins.push(Box::new(LocalFsPlugin::default()));
     // Each session's working directory, shown to the model as runtime
@@ -190,9 +201,15 @@ pub fn loop_plugins(
         McpClientsPlugin::new().on_log(Arc::clone(&log)),
         McpClientsPlugin::server,
     )));
-    // Who owns each session; `KARAKA_APPLICATION_ID` and the rest set the
-    // owner of the one this process opens.
-    plugins.push(Box::new(SessionOwnersPlugin::new()));
+    // Karaka's application authority: who owns each session.
+    // `KARAKA_APPLICATION_ID` and the rest admit the owner of the one this
+    // process opens (`admit`). A chat kept in `KARAKA_SESSIONS` has durable
+    // storage, so its chats are acknowledged and restored through it.
+    plugins.push(Box::new(if chat && config_sessions {
+        KarakaIdentityPlugin::with_persistence()
+    } else {
+        KarakaIdentityPlugin::new()
+    }));
     if let Some(auth) = global.server_auth {
         plugins.push(Box::new(CredentialsPlugin::new()));
         plugins.push(Box::new(ServerAuthPlugin::bearer(auth)));
@@ -251,15 +268,69 @@ pub fn select_preset(
         .map_err(|error| error.to_string())
 }
 
-/// Makes `owner`, if there is one, own the session `id`. Called before
-/// the session's agent opens, which is when an application endpoint
-/// offers the agent its tools.
-pub fn own_session(runtime: &Runtime, id: &SessionId, owner: Option<&ApplicationOwner>) {
-    if let Some(owner) = owner {
-        runtime
-            .get::<InMemorySessionOwners>()
-            .set(id.clone(), owner.clone());
-    }
+/// Admits `owner` to the session `id` through Karaka's authority, before
+/// the session's agent opens, which is when an application endpoint offers
+/// the agent its tools. (Karaka: `transport-http`'s create path, under
+/// `withChatLock`.)
+///
+/// A session already stored is restored to `owner`: the operator who set
+/// the variables is trusted, where the ingress trusts the application's
+/// verified access. Otherwise the chat is reserved, its session made as the
+/// loop or the durable store makes it, and bound; with durable storage it
+/// is then acknowledged once flushed.
+///
+/// # Errors
+///
+/// The authority's refusal, in Karaka's words, or the durable store's.
+pub async fn admit(
+    runtime: &Runtime,
+    id: &SessionId,
+    owner: &ApplicationOwner,
+    durable: Option<&DurableSessions>,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let identity = runtime.get::<KarakaIdentity>();
+    let refused = |error: IdentityError| format!("the session's owner: {error}");
+    identity
+        .with_chat_lock(id, async {
+            if let Some(durable) = durable {
+                let stored = durable
+                    .persistence()
+                    .stat(id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if stored.is_some() {
+                    identity.restore(id, owner).await.map_err(refused)?;
+                    return Ok(());
+                }
+            }
+            if identity.reserve(id, owner).await.map_err(refused)? == Reservation::Existing {
+                return Ok(());
+            }
+            let session = match durable {
+                Some(durable) => durable
+                    .open(id.clone(), cwd)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                // As the loop's `open` makes it, named for its preset.
+                None => match runtime.get::<AgentComposition>().composer() {
+                    Some(composer) => runtime
+                        .get::<SessionStore>()
+                        .open_or_create_with(id.clone(), |header| composer.prepare(header)),
+                    None => runtime.get::<SessionStore>().open_or_create(id.clone()),
+                },
+            };
+            identity.bind(&session, owner).await.map_err(refused)?;
+            if durable.is_some() {
+                identity
+                    .mark_ready(&session, owner)
+                    .await
+                    .map_err(refused)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(refused)?
 }
 
 /// What the command line says about approvals.
@@ -324,12 +395,8 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
     let id = SessionId::new(config.session.as_deref().unwrap_or(SESSION));
     let sessions = config.sessions.clone();
     let owner = config.owner.clone();
-    let mut plugins = loop_plugins(config, &approvals, true)?;
-    if let Some(root) = sessions.clone() {
-        // The store's sessions kept as JSONL files under the root.
-        plugins.push(Box::new(JsonlPlugin::new(JsonlConfig::new(root))));
-        plugins.push(Box::new(DurableSessionsPlugin));
-    }
+    // With `KARAKA_SESSIONS`, the plugins keep the sessions durable.
+    let plugins = loop_plugins(config, &approvals, true)?;
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;
@@ -339,13 +406,17 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
     answer_on_the_terminal(&runtime, &lines, &approvals);
 
     // A stored session is resumed, and repaired if a crash left a turn
-    // open, before the agent sees it.
-    let durable = match sessions {
-        Some(_) => {
-            let durable = runtime.get::<DurableSessions>();
-            let cwd = std::env::current_dir()
-                .ok()
-                .and_then(|dir| dir.to_str().map(str::to_owned));
+    // open, before the agent sees it. Its owner, if one is set, is admitted
+    // first.
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.to_str().map(str::to_owned));
+    let durable = sessions.map(|_| runtime.get::<DurableSessions>());
+    if let Some(owner) = &owner {
+        admit(&runtime, &id, owner, durable.as_deref(), cwd.clone()).await?;
+    }
+    let durable = match durable {
+        Some(durable) => {
             durable
                 .open(id.clone(), cwd)
                 .await
@@ -354,7 +425,6 @@ pub async fn chat(config: Config, options: Options) -> Result<(), String> {
         }
         None => None,
     };
-    own_session(&runtime, &id, owner.as_ref());
     let result = converse(&runtime, &id, &lines, preset.as_deref()).await;
     // Whatever happened, what the chat said is written before it exits.
     if let Some(durable) = durable {

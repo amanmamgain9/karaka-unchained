@@ -26,6 +26,7 @@ use karaka_agent::Agents;
 use karaka_kernel::Runtime;
 use karaka_model::{Model, ModelRegistry};
 use karaka_session::{SessionEvent, SessionId, SessionStore, UserMessage, UserSource};
+use karaka_startup::{KarakaStartup, KarakaStartupPlugin};
 use karaka_webserver::{WebServer, WebServerPlugin};
 
 use crate::answer::Printer;
@@ -320,7 +321,9 @@ async fn ask(question: Option<String>, options: Options) -> Result<(), String> {
     );
 
     let id = SessionId::new("ask");
-    chat::own_session(&runtime, &id, owner.as_ref());
+    if let Some(owner) = &owner {
+        chat::admit(&runtime, &id, owner, None, None).await?;
+    }
     let agent = runtime
         .get::<dyn Agents>()
         .open(id.clone())
@@ -365,9 +368,13 @@ async fn serve(options: Options) -> Result<(), String> {
     plugins.push(Box::new(
         WebServerPlugin::new(listen).on_log(Arc::new(|line: &str| eprintln!("karaka: {line}"))),
     ));
+    // The ingress admits requests only once every plugin has started.
+    plugins.push(Box::new(KarakaStartupPlugin));
     let runtime = Runtime::start(plugins)
         .await
         .map_err(|error| error.to_string())?;
+    let startup = runtime.get::<KarakaStartup>();
+    startup.commit();
     let server = runtime.get::<WebServer>();
     match server.origin() {
         Ok(origin) => eprintln!("karaka: listening on {origin}"),
@@ -385,6 +392,7 @@ async fn serve(options: Options) -> Result<(), String> {
         }
         _ = terminate.recv() => {}
     }
+    startup.withdraw();
     server.close().await;
     eprintln!("karaka: stopped");
     Ok(())
